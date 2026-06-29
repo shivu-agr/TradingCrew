@@ -1,0 +1,94 @@
+{
+  "ticker": "RELIANCE.NS",
+  "params": {
+    "horizon": 20,
+    "target_pct": 8.0,
+    "stop_pct": 3.0
+  },
+  "horizons": [
+    {
+      "horizon_days": 20,
+      "is_trader": true,
+      "hit_rate": 0.1676253081347576,
+      "expectancy": 0.25339810935370954,
+      "payoff": 2.2712294858933673,
+      "avg": 0.2533981093537093,
+      "median": -3.0200214002111925,
+      "n": 1217,
+      "wins": 204,
+      "losses": 624,
+      "timeouts": 389,
+      "avg_win": 8.96066940719141,
+      "avg_loss": -3.945294591694161
+    },
+    {
+      "horizon_days": 60,
+      "is_trader": false,
+      "hit_rate": 0.3211554800339847,
+      "expectancy": 0.280820522313707,
+      "payoff": 2.2836719831856462,
+      "avg": 0.28082052231370674,
+      "median": -3.284031597907877,
+      "n": 1177,
+      "wins": 378,
+      "losses": 785,
+      "timeouts": 14,
+      "avg_win": 8.95753783553926,
+      "avg_loss": -3.922427520892818
+    },
+    {
+      "horizon_days": 120,
+      "is_trader": false,
+      "hit_rate": 0.34646374216651743,
+      "expectancy": 0.5410915817272239,
+      "payoff": 2.2839998281295792,
+      "avg": 0.5410915817272236,
+      "median": -3.2549579025025976,
+      "n": 1117,
+      "wins": 387,
+      "losses": 730,
+      "timeouts": 0,
+      "avg_win": 8.969309500297275,
+      "avg_loss": -3.9270184655147067
+    },
+    {
+      "horizon_days": 252,
+      "is_trader": false,
+      "hit_rate": 0.3401015228426396,
+      "expectancy": 0.49830537128621843,
+      "payoff": 2.3156514979245646,
+      "avg": 0.49830537128621794,
+      "median": -3.2570560662323,
+      "n": 985,
+      "wins": 335,
+      "losses": 650,
+      "timeouts": 0,
+      "avg_win": 9.038998430835859,
+      "avg_loss": -3.9034364363278278
+    }
+  ],
+  "decision_old": {
+    "rules": "old",
+    "action": "NEUTRAL",
+    "confidence": 0.55,
+    "size_pct": 0.0,
+    "rationale": "hit-rate 16.8% < 40% caps confidence at 0.60; quality penalty halves size; both binding => NEUTRAL by default."
+  },
+  "decision_new": {
+    "rules": "new",
+    "action": "OVERWEIGHT",
+    "confidence": 0.808,
+    "size_pct": 1.125,
+    "rationale": "best-expectancy horizon = 120d (exp +0.54%, hit-rate 34.6%, payoff 2.28x). Positive expectancy with payoff \u2265 1.5 \u2014 hit-rate cap not binding."
+  },
+  "walk_forward": {
+    "n_proposals": 0,
+    "n_folds": 0,
+    "total_return_pct": null,
+    "sharpe": null,
+    "max_drawdown": null,
+    "deflated_sharpe": null,
+    "notes": "Only 0 proposals for RELIANCE.NS; walk-forward needs \u2265 5."
+  },
+  "timestamp": "20260626T093645Z"
+}

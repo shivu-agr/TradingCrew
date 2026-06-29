@@ -1,0 +1,76 @@
+# -- secrets ---------------------------------------------------------------
+# .env may contain real LLM / embedding / Tavily / OpenAI keys.
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+.secrets/
+secrets.json
+credentials.json
+
+# -- python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+build/
+dist/
+.eggs/
+pip-wheel-metadata/
+.python-version
+.venv/
+venv/
+env/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# -- vector / memory stores ------------------------------------------------
+# CrewAI memory writes here at runtime; large LanceDB files and may carry
+# decision history that shouldn't be committed.
+crewai_storage/
+.lancedb/
+*.lance
+chroma_db/
+
+# -- workflow run outputs --------------------------------------------------
+runs/
+recent_runs/
+data/processed/
+data/runs/
+data/episodes/
+data/snapshots/
+backtests/output/
+analyst_cache/
+*.log
+*.log.*
+logs/
+
+# -- editor / OS scratch ---------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# -- node / frontend tooling (if you ever add a bundler) -------------------
+node_modules/
+
+# -- coverage / profiling --------------------------------------------------
+.benchmarks/
+prof/
+*.prof
+
+# -- jupyter notebook checkpoints ------------------------------------------
+.ipynb_checkpoints/

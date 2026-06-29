@@ -1,0 +1,166 @@
+{
+  "summary": {
+    "actions_total": {
+      "UNDERWEIGHT": 3,
+      "OVERWEIGHT": 5,
+      "NEUTRAL": 2
+    },
+    "actions_by_country": {
+      "US": {
+        "UNDERWEIGHT": 2,
+        "OVERWEIGHT": 2
+      },
+      "India": {
+        "OVERWEIGHT": 3,
+        "NEUTRAL": 2,
+        "UNDERWEIGHT": 1
+      }
+    },
+    "avg_confidence": 0.654,
+    "avg_size_pct": 0.806,
+    "n_errors": 0,
+    "n_total": 10
+  },
+  "rows": [
+    {
+      "ticker": "NVDA",
+      "resolved": "NVDA",
+      "country": "US",
+      "sector": "Technology / AI & Semiconductors",
+      "action": "UNDERWEIGHT",
+      "confidence": 0.55,
+      "size_pct": 0.5,
+      "compliance": "CLEAR",
+      "horizon_days": 30,
+      "expected_return_pct": 1.33,
+      "error": null,
+      "runtime_s": 266.0
+    },
+    {
+      "ticker": "MSFT",
+      "resolved": "MSFT",
+      "country": "US",
+      "sector": "Technology / Software & Cloud",
+      "action": "UNDERWEIGHT",
+      "confidence": 0.7,
+      "size_pct": 1.0,
+      "compliance": "FLAGGED",
+      "horizon_days": 30,
+      "expected_return_pct": 1.07,
+      "error": null,
+      "runtime_s": 227.5
+    },
+    {
+      "ticker": "AAPL",
+      "resolved": "AAPL",
+      "country": "US",
+      "sector": "Consumer Electronics",
+      "action": "OVERWEIGHT",
+      "confidence": 0.78,
+      "size_pct": 1.5,
+      "compliance": "CLEAR",
+      "horizon_days": 30,
+      "expected_return_pct": 5.8,
+      "error": null,
+      "runtime_s": 248.9
+    },
+    {
+      "ticker": "JPM",
+      "resolved": "JPM",
+      "country": "US",
+      "sector": "Financials / Banking",
+      "action": "OVERWEIGHT",
+      "confidence": 0.68,
+      "size_pct": 1.0,
+      "compliance": "FLAGGED",
+      "horizon_days": 15,
+      "expected_return_pct": 1.33,
+      "error": null,
+      "runtime_s": 243.9
+    },
+    {
+      "ticker": "MAZDOCK",
+      "resolved": "MAZDOCK.NS",
+      "country": "India",
+      "sector": "Defence & Capital Goods",
+      "action": "OVERWEIGHT",
+      "confidence": 0.72,
+      "size_pct": 0.66,
+      "compliance": "FLAGGED",
+      "horizon_days": 30,
+      "expected_return_pct": 2.8,
+      "error": null,
+      "runtime_s": 238.6
+    },
+    {
+      "ticker": "BEL",
+      "resolved": "BEL.NS",
+      "country": "India",
+      "sector": "Defence Electronics",
+      "action": "OVERWEIGHT",
+      "confidence": 0.72,
+      "size_pct": 0.5,
+      "compliance": "FLAGGED",
+      "horizon_days": 30,
+      "expected_return_pct": 3.86,
+      "error": null,
+      "runtime_s": 233.5
+    },
+    {
+      "ticker": "TATAMOTORS",
+      "resolved": "TATAMOTORS",
+      "country": "India",
+      "sector": "Automotive / EV",
+      "action": "OVERWEIGHT",
+      "confidence": 0.71,
+      "size_pct": 1.5,
+      "compliance": "CLEAR",
+      "horizon_days": 20,
+      "expected_return_pct": 5.0,
+      "error": null,
+      "runtime_s": 219.2
+    },
+    {
+      "ticker": "RELIANCE",
+      "resolved": "RELIANCE.NS",
+      "country": "India",
+      "sector": "Conglomerate (Energy, Retail, Telecom)",
+      "action": "NEUTRAL",
+      "confidence": 0.35,
+      "size_pct": 0.0,
+      "compliance": "FLAGGED",
+      "horizon_days": 20,
+      "expected_return_pct": -3.0,
+      "error": null,
+      "runtime_s": 246.0
+    },
+    {
+      "ticker": "LT",
+      "resolved": "LT.NS",
+      "country": "India",
+      "sector": "Engineering & Infrastructure",
+      "action": "UNDERWEIGHT",
+      "confidence": 0.78,
+      "size_pct": 1.4,
+      "compliance": "CLEAR",
+      "horizon_days": 30,
+      "expected_return_pct": 7.34,
+      "error": null,
+      "runtime_s": 226.2
+    },
+    {
+      "ticker": "HINDUNILVR",
+      "resolved": "HINDUNILVR.NS",
+      "country": "India",
+      "sector": "FMCG / Consumer Goods",
+      "action": "NEUTRAL",
+      "confidence": 0.55,
+      "size_pct": 0.0,
+      "compliance": "CLEAR",
+      "horizon_days": 20,
+      "expected_return_pct": -3.5,
+      "error": null,
+      "runtime_s": 222.5
+    }
+  ]
+}

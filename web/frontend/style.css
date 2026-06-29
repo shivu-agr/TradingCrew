@@ -1,0 +1,636 @@
+/* TradingCrew dashboard — dark theme + SVG workflow + sidebar widgets. */
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0; padding: 0;
+  background: #0a0e1a;
+  color: #cbd5e1;
+  font-family: "Inter", -apple-system, "Segoe UI", sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+button { font: inherit; cursor: pointer; }
+code, .font-mono { font-family: "JetBrains Mono", "SF Mono", "Menlo", monospace; }
+
+/* ---------- Sidebar ---------- */
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  position: sticky; top: 0;
+}
+
+.sidebar-rail { display: none; }
+aside.sidebar.is-collapsed { width: 56px !important; }
+aside.sidebar.is-collapsed .sidebar-brand-text { display: none; }
+aside.sidebar.is-collapsed .sidebar-body { display: none; }
+aside.sidebar.is-collapsed .sidebar-rail { display: flex; flex-direction: column; gap: 4px; padding-top: 8px; }
+
+.rail-btn {
+  width: 48px; height: 36px;
+  border-radius: 6px;
+  background: #1f2942;
+  color: #94a3b8;
+  border: 1px solid transparent;
+  display: grid; place-items: center;
+}
+.rail-btn:hover { background: #2a3556; color: #e2e8f0; }
+
+/* ---------- Sections ---------- */
+
+.section {
+  border-bottom: 1px solid #1f2942;
+}
+.section-header {
+  width: 100%;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 11px 16px;
+  background: transparent;
+  border: 0;
+  color: #cbd5e1;
+  font-size: 13px;
+  font-weight: 500;
+}
+.section-header:hover { background: rgba(31, 41, 66, 0.4); }
+.section-header .chev { transition: transform 0.18s; color: #64748b; }
+.section.is-open .section-header .chev { transform: rotate(90deg); }
+.section-h {
+  font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.08em;
+  color: #94a3b8; font-weight: 600;
+}
+.section-meta {
+  font-size: 10.5px; color: #64748b; font-weight: 400;
+  text-transform: none; letter-spacing: 0;
+}
+.section-body {
+  display: none;
+  padding: 4px 16px 14px;
+}
+.section.is-open .section-body { display: block; }
+
+.advanced-group {
+  border-top: 1px solid #1f2942;
+  border-bottom: 1px solid #1f2942;
+  background: rgba(15, 21, 37, 0.4);
+}
+.advanced-header {
+  width: 100%;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 16px;
+  background: transparent; border: 0;
+  color: #cbd5e1;
+  font-size: 12px;
+  text-transform: uppercase; letter-spacing: 0.08em;
+  font-weight: 600;
+}
+.advanced-header:hover { background: rgba(31, 41, 66, 0.4); }
+.advanced-header .chev { transition: transform 0.18s; color: #64748b; }
+.advanced-group.is-open .advanced-header .chev { transform: rotate(90deg); }
+.advanced-body { display: none; }
+.advanced-group.is-open .advanced-body { display: block; }
+
+.cfg-l {
+  display: block;
+  font-size: 10.5px; color: #94a3b8;
+  text-transform: uppercase; letter-spacing: 0.08em;
+  margin: 8px 0 4px;
+}
+.cfg-input,
+input.cfg-input,
+select.cfg-input {
+  width: 100%;
+  padding: 7px 10px;
+  background: #0a0e1a;
+  border: 1px solid #1f2942;
+  border-radius: 6px;
+  color: #cbd5e1;
+  font-size: 13px;
+}
+.cfg-input:hover { border-color: #2a3556; }
+.cfg-input:focus { outline: none; border-color: #3b82f6; }
+.cfg-val {
+  font-size: 12px; color: #e2e8f0;
+  font-variant-numeric: tabular-nums;
+  min-width: 22px; text-align: right;
+}
+.cfg-hint {
+  font-size: 11px;
+  color: #64748b;
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+}
+.cfg-hint span { color: #93c5fd; }
+.checkbox {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px; color: #cbd5e1;
+}
+
+.preset-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 4px;
+}
+.preset-grid button {
+  padding: 6px 0;
+  background: #0a0e1a;
+  border: 1px solid #1f2942;
+  border-radius: 6px;
+  color: #94a3b8;
+  font-size: 11px;
+  font-family: "JetBrains Mono", monospace;
+}
+.preset-grid button:hover { border-color: #3b82f6; color: #e2e8f0; }
+.preset-grid button.selected {
+  background: rgba(59, 130, 246, 0.18);
+  border-color: #3b82f6;
+  color: #e2e8f0;
+}
+
+/* ---------- Workflow diagram ---------- */
+
+/* Viewport that wraps the (transform-scaled) diagram inner.  Capped to
+   80vh so a huge zoomed-in diagram doesn't push the rest of the tab
+   off-screen; users get internal scrollbars instead.  ``overscroll-behavior``
+   contains the scroll so wheel events inside the diagram don't bubble up
+   to the page when they're not Ctrl-modified zoom events. */
+#workflow-viewport {
+  max-height: 80vh;
+  overscroll-behavior: contain;
+  position: relative;
+}
+#workflow-diagram {
+  position: relative;
+  overflow: hidden;
+}
+
+.flow-svg path { fill: none; }
+
+/* ===== Edge states =====
+ * Industry-standard "flowing dashed" animation for active edges, copied
+ * almost verbatim from React Flow / n8n.  The dashes scroll along the
+ * stroke via ``stroke-dashoffset`` keyframes, which conveys both
+ * "live data is moving" and the direction of flow.
+ */
+.flow-edge {
+  stroke: #334155;
+  stroke-width: 1;
+  stroke-opacity: 0.45;
+  fill: none;
+  transition: stroke 0.25s, stroke-width 0.25s, stroke-opacity 0.25s;
+}
+.flow-edge.active {
+  stroke: #22d3ee;             /* cyan-400 */
+  stroke-width: 1.8;
+  stroke-opacity: 1;
+  stroke-dasharray: 6 4;
+  animation: flow-dash 0.6s linear infinite;
+  filter: drop-shadow(0 0 3px rgba(34, 211, 238, 0.5));
+}
+.flow-edge.done {
+  stroke: #22c55e;
+  stroke-width: 1.4;
+  stroke-opacity: 0.9;
+}
+@keyframes flow-dash {
+  to { stroke-dashoffset: -20; }
+}
+
+/* ===== Nodes =====
+ * Compact pill (140×38) — title + role tag.  Tool chips render below
+ * the node, not inside it, so the visible card stays the same size for
+ * every agent.  Selected/running/done border treatments mirror what
+ * production schedulers do: subtle for idle, glowing pulse for running,
+ * solid green for done.
+ */
+.flow-node {
+  position: absolute;
+  width: 140px;
+  background: #0f1525;
+  border: 1.5px solid #1f2942;
+  border-radius: 8px;
+  padding: 5px 8px 6px;
+  cursor: pointer;
+  transition: 0.2s;
+  z-index: 2;
+}
+.flow-node:hover { border-color: #3b82f6; transform: translateY(-1px); }
+.flow-node.selected { border-color: #60a5fa; box-shadow: 0 0 0 1px #60a5fa, 0 0 14px rgba(96,165,250,0.25); }
+.flow-node[data-state="running"] {
+  border-color: currentColor;
+  box-shadow: 0 0 0 1px currentColor, 0 0 14px rgba(34,211,238,0.30);
+  animation: nodepulse 1.3s ease-in-out infinite;
+}
+.flow-node[data-state="done"] {
+  border-color: #22c55e;
+}
+.flow-node[data-state="degraded"] {
+  /* Amber border + faint wash so a degraded analyst stands out in the
+     workflow diagram without using the red "error" treatment that's
+     reserved for crashes — the patch caught the failure and the rest
+     of the crew kept running. */
+  border-color: #f59e0b;
+  background: rgba(245, 158, 11, 0.07);
+}
+@keyframes nodepulse {
+  0%, 100% { box-shadow: 0 0 0 1px currentColor, 0 0 10px rgba(34,211,238,0.25); }
+  50%      { box-shadow: 0 0 0 1px currentColor, 0 0 18px rgba(34,211,238,0.45); }
+}
+
+.flow-node .title {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; font-weight: 600;
+  color: #e2e8f0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.flow-node .title > span:last-child {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.flow-node .ndot {
+  width: 7px; height: 7px; border-radius: 50%; display: inline-block;
+  flex-shrink: 0;
+}
+.flow-node .subtitle {
+  margin-top: 1px;
+  font-size: 9px;
+  text-transform: uppercase; letter-spacing: 0.07em;
+  color: #64748b;
+}
+
+/* Group rectangles.  Subtle backgrounds — the LABEL is what carries the
+ * information, the box itself is just a visual envelope. */
+.flow-group {
+  position: absolute;
+  border: 1px dashed #1f2942;
+  border-radius: 10px;
+  background: rgba(15, 21, 37, 0.18);
+  z-index: 1;
+}
+.flow-group .group-label {
+  position: absolute;
+  top: -8px; left: 10px;
+  background: #0a0e1a;
+  padding: 0 6px;
+  font-size: 9.5px;
+  text-transform: uppercase; letter-spacing: 0.08em;
+  color: #64748b;
+  font-weight: 600;
+}
+
+/* Tool-chip strip — shown beneath the node, never inside it.  Width
+ * matches the node so the strip reads as "belongs to this node".
+ * max-height clips to 2 lines so a tool-heavy analyst (Market: 4 tools)
+ * doesn't push the next row down. */
+.tools-strip {
+  position: absolute;
+  display: flex; gap: 2px; flex-wrap: wrap;
+  width: 140px;
+  max-height: 28px;
+  overflow: hidden;
+  z-index: 3;
+}
+.tool-chip {
+  display: inline-block;
+  padding: 0.5px 5px;
+  border-radius: 999px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 8.5px;
+  line-height: 1.45;
+  background: #0a0e1a;
+  border: 1px solid #1f2942;
+  color: #94a3b8;
+  white-space: nowrap;
+}
+.tool-chip[data-state="running"] {
+  background: rgba(217,119,6,0.18);
+  border-color: #d97706;
+  color: #fbbf24;
+  animation: chippulse 1.0s ease-in-out infinite;
+}
+.tool-chip[data-state="done"] {
+  background: rgba(34,197,94,0.15);
+  border-color: #22c55e;
+  color: #4ade80;
+}
+.tool-chip[data-state="error"] {
+  background: rgba(239,68,68,0.18);
+  border-color: #ef4444;
+  color: #fca5a5;
+}
+@keyframes chippulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.55; }
+}
+
+/* ---------- Decision card ---------- */
+
+.kv {
+  background: rgba(10, 14, 26, 0.6);
+  border: 1px solid #1f2942;
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+.kv .k { color: #64748b; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; }
+.kv .v { color: #e2e8f0; font-size: 13px; font-variant-numeric: tabular-nums; }
+
+/* ---------- Logs colors ---------- */
+
+.log-tag-info   { color: #94a3b8; }
+.log-tag-node   { color: #60a5fa; }
+.log-tag-tool   { color: #fbbf24; }
+.log-tag-result { color: #4ade80; }
+.log-tag-error  { color: #fca5a5; }
+.log-tag-llm    { color: #c4b5fd; }
+.log-tag-report { color: #67e8f9; }
+.log-tag-final  { color: #facc15; font-weight: 600; }
+.log-tag-warn   { color: #fbbf24; font-weight: 600; }
+
+/* ---------- Report markdown rendering ---------- */
+
+.report-body {
+  color: #cbd5e1;
+  font-size: 13.5px;
+  line-height: 1.65;
+}
+.report-body h1, .report-body h2, .report-body h3, .report-body h4 {
+  color: #e2e8f0; margin-top: 14px; font-weight: 600;
+}
+.report-body h1 { font-size: 18px; }
+.report-body h2 { font-size: 16px; padding-bottom: 4px; border-bottom: 1px solid #1f2942; }
+.report-body h3 { font-size: 14px; color: #cbd5e1; }
+.report-body h4 { font-size: 12.5px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.06em; }
+.report-body p { margin: 6px 0; }
+.report-body strong { color: #f1f5f9; }
+.report-body em { color: #c4b5fd; }
+.report-body ul, .report-body ol { margin: 6px 0; padding-left: 22px; }
+.report-body li { margin: 2px 0; }
+.report-body li::marker { color: #64748b; }
+.report-body code {
+  background: rgba(17,23,41,0.7);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 12px;
+  color: #c4b5fd;
+}
+.report-body pre {
+  background: #0a0e1a;
+  border: 1px solid #1f2942;
+  padding: 10px;
+  border-radius: 6px;
+  overflow: auto;
+  font-size: 12px;
+}
+.report-body table { width: 100%; border-collapse: collapse; margin: 6px 0; }
+.report-body th, .report-body td {
+  padding: 6px 8px;
+  border-bottom: 1px solid #1f2942;
+  text-align: left;
+}
+.report-body tr:nth-child(even) td { background: rgba(15, 21, 37, 0.5); }
+
+/* =========================================================== help system */
+
+/* (i) info-icon — a small circle that pops the Help drawer on click and
+   shows a tooltip on hover.  Placed next to tabs, sidebar fields and
+   workflow panel headings via:
+       <button class="info-i" data-help="tab.memory">i</button>
+   The cursor + accessible label are tuned so it doesn't compete with
+   surrounding controls. */
+.info-i {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1px solid #475569;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 10px;
+  line-height: 1;
+  font-weight: 700;
+  font-family: "Inter", sans-serif;
+  cursor: help;
+  margin-left: 6px;
+  padding: 0;
+  vertical-align: middle;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+.info-i:hover, .info-i:focus-visible {
+  background: rgba(59, 130, 246, 0.18);
+  border-color: #3b82f6;
+  color: #93c5fd;
+  outline: none;
+}
+
+/* Tooltip popover (mounted once at the body level by index.html, positioned
+   imperatively by help.js).  z-index sits below the drawer (40) so the
+   drawer opens cleanly over any lingering tooltip. */
+.tc-tooltip {
+  position: fixed;
+  z-index: 50;
+  width: 280px;
+  background: #0a0e1a;
+  border: 1px solid #2a3556;
+  border-radius: 8px;
+  padding: 10px 12px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.6);
+  font-size: 12px;
+  color: #cbd5e1;
+  pointer-events: none;
+}
+.tc-tooltip-title {
+  font-weight: 600;
+  color: #f1f5f9;
+  font-size: 12.5px;
+  margin-bottom: 3px;
+}
+.tc-tooltip-body { line-height: 1.45; }
+.tc-tooltip-hint {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(255,255,255,0.05);
+  color: #64748b;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+/* Floating Help launcher — '?' button anchored to the bottom-right. */
+.help-fab {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 30;
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #3b82f6, #2563eb);
+  color: #fff;
+  border: 0;
+  box-shadow: 0 8px 24px rgba(37, 99, 235, 0.45);
+  display: grid;
+  place-items: center;
+  font-size: 18px;
+  transition: transform 0.12s, box-shadow 0.12s;
+}
+.help-fab:hover { transform: translateY(-2px); box-shadow: 0 12px 30px rgba(37, 99, 235, 0.55); }
+
+/* Drawer chrome — slides in from the right, transparent backdrop. */
+.help-drawer {
+  animation: helpDrawerSlide 0.18s ease-out;
+}
+@keyframes helpDrawerSlide {
+  from { transform: translateX(40px); opacity: 0; }
+  to   { transform: translateX(0); opacity: 1; }
+}
+
+.help-search-row {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 10px 14px;
+  border: 0;
+  background: transparent;
+  border-bottom: 1px solid #161e33;
+  color: inherit;
+}
+.help-search-row:hover { background: rgba(31, 41, 66, 0.6); }
+
+.help-chip {
+  padding: 3px 8px;
+  font-size: 11px;
+  border-radius: 4px;
+  background: rgba(31, 41, 66, 0.6);
+  border: 1px solid #2a3556;
+  color: #cbd5e1;
+  transition: background 0.12s, border-color 0.12s;
+}
+.help-chip:hover { background: rgba(59, 130, 246, 0.18); border-color: #3b82f6; color: #bfdbfe; }
+.help-chip.is-active {
+  background: rgba(59, 130, 246, 0.28);
+  border-color: #3b82f6;
+  color: #f1f5f9;
+}
+
+/* Drawer markdown styling — mirrors .report-body but tighter. */
+.help-long h1, .help-long h2, .help-long h3 {
+  color: #f1f5f9;
+  margin: 10px 0 6px;
+  font-weight: 600;
+}
+.help-long h1 { font-size: 15px; }
+.help-long h2 { font-size: 14px; }
+.help-long h3 { font-size: 13px; color: #cbd5e1; }
+.help-long p { margin: 6px 0; line-height: 1.55; font-size: 12.5px; color: #cbd5e1; }
+.help-long ul, .help-long ol { padding-left: 20px; margin: 6px 0; }
+.help-long li { margin: 3px 0; font-size: 12.5px; }
+.help-long code {
+  background: rgba(17,23,41,0.7);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 11.5px;
+  color: #c4b5fd;
+  font-family: "JetBrains Mono", monospace;
+}
+.help-long pre {
+  background: #0a0e1a;
+  border: 1px solid #1f2942;
+  padding: 8px 10px;
+  border-radius: 6px;
+  overflow: auto;
+  margin: 8px 0;
+  font-size: 11.5px;
+}
+.help-long pre code { background: transparent; padding: 0; }
+.help-long a { color: #93c5fd; text-decoration: underline; text-decoration-color: rgba(147,197,253,0.35); }
+.help-long strong { color: #f1f5f9; }
+.help-long table { width: 100%; border-collapse: collapse; margin: 6px 0; font-size: 12px; }
+.help-long th, .help-long td {
+  padding: 5px 7px;
+  border-bottom: 1px solid #1f2942;
+  text-align: left;
+}
+
+/* Glossary highlighting on rendered Reports.  Subtle underline so it's
+   discoverable without competing with the prose. */
+.glossary-term {
+  border-bottom: 1px dotted rgba(147, 197, 253, 0.5);
+  cursor: help;
+  color: #bfdbfe;
+}
+.glossary-term:hover { border-bottom-style: solid; color: #93c5fd; }
+
+/* Guided-tour overlay (Phase 1E). */
+.tour-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgba(0, 0, 0, 0.55);
+  pointer-events: auto;
+}
+.tour-spotlight {
+  position: absolute;
+  border-radius: 8px;
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.55), 0 0 0 3px #3b82f6;
+  transition: top 0.18s, left 0.18s, width 0.18s, height 0.18s;
+  pointer-events: none;
+}
+.tour-card {
+  position: absolute;
+  width: 320px;
+  background: #0f1525;
+  border: 1px solid #2a3556;
+  border-radius: 10px;
+  padding: 14px 16px;
+  box-shadow: 0 16px 40px rgba(0,0,0,0.55);
+  color: #cbd5e1;
+  font-size: 12.5px;
+  z-index: 61;
+}
+.tour-card h3 { margin: 0 0 4px; color: #f1f5f9; font-size: 14px; font-weight: 600; }
+.tour-card-foot { display: flex; gap: 6px; justify-content: flex-end; margin-top: 10px; }
+.tour-btn {
+  padding: 4px 10px;
+  font-size: 11.5px;
+  border-radius: 4px;
+  border: 1px solid #2a3556;
+  background: rgba(31,41,66,0.6);
+  color: #cbd5e1;
+}
+.tour-btn:hover { background: rgba(59,130,246,0.2); border-color: #3b82f6; color: #bfdbfe; }
+.tour-btn.is-primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+.tour-btn.is-primary:hover { background: #1d4ed8; }
+
+/* Limit help search row body to 2 lines without needing @tailwindcss/typography. */
+.line-clamp-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* Per-node (i) help icon — top-right corner of each agent box in the
+   workflow diagram.  Smaller than the inline .info-i to avoid disturbing
+   the dense diagram layout. */
+.flow-node .node-help {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 13px;
+  height: 13px;
+  font-size: 9px;
+  margin: 0;
+  border-color: rgba(148, 163, 184, 0.35);
+}
+.flow-node .node-help:hover {
+  background: rgba(59, 130, 246, 0.28);
+  border-color: #3b82f6;
+  color: #fff;
+}

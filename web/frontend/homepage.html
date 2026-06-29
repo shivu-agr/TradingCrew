@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TradingCrew — Research Dashboards</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            ink: {
+              900: '#0a0e17',
+              800: '#101627',
+              700: '#1c2438',
+              600: '#2a3550',
+            },
+          },
+          fontFamily: {
+            sans: ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+            mono: ['JetBrains Mono', 'ui-monospace', 'SFMono-Regular', 'monospace'],
+          },
+        },
+      },
+    };
+  </script>
+  <link rel="preconnect" href="https://rsms.me/">
+  <link rel="stylesheet" href="https://rsms.me/inter/inter.css" />
+  <style>
+    body { font-family: 'Inter', system-ui, sans-serif; }
+    .card-glow:hover { box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.4), 0 12px 40px -8px rgba(56, 189, 248, 0.25); transform: translateY(-2px); }
+    .card-glow { transition: all 200ms ease; }
+    .card-glow-amber:hover { box-shadow: 0 0 0 1px rgba(251, 191, 36, 0.4), 0 12px 40px -8px rgba(251, 191, 36, 0.25); transform: translateY(-2px); }
+  </style>
+</head>
+<body class="bg-ink-900 text-slate-200 min-h-screen flex flex-col">
+  <header class="border-b border-ink-700">
+    <div class="max-w-5xl mx-auto px-6 py-5 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div class="w-8 h-8 rounded-md bg-gradient-to-br from-blue-500 to-emerald-400"></div>
+        <div>
+          <div class="text-[14px] font-semibold tracking-tight">TradingCrew</div>
+          <div class="text-[11px] text-slate-500 -mt-0.5">Multi-agent research dashboards with deterministic execution + audit memory</div>
+        </div>
+      </div>
+      <div class="text-[11px] font-mono text-slate-500" id="version">v0.3.0 · dual asset</div>
+    </div>
+  </header>
+
+  <main class="flex-1 flex items-center justify-center px-6 py-12">
+    <div class="max-w-4xl w-full">
+      <div class="mb-10 text-center">
+        <h1 class="text-2xl font-semibold tracking-tight text-slate-100">Choose a research dashboard</h1>
+        <p class="text-[13px] text-slate-500 mt-2">Each dashboard runs a domain-specific multi-agent crew over the same M1–M7 deterministic backbone: typed action proposals, walk-forward backtesting, audit-grade episodic memory, and outcome-resolution learning.</p>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <!-- Stock card -->
+        <a href="/stock" class="block rounded-xl border border-ink-700 bg-ink-800/50 p-6 card-glow no-underline">
+          <div class="flex items-center gap-3 mb-4">
+            <div class="w-10 h-10 rounded-lg bg-blue-500/15 border border-blue-500/30 flex items-center justify-center">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="w-5 h-5 text-blue-300">
+                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+              </svg>
+            </div>
+            <div>
+              <div class="text-[16px] font-semibold text-slate-100">Stock Trading</div>
+              <div class="text-[11px] text-slate-500">Equity research · 18-agent debate</div>
+            </div>
+          </div>
+          <div class="text-[12px] text-slate-400 leading-relaxed mb-4">
+            Multi-turn analyst debate across market, social, news, fundamentals, macro, geopolitical, sector, and quant signals. Bull vs Bear research debate, Quality / Compliance / Risk review, then a typed Portfolio Manager decision.
+          </div>
+          <ul class="text-[11px] text-slate-400 space-y-1 mb-5">
+            <li><span class="text-slate-500">·</span> Yahoo Finance OHLCV + technicals (RSI / MACD / Bollinger / ATR)</li>
+            <li><span class="text-slate-500">·</span> Earnings proximity + historical base-rate backtest at decision time</li>
+            <li><span class="text-slate-500">·</span> Equity-vol Kelly sizing, single-name concentration caps</li>
+          </ul>
+          <div class="flex items-center justify-between text-[11px]">
+            <span class="text-slate-500">Default tickers: NVDA · AAPL · MSFT · NTNX · …</span>
+            <span class="text-blue-300 font-semibold">Open →</span>
+          </div>
+        </a>
+
+        <!-- Commodity card -->
+        <a href="/commodity" class="block rounded-xl border border-ink-700 bg-ink-800/50 p-6 card-glow-amber no-underline">
+          <div class="flex items-center gap-3 mb-4">
+            <div class="w-10 h-10 rounded-lg bg-amber-500/15 border border-amber-500/30 flex items-center justify-center">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="w-5 h-5 text-amber-300">
+                <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"></path>
+                <circle cx="12" cy="12" r="5"></circle>
+              </svg>
+            </div>
+            <div>
+              <div class="text-[16px] font-semibold text-slate-100">Commodity Trading</div>
+              <div class="text-[11px] text-slate-500">Futures research · 17-agent debate</div>
+            </div>
+          </div>
+          <div class="text-[12px] text-slate-400 leading-relaxed mb-4">
+            Bull/bear debate across price action, term-structure (contango/backwardation), inventories, supply-demand, macro, geopolitics, and positioning (CFTC COT) — refereed by a Research Manager, audited by a Quality Reviewer, sized by a Senior Futures Trader, and committed by a Portfolio Manager after a 3-way risk debate and compliance review.
+          </div>
+          <ul class="text-[11px] text-slate-400 space-y-1 mb-5">
+            <li><span class="text-slate-500">·</span> Yahoo Finance futures (CL=F, GC=F, NG=F, HG=F, ZC=F, ZS=F, ZW=F)</li>
+            <li><span class="text-slate-500">·</span> Curve term-structure, CFTC COT positioning, multi-year seasonality</li>
+            <li><span class="text-slate-500">·</span> Roll-yield-aware cost model, exchange-fee sizing, leverage-built-in</li>
+          </ul>
+          <div class="flex items-center justify-between text-[11px]">
+            <span class="text-slate-500">Default contracts: CL=F · GC=F · NG=F · HG=F · …</span>
+            <span class="text-amber-300 font-semibold">Open →</span>
+          </div>
+        </a>
+      </div>
+
+      <div class="mt-10 text-center text-[11px] text-slate-500">
+        Both dashboards share the same backbone: audit-grade memory, reflective critic, cascaded controller (CRISIS short-circuit), walk-forward grid search, and run persistence.
+      </div>
+    </div>
+  </main>
+
+  <footer class="border-t border-ink-700">
+    <div class="max-w-5xl mx-auto px-6 py-4 text-[11px] font-mono text-slate-500 flex items-center justify-between">
+      <div>TradingCrew · CrewAI multi-agent framework</div>
+      <div class="flex gap-4">
+        <a href="/stock" class="hover:text-slate-300">/stock</a>
+        <a href="/commodity" class="hover:text-slate-300">/commodity</a>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

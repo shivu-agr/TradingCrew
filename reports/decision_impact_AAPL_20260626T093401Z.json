@@ -1,0 +1,94 @@
+{
+  "ticker": "AAPL",
+  "params": {
+    "horizon": 20,
+    "target_pct": 8.0,
+    "stop_pct": 3.0
+  },
+  "horizons": [
+    {
+      "horizon_days": 20,
+      "is_trader": true,
+      "hit_rate": 0.24149108589951376,
+      "expectancy": 0.853849397420521,
+      "payoff": 2.1448267337848823,
+      "avg": 0.853849397420521,
+      "median": -2.073657170672105,
+      "n": 1234,
+      "wins": 298,
+      "losses": 611,
+      "timeouts": 325,
+      "avg_win": 8.914445833038084,
+      "avg_loss": -4.156254532181791
+    },
+    {
+      "horizon_days": 60,
+      "is_trader": false,
+      "hit_rate": 0.37269681742043553,
+      "expectancy": 0.8610699975099844,
+      "payoff": 2.204383543168094,
+      "avg": 0.8610699975099839,
+      "median": -3.233520270045387,
+      "n": 1194,
+      "wins": 445,
+      "losses": 739,
+      "timeouts": 10,
+      "avg_win": 8.972782117178731,
+      "avg_loss": -4.070426920481921
+    },
+    {
+      "horizon_days": 120,
+      "is_trader": false,
+      "hit_rate": 0.3835978835978836,
+      "expectancy": 0.9403874745320411,
+      "payoff": 2.2092326340027117,
+      "avg": 0.9403874745320419,
+      "median": -3.237159153672031,
+      "n": 1134,
+      "wins": 435,
+      "losses": 699,
+      "timeouts": 0,
+      "avg_win": 8.991521839608847,
+      "avg_loss": -4.0699751131767
+    },
+    {
+      "horizon_days": 252,
+      "is_trader": false,
+      "hit_rate": 0.3872255489021956,
+      "expectancy": 0.9407564623416804,
+      "payoff": 2.174835525363275,
+      "avg": 0.9407564623416804,
+      "median": -3.2379970352761633,
+      "n": 1002,
+      "wins": 388,
+      "losses": 614,
+      "timeouts": 0,
+      "avg_win": 8.919755461935782,
+      "avg_loss": -4.101347140007687
+    }
+  ],
+  "decision_old": {
+    "rules": "old",
+    "action": "NEUTRAL",
+    "confidence": 0.55,
+    "size_pct": 0.0,
+    "rationale": "hit-rate 24.1% < 40% caps confidence at 0.60; quality penalty halves size; both binding => NEUTRAL by default."
+  },
+  "decision_new": {
+    "rules": "new",
+    "action": "OVERWEIGHT",
+    "confidence": 0.88,
+    "size_pct": 1.125,
+    "rationale": "best-expectancy horizon = 252d (exp +0.94%, hit-rate 38.7%, payoff 2.17x). Positive expectancy with payoff \u2265 1.5 \u2014 hit-rate cap not binding."
+  },
+  "walk_forward": {
+    "n_proposals": 0,
+    "n_folds": 0,
+    "total_return_pct": null,
+    "sharpe": null,
+    "max_drawdown": null,
+    "deflated_sharpe": null,
+    "notes": "Only 0 proposals for AAPL; walk-forward needs \u2265 5."
+  },
+  "timestamp": "20260626T093401Z"
+}

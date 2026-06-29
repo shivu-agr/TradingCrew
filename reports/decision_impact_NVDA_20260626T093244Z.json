@@ -1,0 +1,94 @@
+{
+  "ticker": "NVDA",
+  "params": {
+    "horizon": 20,
+    "target_pct": 5.0,
+    "stop_pct": 3.0
+  },
+  "horizons": [
+    {
+      "horizon_days": 20,
+      "is_trader": true,
+      "hit_rate": 0.4651539708265802,
+      "expectancy": 0.8272410168740865,
+      "payoff": 1.5149051402724667,
+      "avg": 0.8272410168740861,
+      "median": -3.087122163734224,
+      "n": 1234,
+      "wins": 574,
+      "losses": 654,
+      "timeouts": 6,
+      "avg_win": 7.116533902226535,
+      "avg_loss": -4.697676252485733
+    },
+    {
+      "horizon_days": 60,
+      "is_trader": false,
+      "hit_rate": 0.45979899497487436,
+      "expectancy": 0.7415329313752754,
+      "payoff": 1.5177995813015095,
+      "avg": 0.7415329313752751,
+      "median": -3.120474264809514,
+      "n": 1194,
+      "wins": 549,
+      "losses": 645,
+      "timeouts": 0,
+      "avg_win": 7.137786129918302,
+      "avg_loss": -4.702719791105534
+    },
+    {
+      "horizon_days": 120,
+      "is_trader": false,
+      "hit_rate": 0.47530864197530864,
+      "expectancy": 0.9215491106171996,
+      "payoff": 1.5136172358648567,
+      "avg": 0.9215491106171999,
+      "median": -3.0639262987853355,
+      "n": 1134,
+      "wins": 539,
+      "losses": 595,
+      "timeouts": 0,
+      "avg_win": 7.1625963038400995,
+      "avg_loss": -4.732105405596486
+    },
+    {
+      "horizon_days": 252,
+      "is_trader": false,
+      "hit_rate": 0.48403193612774453,
+      "expectancy": 1.0083097476679441,
+      "payoff": 1.496200642303872,
+      "avg": 1.008309747667944,
+      "median": -3.0408616549224443,
+      "n": 1002,
+      "wins": 485,
+      "losses": 517,
+      "timeouts": 0,
+      "avg_win": 7.24465847131525,
+      "avg_loss": -4.842036733896744
+    }
+  ],
+  "decision_old": {
+    "rules": "old",
+    "action": "OVERWEIGHT",
+    "confidence": 0.85,
+    "size_pct": 1.5,
+    "rationale": "hit-rate 46.5% \u2014 no hit-rate cap"
+  },
+  "decision_new": {
+    "rules": "new",
+    "action": "OVERWEIGHT",
+    "confidence": 0.88,
+    "size_pct": 1.5,
+    "rationale": "best-expectancy horizon = 252d (exp +1.01%, hit-rate 48.4%, payoff 1.50x). Positive expectancy with payoff \u2265 1.5 \u2014 hit-rate cap not binding."
+  },
+  "walk_forward": {
+    "n_proposals": 0,
+    "n_folds": 0,
+    "total_return_pct": null,
+    "sharpe": null,
+    "max_drawdown": null,
+    "deflated_sharpe": null,
+    "notes": "Only 0 proposals for NVDA; walk-forward needs \u2265 5."
+  },
+  "timestamp": "20260626T093244Z"
+}

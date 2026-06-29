@@ -1,0 +1,36 @@
+TradingCrew
+Copyright 2026 Shivam Agrahari
+
+This product was developed by Shivam Agrahari.
+
+------------------------------------------------------------
+Third-party inspiration and acknowledgements
+------------------------------------------------------------
+
+The high-level multi-agent debate topology (analyst team → bull/bear
+research debate → trader → 3-way risk debate → portfolio manager) is
+inspired by:
+
+  TauricResearch/TradingAgents — "TradingAgents: Multi-Agents LLM
+  Financial Trading Framework", Apache-2.0 licensed.
+  https://github.com/TauricResearch/TradingAgents
+
+  Xiao et al., "TradingAgents: Multi-Agents LLM Financial Trading
+  Framework", arXiv:2412.20138 (2025).
+  https://arxiv.org/abs/2412.20138
+
+TradingCrew is an independent implementation: it is built on CrewAI
+(not LangGraph), introduces a deterministic post-LLM Layer-A pipeline
+(M1–M7 — bridge, simulator, episodic memory, regime detector + critic,
+sizer + gates, optional RL trainer), adds a futures dashboard with
+cost-model presets, and ships its own FastAPI/WebSocket web UI. No
+source code is copied from the upstream project.
+
+------------------------------------------------------------
+Runtime dependencies
+------------------------------------------------------------
+
+This product depends on third-party Python packages declared in
+`requirements.txt` (CrewAI, FastAPI, yfinance, LanceDB, Tavily, etc.).
+Each is distributed under its own license — see the respective project
+for terms.

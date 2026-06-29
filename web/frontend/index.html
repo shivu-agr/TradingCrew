@@ -1,0 +1,2089 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TradingCrew — Multi-Agent Trading Workbench</title>
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+        rel="stylesheet" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ["Inter", "ui-sans-serif", "system-ui"],
+            mono: ["JetBrains Mono", "ui-monospace", "SFMono-Regular", "monospace"],
+          },
+          colors: {
+            ink: { 900: "#0a0e1a", 800: "#0f1525", 700: "#161e33",
+                   600: "#1f2942", 500: "#2a3556", 400: "#3b4768" },
+            accent: { bull: "#22c55e", bear: "#ef4444", neutral: "#f59e0b",
+                      trader: "#a855f7", manager: "#3b82f6", analyst: "#06b6d4",
+                      reviewer: "#facc15", tool: "#d97706" },
+          },
+        },
+      },
+    };
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns/dist/chartjs-adapter-date-fns.bundle.min.js" defer></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <link rel="stylesheet" href="/static/style.css" />
+  <style>[x-cloak] { display: none !important; }</style>
+</head>
+<body class="h-full bg-ink-900 text-slate-300 font-sans antialiased">
+  <div id="app"
+       x-data="tradingCrewApp()"
+       x-init="init()"
+       class="flex h-full min-h-screen">
+
+    <!-- ============================== Sidebar ============================== -->
+    <aside class="sidebar w-[360px] shrink-0 border-r border-ink-700 bg-ink-800/70 flex flex-col"
+           :class="{ 'is-collapsed': sidebarCollapsed }">
+
+      <!-- Brand bar -->
+      <div class="px-3 py-3 border-b border-ink-700 sticky top-0 bg-ink-800/95 backdrop-blur z-10 flex items-center gap-2">
+        <button type="button"
+                @click="sidebarCollapsed = !sidebarCollapsed"
+                class="size-9 rounded-md grid place-items-center hover:bg-ink-700/60 text-slate-400 hover:text-slate-200 transition shrink-0"
+                :title="sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'">
+          <svg class="size-5 transition-transform duration-200" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+               :class="sidebarCollapsed ? 'rotate-180' : ''">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 19l-7-7 7-7m8 14l-7-7 7-7" />
+          </svg>
+        </button>
+        <div class="sidebar-brand-text">
+          <div class="flex items-center gap-2">
+            <a href="/" class="text-sm font-semibold tracking-tight text-slate-200 hover:text-blue-300" title="Back to dashboard chooser">TradingCrew</a>
+            <span
+              class="text-[9px] px-1.5 py-0.5 rounded font-mono uppercase tracking-wider"
+              :class="assetClass === 'commodity' ? 'bg-amber-500/15 text-amber-300 border border-amber-500/30' : 'bg-blue-500/15 text-blue-300 border border-blue-500/30'"
+              x-text="assetClass"
+            ></span>
+          </div>
+          <div class="text-[10.5px] text-slate-500" x-text="assetClass === 'commodity' ? 'CrewAI 17-agent futures crew' : 'CrewAI 18-agent equity crew'"></div>
+        </div>
+      </div>
+
+      <!-- Collapsed rail -->
+      <div class="sidebar-rail px-1 py-2">
+        <template x-for="s in sections" :key="s.id">
+          <button class="rail-btn" :title="s.title" @click="sidebarCollapsed=false; openSection(s.id)">
+            <span class="text-[11px] font-bold" x-text="s.icon"></span>
+          </button>
+        </template>
+      </div>
+
+      <!-- Scrollable body -->
+      <div class="sidebar-body flex-1 overflow-y-auto">
+
+        <!-- =========== Bootstrap error banner =========== -->
+        <!-- Visible when /api/options failed to load. Without this, the
+             sidebar silently shows "0 of 0 tools enabled" and the user
+             has no idea the backend never replied. -->
+        <div x-show="optionsError"
+             x-cloak
+             class="mx-3 mt-3 mb-2 rounded-md border border-rose-500/40 bg-rose-500/10 p-3 text-[12px] leading-relaxed">
+          <div class="flex items-start gap-2">
+            <svg class="size-4 text-rose-300 shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <div class="flex-1 min-w-0">
+              <div class="font-semibold text-rose-200">Couldn't load workbench config</div>
+              <div class="text-rose-100/80 text-[11px] mt-0.5 break-words" x-text="optionsError"></div>
+              <div class="text-rose-200/60 text-[10.5px] mt-1.5">
+                The sidebar will stay empty until this succeeds. Try a hard refresh
+                (<span class="font-mono">⌘ + Shift + R</span>) or retry below.
+              </div>
+              <button type="button"
+                      @click="loadOptions()"
+                      :disabled="optionsRetrying"
+                      class="mt-2 inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 text-rose-100 text-[11px] font-semibold disabled:opacity-60 disabled:cursor-wait">
+                <svg class="size-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+                <span x-text="optionsRetrying ? 'Retrying…' : 'Retry'"></span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- =========== Ticker =========== -->
+        <div class="section" :class="{ 'is-open': openSections.ticker }">
+          <button class="section-header" @click="toggle('ticker')">
+            <span class="flex items-center gap-2">
+              <span class="section-h">Ticker</span>
+              <span class="info-i" role="button" tabindex="0"
+                    data-help="sidebar.ticker"
+                    @click.stop="$store.help.openHelp('sidebar.ticker')"
+                    @keydown.enter.stop="$store.help.openHelp('sidebar.ticker')"
+                    aria-label="What is the Ticker field?">i</span>
+              <span class="section-meta" x-text="form.ticker || '—'"></span>
+            </span>
+            <svg class="chev size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+            </svg>
+          </button>
+          <div class="section-body">
+            <div class="preset-grid mb-2.5">
+              <template x-for="t in tickers" :key="t.symbol">
+                <button type="button" @click="form.ticker = t.symbol"
+                        :class="form.ticker === t.symbol ? 'selected' : ''"
+                        x-text="t.symbol"></button>
+              </template>
+            </div>
+            <label class="cfg-l">Custom ticker</label>
+            <input type="text" x-model="form.ticker" placeholder="e.g. NVDA, AAPL, NTNX"
+                   class="cfg-input uppercase font-mono" />
+          </div>
+        </div>
+
+        <!-- =========== Analysis date =========== -->
+        <div class="section" :class="{ 'is-open': openSections.date }">
+          <button class="section-header" @click="toggle('date')">
+            <span class="flex items-center gap-2">
+              <span class="section-h">Analysis date</span>
+              <span class="info-i" role="button" tabindex="0"
+                    data-help="sidebar.date"
+                    @click.stop="$store.help.openHelp('sidebar.date')"
+                    @keydown.enter.stop="$store.help.openHelp('sidebar.date')"
+                    aria-label="What does the Analysis date do?">i</span>
+              <span class="section-meta" x-text="form.trade_date"></span>
+            </span>
+            <svg class="chev size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+            </svg>
+          </button>
+          <div class="section-body">
+            <input type="date" x-model="form.trade_date" class="cfg-input" />
+            <p class="text-[11px] text-slate-500 mt-2 leading-relaxed">
+              Drives the chart end-date. The crew itself uses live data.
+            </p>
+          </div>
+        </div>
+
+        <!-- =========== LLM picker =========== -->
+        <div class="section" :class="{ 'is-open': openSections.llm }">
+          <button class="section-header" @click="toggle('llm')">
+            <span class="flex items-center gap-2">
+              <span class="section-h">LLM</span>
+              <span class="info-i" role="button" tabindex="0"
+                    data-help="sidebar.llm"
+                    @click.stop="$store.help.openHelp('sidebar.llm')"
+                    @keydown.enter.stop="$store.help.openHelp('sidebar.llm')"
+                    aria-label="What LLM is configured?">i</span>
+              <span class="section-meta" x-text="llmSummary"></span>
+            </span>
+            <svg class="chev size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+            </svg>
+          </button>
+          <div class="section-body">
+            <label class="cfg-l">Active model</label>
+            <select
+              x-model="selectedLlmPreset"
+              @change="onLlmPresetChange()"
+              class="w-full bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] text-slate-200"
+              :class="{ 'opacity-60': !optionsLoaded }"
+              :disabled="!optionsLoaded">
+              <template x-for="p in llmPresets" :key="p.id">
+                <option
+                  :value="p.id"
+                  :disabled="!p.api_key_configured"
+                  x-text="p.api_key_configured ? p.label : (p.label + ' — set ' + p.api_env)"></option>
+              </template>
+            </select>
+
+            <template x-if="activeLlmPreset">
+              <div class="mt-2 text-[11px] text-slate-400 leading-relaxed">
+                <p>
+                  <span class="text-slate-200 font-mono" x-text="activeLlmPreset.model"></span>
+                </p>
+                <p class="text-slate-500 mt-0.5">
+                  via <span class="font-mono" x-text="activeLlmPreset.base_url || '(provider default)'"></span>
+                </p>
+                <p class="text-[10px] text-slate-500 mt-1 leading-snug" x-text="activeLlmPreset.description"></p>
+                <div class="flex flex-wrap items-center gap-1 mt-1">
+                  <span class="px-1.5 py-0.5 rounded text-[10px]"
+                        :class="activeLlmPreset.kind === 'open-source'
+                          ? 'bg-emerald-500/15 text-emerald-300'
+                          : 'bg-amber-500/15 text-amber-300'"
+                        x-text="activeLlmPreset.kind"></span>
+                  <template x-for="t in (activeLlmPreset.tags || [])" :key="t">
+                    <span class="px-1.5 py-0.5 rounded text-[10px] bg-slate-500/15 text-slate-300" x-text="t"></span>
+                  </template>
+                  <span class="text-[10px] text-slate-500 ml-auto"
+                        x-text="activeLlmPreset.context_window ? (Math.round(activeLlmPreset.context_window / 1024) + 'K ctx') : ''"></span>
+                </div>
+              </div>
+            </template>
+
+            <p class="text-[11px] text-slate-500 mt-2">
+              Closed-source presets need their key in <code>.env</code>; the dropdown greys them out until you set it.
+              Tavily:
+              <span :class="tavily ? 'text-emerald-400' : 'text-amber-400'"
+                    x-text="tavily ? 'configured' : 'missing'"></span>.
+            </p>
+
+            <!-- ============ Embedding model picker ============ -->
+            <div class="mt-4 pt-3 border-t border-ink-800"
+                 :class="{ 'opacity-50': !form.memory }">
+              <div class="flex items-center gap-2 mb-1">
+                <label class="cfg-l mb-0">Embedding model</label>
+                <span class="info-i" role="button" tabindex="0"
+                      data-help="sidebar.embedding"
+                      @click.stop="$store.help.openHelp('sidebar.embedding')"
+                      @keydown.enter.stop="$store.help.openHelp('sidebar.embedding')"
+                      aria-label="What is the embedding model for?">i</span>
+                <span class="text-[10px] text-slate-500 ml-auto"
+                      x-show="!form.memory">memory off</span>
+              </div>
+              <select
+                x-model="selectedEmbeddingPreset"
+                @change="onEmbeddingPresetChange()"
+                class="w-full bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] text-slate-200"
+                :class="{ 'opacity-60': !optionsLoaded }"
+                :disabled="!optionsLoaded">
+                <template x-for="p in embeddingPresets" :key="p.id">
+                  <option
+                    :value="p.id"
+                    :disabled="!p.api_key_configured"
+                    x-text="p.api_key_configured
+                      ? p.label
+                      : (p.label + ' — set ' + p.api_env
+                        + (p.id === 'vllm-embedding' ? ' + VLLM_EMBEDDING_BASE_URL/MODEL' : ''))"></option>
+                </template>
+              </select>
+
+              <template x-if="activeEmbeddingPreset">
+                <div class="mt-2 text-[11px] text-slate-400 leading-relaxed">
+                  <p>
+                    <span class="text-slate-200 font-mono"
+                          x-text="activeEmbeddingPreset.resolved_model
+                            || activeEmbeddingPreset.model
+                            || '(env-driven — set VLLM_EMBEDDING_MODEL)'"></span>
+                  </p>
+                  <p class="text-slate-500 mt-0.5">
+                    via <span class="font-mono"
+                              x-text="activeEmbeddingPreset.resolved_base_url
+                                || activeEmbeddingPreset.base_url
+                                || '(provider default)'"></span>
+                  </p>
+                  <p class="text-[10px] text-slate-500 mt-1 leading-snug"
+                     x-text="activeEmbeddingPreset.description"></p>
+                  <div class="flex flex-wrap items-center gap-1 mt-1">
+                    <span class="px-1.5 py-0.5 rounded text-[10px]"
+                          :class="activeEmbeddingPreset.kind === 'open-source'
+                            ? 'bg-emerald-500/15 text-emerald-300'
+                            : 'bg-amber-500/15 text-amber-300'"
+                          x-text="activeEmbeddingPreset.kind"></span>
+                    <template x-for="t in (activeEmbeddingPreset.tags || [])" :key="t">
+                      <span class="px-1.5 py-0.5 rounded text-[10px] bg-slate-500/15 text-slate-300" x-text="t"></span>
+                    </template>
+                    <span class="text-[10px] text-slate-500 ml-auto"
+                          x-text="activeEmbeddingPreset.dim
+                            ? (activeEmbeddingPreset.dim + '-d')
+                            : ''"></span>
+                  </div>
+                </div>
+              </template>
+
+              <p class="text-[10px] text-slate-500 mt-2 leading-snug">
+                Used by the LLM-enriched memory store. Switching presets is safe — the
+                crew partitions its on-disk vector store by preset id so vector-dim
+                changes don't break older runs.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <!-- =========== Recent runs (Phase E) =========== -->
+        <div class="section" :class="{ 'is-open': openSections.runs }">
+          <button class="section-header" @click="toggle('runs'); if (openSections.runs) loadRecentRuns()">
+            <span class="flex items-center gap-2">
+              <span class="section-title">Recent runs</span>
+              <span class="info-i" role="button" tabindex="0"
+                    data-help="sidebar.runs"
+                    @click.stop="$store.help.openHelp('sidebar.runs')"
+                    @keydown.enter.stop="$store.help.openHelp('sidebar.runs')"
+                    aria-label="How do Recent runs work?">i</span>
+            </span>
+            <span class="text-[10px] text-slate-500" x-text="(recentRuns?.length || 0) + ' saved'"></span>
+          </button>
+          <div class="section-body">
+            <div class="space-y-1 mt-2 max-h-72 overflow-y-auto">
+              <template x-for="r in recentRuns" :key="r.run_id">
+                <button @click="loadRun(r.ticker, r.run_id)"
+                        class="w-full text-left rounded-md border border-ink-700 bg-ink-900/50 hover:bg-ink-900 px-2.5 py-1.5 transition">
+                  <div class="flex items-center justify-between gap-2 text-[11px] font-mono">
+                    <span class="text-slate-200 font-semibold" x-text="r.ticker"></span>
+                    <span class="text-[10px] px-1.5 py-0.5 rounded"
+                          :class="{
+                            'bg-emerald-500/20 text-emerald-300': r.final_action === 'OVERWEIGHT',
+                            'bg-rose-500/20 text-rose-300': r.final_action === 'UNDERWEIGHT',
+                            'bg-slate-500/20 text-slate-300': r.final_action === 'NEUTRAL' || !r.final_action,
+                          }"
+                          x-text="r.final_action || '?'"></span>
+                  </div>
+                  <div class="text-[10px] text-slate-500 mt-0.5 font-mono" x-text="(r.started_at || '').slice(0, 16).replace('T', ' ')"></div>
+                  <div class="text-[10px] mt-0.5"
+                       :class="r.cascade_route === 'CRISIS_OVERRIDE' ? 'text-rose-400' : 'text-slate-500'"
+                       x-text="r.cascade_route ? `route: ${r.cascade_route}` : ''"></div>
+                </button>
+              </template>
+              <div x-show="!recentRuns?.length" class="text-[11px] text-slate-500 italic py-3 text-center">
+                No saved runs yet. Hit "Run analysis" to record one.
+              </div>
+            </div>
+            <div class="flex items-center justify-between mt-2 text-[10px] text-slate-500">
+              <div class="flex items-center gap-3">
+                <button @click="loadRecentRuns()"
+                        class="hover:text-slate-300"
+                        :disabled="clearingRecentRuns">Refresh</button>
+                <button @click="clearRecentRuns()"
+                        class="text-rose-400/80 hover:text-rose-300 disabled:opacity-40 disabled:cursor-not-allowed"
+                        :disabled="clearingRecentRuns || !(recentRuns?.length)"
+                        :title="recentRuns?.length ? 'Move all saved runs into a timestamped backup folder' : 'No runs to clear'">
+                  <span x-show="!clearingRecentRuns">Clear all</span>
+                  <span x-show="clearingRecentRuns">Clearing&hellip;</span>
+                </button>
+              </div>
+              <span x-show="loadedRunId" class="text-cyan-300 font-mono truncate ml-2" x-text="loadedRunId ? `viewing: ${loadedRunId.slice(0,16)}` : ''"></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- =========== Advanced settings (dialogue + analysts + tools) =========== -->
+        <div class="advanced-group" :class="{ 'is-open': advancedOpen }">
+          <button class="advanced-header" @click="advancedOpen = !advancedOpen">
+            <span class="flex items-center gap-2">
+              <span>Advanced settings</span>
+              <span class="text-[10px] text-slate-500 normal-case tracking-normal"
+                    x-text="`${selectedAnalystCount} analysts · ${totalEnabledTools()} tools · debate ${form.max_debate_rounds}/${form.max_risk_rounds}`"></span>
+            </span>
+            <svg class="chev size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+            </svg>
+          </button>
+          <div class="advanced-body">
+
+            <!-- Multi-turn dialogue -->
+            <div class="section" :class="{ 'is-open': openSections.dialogue }">
+              <button class="section-header" @click="toggle('dialogue')">
+                <span class="flex items-center gap-2">
+                  <span class="section-h">Multi-turn dialogue</span>
+                  <span class="info-i" role="button" tabindex="0"
+                        data-help="sidebar.dialogue"
+                        @click.stop="$store.help.openHelp('sidebar.dialogue')"
+                        @keydown.enter.stop="$store.help.openHelp('sidebar.dialogue')"
+                        aria-label="What do these debate sliders do?">i</span>
+                  <span class="section-meta"
+                        x-text="`debate ${form.max_debate_rounds} · risk ${form.max_risk_rounds}`"></span>
+                </span>
+                <svg class="chev size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+                </svg>
+              </button>
+              <div class="section-body">
+                <label class="cfg-l">Debate rounds (Bull vs Bear)</label>
+                <div class="flex items-center gap-3">
+                  <input type="range" min="1" max="10" step="1" x-model.number="form.max_debate_rounds" class="flex-1" />
+                  <span class="cfg-val" x-text="form.max_debate_rounds"></span>
+                </div>
+                <label class="cfg-l">Risk-team rounds</label>
+                <div class="flex items-center gap-3">
+                  <input type="range" min="1" max="10" step="1" x-model.number="form.max_risk_rounds" class="flex-1" />
+                  <span class="cfg-val" x-text="form.max_risk_rounds"></span>
+                </div>
+                <label class="checkbox mt-3 flex items-start gap-2">
+                  <input type="checkbox" x-model="form.memory" class="mt-1" />
+                  <span class="flex-1">
+                    <span>LLM-enriched memory</span>
+                    <span class="info-i ml-1" role="button" tabindex="0"
+                          data-help="sidebar.memory"
+                          @click.stop="$store.help.openHelp('sidebar.memory')"
+                          @keydown.enter.stop="$store.help.openHelp('sidebar.memory')"
+                          aria-label="What is LLM-enriched memory?">i</span>
+                    <div class="cfg-hint mt-1" x-show="form.memory" x-cloak>
+                      ~<span x-text="estimateMemoryLlmCalls().count"></span> LLM analysis calls
+                      (≈ <span x-text="estimateMemoryLlmCalls().minutes"></span> min @ 60 req/min, 8 parallel workers)
+                    </div>
+                    <div class="cfg-hint mt-1" x-show="!form.memory" x-cloak>
+                      Memory off — agents start each task fresh, no extra LLM calls.
+                    </div>
+                  </span>
+                </label>
+              </div>
+            </div>
+
+            <!-- Tools (per-agent enable/disable) -->
+            <div class="section" :class="{ 'is-open': openSections.tools }">
+              <button class="section-header" @click="toggle('tools')">
+                <span class="flex items-center gap-2">
+                  <span class="section-h">Tools</span>
+                  <span class="info-i" role="button" tabindex="0"
+                        data-help="sidebar.tools"
+                        @click.stop="$store.help.openHelp('sidebar.tools')"
+                        @keydown.enter.stop="$store.help.openHelp('sidebar.tools')"
+                        aria-label="How do tool toggles work?">i</span>
+                  <span class="section-meta"
+                        x-text="`${totalEnabledTools()} of ${totalAvailableTools()} enabled`"></span>
+                </span>
+                <svg class="chev size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+                </svg>
+              </button>
+              <div class="section-body">
+                <p class="text-[11px] text-slate-500 mb-2 leading-relaxed">
+                  Enable / disable tools each agent can call. Disabling all tools
+                  means the agent has to rely on its prior context only.
+                </p>
+                <template x-for="agent in toolOwners" :key="agent.key">
+                  <div class="mb-2.5">
+                    <div class="text-[10.5px] uppercase tracking-wider text-slate-500 mb-1"
+                         x-text="agent.role"></div>
+                    <div class="space-y-1">
+                      <template x-for="toolName in agent.tools" :key="toolName">
+                        <label class="flex items-start gap-2 text-xs leading-snug">
+                          <input type="checkbox"
+                                 :checked="isToolEnabled(agent.key, toolName)"
+                                 @change="toggleTool(agent.key, toolName, $event.target.checked)"
+                                 class="mt-0.5" />
+                          <span>
+                            <span class="font-mono text-slate-300" x-text="toolName"></span>
+                            <span class="block text-slate-500 text-[10.5px] leading-tight"
+                                  x-text="(toolsInfo[toolName]?.description || '').slice(0, 110)"></span>
+                          </span>
+                        </label>
+                      </template>
+                    </div>
+                  </div>
+                </template>
+              </div>
+            </div>
+
+          </div>
+        </div>
+        <!-- /Advanced settings -->
+
+      </div>
+      <!-- /sidebar-body -->
+
+      <!-- =========== Sticky Run button at bottom =========== -->
+      <div class="p-4 sticky bottom-0 bg-ink-800/95 backdrop-blur border-t border-ink-700">
+        <button type="button"
+                @click="startRun()"
+                :disabled="isRunning"
+                class="w-full rounded-md py-2 text-sm font-semibold transition disabled:opacity-50 disabled:cursor-not-allowed"
+                :class="isRunning ? 'bg-ink-700 text-slate-400' : 'bg-blue-600 hover:bg-blue-500 text-white shadow shadow-blue-600/20'">
+          <span x-show="!isRunning">▶ Run analysis</span>
+          <span x-show="isRunning" class="inline-flex items-center gap-2 justify-center">
+            <span class="size-1.5 rounded-full bg-white animate-pulse"></span>
+            Running…
+          </span>
+        </button>
+        <button x-show="isRunning"
+                @click="cancelRun()"
+                class="w-full mt-1.5 text-[11px] text-slate-500 hover:text-slate-300 py-1">
+          ■ Cancel
+        </button>
+      </div>
+    </aside>
+
+    <!-- ============================== Main area ============================== -->
+    <main class="flex-1 overflow-y-auto">
+
+      <!-- Header -->
+      <header class="px-6 py-3 border-b border-ink-700 bg-ink-800/40 sticky top-0 z-20 backdrop-blur">
+        <div class="flex items-center justify-between gap-4">
+          <div class="min-w-0">
+            <div class="flex items-center gap-3">
+              <h1 class="text-lg font-semibold tracking-tight text-slate-200">
+                <span x-text="form.ticker || '—'"></span>
+                <span class="text-slate-500 text-sm font-normal ml-2" x-text="form.trade_date || ''"></span>
+              </h1>
+              <span x-show="status"
+                    class="px-2 py-0.5 rounded-full text-[10.5px] font-medium"
+                    :class="{
+                      'bg-slate-800 text-slate-400 border border-slate-700': status === 'idle',
+                      'bg-blue-500/10 text-blue-300 border border-blue-500/30': status === 'running',
+                      'bg-emerald-500/10 text-emerald-300 border border-emerald-500/30': status === 'completed',
+                      'bg-red-500/10 text-red-300 border border-red-500/30': status === 'error',
+                    }"
+                    x-text="status"></span>
+            </div>
+            <div class="text-[11px] text-slate-500 mt-0.5" x-show="currentNode">
+              Currently executing: <span class="font-mono text-slate-300" x-text="currentNode"></span>
+            </div>
+          </div>
+          <div class="flex items-center gap-3">
+            <div x-show="finalDecision" class="text-right">
+              <div class="text-[10px] uppercase tracking-wider text-slate-500">Final decision</div>
+              <div class="text-xl font-bold tracking-tight"
+                   :class="{
+                     'text-accent-bull': finalDecision === 'OVERWEIGHT',
+                     'text-accent-bear': finalDecision === 'UNDERWEIGHT',
+                     'text-accent-neutral': finalDecision === 'NEUTRAL',
+                   }"
+                   x-text="finalDecision"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tabs -->
+        <nav class="mt-3 flex gap-1 text-sm">
+          <template x-for="tab in tabs.filter(t => !t.commodityOnly || assetClass === 'commodity')" :key="tab.id">
+            <button type="button"
+                    :data-help-tip="`tab.${tab.id}`"
+                    @click="activeTab = tab.id; if (tab.id === 'memory') loadMemoryRetrieval(); if (tab.id === 'backtest') loadBacktest(); if (tab.id === 'portfolio') loadPortfolio(); if (tab.id === 'futures') loadCommodityFutures()"
+                    :class="activeTab === tab.id
+                      ? 'border-blue-500 text-slate-100'
+                      : 'border-transparent text-slate-500 hover:text-slate-300'"
+                    class="px-3 py-1.5 border-b-2 -mb-px font-medium transition inline-flex items-center">
+              <span x-text="tab.label"></span>
+              <span x-show="tab.id === 'logs' && pendingLogCount > 0"
+                    class="ml-1 inline-block bg-amber-500/30 text-amber-200 text-[10px] font-bold rounded-full px-1.5"
+                    x-text="pendingLogCount"></span>
+              <!-- Info icon: hover for short, click for full drawer.
+                   Span (not <button>) because the parent is already a <button>;
+                   nested buttons are invalid HTML.  Click delegation in help.js
+                   matches on `.info-i` so any element gets the open behaviour. -->
+              <span class="info-i"
+                    role="button"
+                    tabindex="0"
+                    :data-help="`tab.${tab.id}`"
+                    @click.stop="$store.help.openHelp(`tab.${tab.id}`)"
+                    @keydown.enter.stop="$store.help.openHelp(`tab.${tab.id}`)"
+                    :aria-label="`What is the ${tab.label} tab?`">i</span>
+            </button>
+          </template>
+        </nav>
+      </header>
+
+      <!-- Workflow Tab -->
+      <section x-show="activeTab === 'workflow'" class="p-6 space-y-6">
+        <div class="rounded-xl border border-ink-700 bg-ink-800/30 p-5">
+          <div class="flex items-center justify-between mb-4 gap-3 flex-wrap">
+            <h2 class="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Workflow diagram</h2>
+            <div class="flex items-center gap-3">
+              <div class="text-[11px] text-slate-500 hidden md:block">
+                Click any node to inspect · Ctrl+wheel to zoom · drag to pan
+              </div>
+              <!-- Zoom toolbar: + / − / Fit / 100%.  The buttons call
+                   methods on the WorkflowDiagram instance via a small
+                   adapter in app.js (see diagramZoom* helpers). -->
+              <div class="flex items-center gap-1 rounded-md border border-ink-700 bg-ink-900/60 p-0.5">
+                <button @click="diagramZoomOut()" title="Zoom out (Ctrl+−)"
+                        class="px-2 py-0.5 text-slate-300 hover:bg-ink-700 rounded text-sm leading-none">−</button>
+                <span class="text-[10px] text-slate-400 font-mono px-1 min-w-[3.5em] text-center"
+                      x-text="`${Math.round(diagramScale * 100)}%`"></span>
+                <button @click="diagramZoomIn()" title="Zoom in (Ctrl+=)"
+                        class="px-2 py-0.5 text-slate-300 hover:bg-ink-700 rounded text-sm leading-none">+</button>
+                <span class="w-px h-4 bg-ink-700 mx-0.5"></span>
+                <button @click="diagramZoomFit()" title="Fit to width"
+                        class="px-2 py-0.5 text-slate-400 hover:bg-ink-700 hover:text-slate-200 rounded text-[10px] uppercase tracking-wider">Fit</button>
+                <button @click="diagramZoomReset()" title="Reset to 100%"
+                        class="px-2 py-0.5 text-slate-400 hover:bg-ink-700 hover:text-slate-200 rounded text-[10px] uppercase tracking-wider">100%</button>
+              </div>
+            </div>
+          </div>
+          <!-- Outer wrapper has overflow:auto so zoomed-in diagrams scroll
+               freely; the inner #workflow-diagram is the transform target
+               the WorkflowDiagram class scales/translates. -->
+          <div id="workflow-viewport" class="overflow-auto rounded-md bg-ink-900/30">
+            <div id="workflow-diagram"></div>
+          </div>
+        </div>
+
+        <!-- M4: Cascade status badge -->
+        <div x-show="cascadeStatus" class="rounded-xl border p-4"
+             :class="cascadeStatus?.regime === 'CRISIS' ? 'border-rose-500/40 bg-rose-500/10' : 'border-cyan-500/30 bg-cyan-500/5'">
+          <div class="flex items-center gap-3">
+            <span class="text-[10px] uppercase tracking-wider"
+                  :class="cascadeStatus?.regime === 'CRISIS' ? 'text-rose-300' : 'text-cyan-300'">Cascaded controller</span>
+            <span class="info-i" role="button" tabindex="0"
+                  data-help="panel.cascade"
+                  @click.stop="$store.help.openHelp('panel.cascade')"
+                  aria-label="What is the cascade controller?">i</span>
+            <span class="text-[11px] font-mono" x-text="`regime=${cascadeStatus?.regime}`"></span>
+            <span class="text-[11px] font-mono" x-text="`route=${cascadeStatus?.route}`"></span>
+            <span class="text-[11px] text-slate-400" x-text="cascadeStatus?.reason"></span>
+          </div>
+        </div>
+
+        <!-- M4: Reflective Critic — 5-stage protocol + consistency vote -->
+        <div x-show="reflectionRecords" class="rounded-xl border border-ink-700 bg-ink-800/30 p-5">
+          <div class="flex items-center justify-between mb-3">
+            <h2 class="text-[11px] font-semibold uppercase tracking-wider text-slate-400 inline-flex items-center">
+              Reflective critic — 5-stage protocol + consistency vote (M4)
+              <span class="info-i" role="button" tabindex="0"
+                    data-help="panel.critic"
+                    @click.stop="$store.help.openHelp('panel.critic')"
+                    aria-label="What does the Reflective Critic do?">i</span>
+            </h2>
+            <span class="text-[10px] font-bold uppercase px-2 py-0.5 rounded"
+                  :class="{
+                    'bg-emerald-500/20 text-emerald-300': reflectionRecords?.final_action === 'OVERWEIGHT' || reflectionRecords?.final_action === 'NEUTRAL' && !reflectionRecords?.revised,
+                    'bg-rose-500/20 text-rose-300': reflectionRecords?.final_action === 'UNDERWEIGHT',
+                    'bg-amber-500/20 text-amber-300': reflectionRecords?.revised,
+                  }"
+                  x-text="reflectionRecords?.revised ? 'REVISED' : reflectionRecords?.final_action"></span>
+          </div>
+          <p class="text-[11px] text-slate-500 mb-3" x-show="reflectionRecords?.revised">
+            The critic amended the Portfolio Manager's decision. Final action: <span class="text-amber-300 font-mono" x-text="reflectionRecords?.final_action"></span>, size: <span class="text-amber-300 font-mono" x-text="(reflectionRecords?.final_size_pct || 0).toFixed(2) + '%'"></span>.
+          </p>
+          <div class="space-y-2">
+            <template x-for="(r, i) in reflectionRecords?.records || []" :key="i">
+              <div class="rounded-md bg-ink-900/60 border p-3"
+                   :class="r.abstained ? 'border-rose-500/30' : (r.verdict === 'RATIFY' ? 'border-emerald-500/30' : 'border-amber-500/30')">
+                <div class="flex items-center gap-3 text-[11px] font-mono mb-2">
+                  <span class="text-slate-500" x-text="r.temperature !== null ? `vote · T=${r.temperature}` : `iter #${r.iteration + 1}`"></span>
+                  <span class="font-semibold uppercase tracking-wider"
+                        :class="r.verdict === 'RATIFY' ? 'text-emerald-300' : (r.verdict === 'ABSTAIN' ? 'text-rose-300' : 'text-amber-300')"
+                        x-text="r.verdict"></span>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-2 text-[11px] mb-2">
+                  <div :class="r.intent_ok ? 'text-emerald-300' : 'text-rose-300'">
+                    <span class="font-bold" x-text="r.intent_ok ? '✓' : '✗'"></span>
+                    <span class="ml-1 uppercase text-[10px]">Intent</span>
+                    <div class="text-slate-400 mt-0.5 text-[11px]" x-text="r.intent_reason"></div>
+                  </div>
+                  <div :class="r.evidence_ok ? 'text-emerald-300' : 'text-rose-300'">
+                    <span class="font-bold" x-text="r.evidence_ok ? '✓' : '✗'"></span>
+                    <span class="ml-1 uppercase text-[10px]">Evidence</span>
+                    <div class="text-slate-400 mt-0.5 text-[11px]" x-text="r.evidence_reason"></div>
+                  </div>
+                  <div :class="r.risk_ok ? 'text-emerald-300' : 'text-rose-300'">
+                    <span class="font-bold" x-text="r.risk_ok ? '✓' : '✗'"></span>
+                    <span class="ml-1 uppercase text-[10px]">Risk</span>
+                    <div class="text-slate-400 mt-0.5 text-[11px]" x-text="r.risk_reason"></div>
+                  </div>
+                </div>
+                <div class="text-[11px] text-slate-400 mb-1">
+                  <span class="text-slate-500 uppercase text-[10px]">Counterfactual:</span>
+                  <span x-text="r.counterfactual_flip_evidence"></span>
+                </div>
+                <div x-show="r.verdict === 'REVISE'" class="text-[11px] font-mono text-amber-300">
+                  Revise → action=<span x-text="r.revised_action"></span>,
+                  size=<span x-text="r.revised_size_pct?.toFixed(2)"></span>%,
+                  confidence=<span x-text="r.revised_confidence?.toFixed(2)"></span>
+                </div>
+                <div class="text-[11px] text-slate-300 mt-2 italic" x-text="r.overall_comment"></div>
+              </div>
+            </template>
+          </div>
+        </div>
+
+        <!-- M1: Order Ticket (ActionProposal) -->
+        <div x-show="actionProposal" class="rounded-xl border border-ink-700 bg-ink-800/30 p-5">
+          <div class="flex items-center justify-between mb-3">
+            <h2 class="text-[11px] font-semibold uppercase tracking-wider text-slate-400 inline-flex items-center">
+              Order ticket — ActionProposal (M1)
+              <span class="info-i" role="button" tabindex="0"
+                    data-help="panel.order_ticket"
+                    @click.stop="$store.help.openHelp('panel.order_ticket')"
+                    aria-label="What is the Order Ticket?">i</span>
+            </h2>
+            <span class="text-[10px] font-bold uppercase px-2 py-0.5 rounded"
+                  :class="{
+                    'bg-emerald-500/20 text-emerald-300': actionProposal?.side === 'BUY',
+                    'bg-rose-500/20 text-rose-300': actionProposal?.side === 'SELL',
+                    'bg-slate-500/20 text-slate-300': actionProposal?.side === 'HOLD' || actionProposal?.side === 'ABSTAIN',
+                  }" x-text="actionProposal?.side"></span>
+          </div>
+          <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-[12px] font-mono">
+            <div><span class="text-slate-500">target weight</span><div class="text-slate-200" x-text="actionProposal?.target_weight !== undefined ? (actionProposal.target_weight * 100).toFixed(2) + '%' : '—'"></div></div>
+            <div><span class="text-slate-500">conviction</span><div class="text-slate-200" x-text="actionProposal?.conviction_tier + ' / ' + (actionProposal?.conviction_score * 100).toFixed(0) + '%'"></div></div>
+            <div><span class="text-slate-500">horizon</span><div class="text-slate-200" x-text="actionProposal?.horizon_days + 'd'"></div></div>
+            <div><span class="text-slate-500">expected return</span><div class="text-slate-200" x-text="(actionProposal?.expected_return_pct * 100).toFixed(2) + '%'"></div></div>
+          </div>
+          <div class="mt-3 report-body text-[12px]" x-html="renderMarkdown(actionProposalMd || actionProposal?.rationale || '')"></div>
+        </div>
+
+        <!-- M2 + M5: Execution panel -->
+        <div x-show="executionResult" class="rounded-xl border border-ink-700 bg-ink-800/30 p-5">
+          <h2 class="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-3 inline-flex items-center">
+            Execution — deterministic pipeline (M2 + M5)
+            <span class="info-i" role="button" tabindex="0"
+                  data-help="panel.execution"
+                  @click.stop="$store.help.openHelp('panel.execution')"
+                  aria-label="How does the execution pipeline work?">i</span>
+          </h2>
+
+          <div x-show="executionResult?.fill" class="grid grid-cols-2 md:grid-cols-4 gap-3 text-[12px] font-mono mb-3">
+            <div><span class="text-slate-500">status</span><div class="text-emerald-300" x-text="executionResult?.fill?.status"></div></div>
+            <div><span class="text-slate-500">qty filled</span><div class="text-slate-200" x-text="executionResult?.fill?.qty_filled?.toFixed(0)"></div></div>
+            <div><span class="text-slate-500">avg price</span><div class="text-slate-200" x-text="executionResult?.fill?.avg_price ? '$' + executionResult.fill.avg_price.toFixed(2) : '—'"></div></div>
+            <div><span class="text-slate-500">slippage</span><div class="text-slate-200" x-text="executionResult?.fill?.slippage_bps?.toFixed(1) + ' bps'"></div></div>
+          </div>
+
+          <div x-show="!executionResult?.fill && executionResult?.note" class="rounded-md bg-amber-500/10 border border-amber-500/30 p-3 text-[12px] text-amber-200 mb-3" x-text="executionResult?.note"></div>
+
+          <!-- Sizing (M5) — show binding constraint + risk-multiplier provenance -->
+          <div x-show="executionResult?.sizing" class="rounded-md bg-ink-900/60 border border-ink-700 p-3 mb-3">
+            <div class="flex items-center justify-between mb-2">
+              <div class="text-[10px] uppercase text-slate-500 inline-flex items-center">
+                Sizing — binding: <span class="text-cyan-300 font-mono ml-1" x-text="executionResult?.sizing?.binding_constraint"></span>
+                <span class="info-i" role="button" tabindex="0"
+                      data-help="panel.sizing"
+                      @click.stop="$store.help.openHelp('panel.sizing')"
+                      aria-label="How is sizing calculated?">i</span>
+              </div>
+              <div class="text-[10px] uppercase text-slate-500">risk_mult: <span class="font-mono"
+                    :class="executionResult?.sizing?.risk_mult < 1 ? 'text-amber-300' : 'text-emerald-300'"
+                    x-text="executionResult?.sizing?.risk_mult?.toFixed(2)"></span></div>
+            </div>
+            <div class="grid grid-cols-2 md:grid-cols-5 gap-2 text-[11px] font-mono">
+              <template x-for="cap in ['kelly_cap','vol_cap','cvar_cap','hard_cap']" :key="cap">
+                <div class="rounded p-1.5"
+                     :class="cap === (executionResult?.sizing?.binding_constraint || '').toLowerCase() + '_cap' || ((executionResult?.sizing?.binding_constraint || '').toLowerCase() === cap.replace('_cap','')) ? 'bg-cyan-500/10 border border-cyan-500/40' : ''">
+                  <span class="text-slate-500" x-text="cap.replace('_cap','').toUpperCase() + ':'"></span>
+                  <span class="text-slate-300" x-text="executionResult?.sizing && (executionResult.sizing[cap] * 100).toFixed(2) + '%'"></span>
+                </div>
+              </template>
+              <div class="rounded p-1.5 bg-emerald-500/10 border border-emerald-500/40 col-span-2 md:col-span-1">
+                <span class="text-slate-500">FINAL:</span>
+                <span :class="executionResult?.sizing?.final_weight >= 0 ? 'text-emerald-300' : 'text-rose-300'" x-text="executionResult?.sizing && (executionResult.sizing.final_weight * 100).toFixed(2) + '%'"></span>
+              </div>
+            </div>
+            <div x-show="executionResult?.sizing?.notes" class="text-[10px] text-slate-500 mt-2 italic" x-text="executionResult?.sizing?.notes"></div>
+          </div>
+
+          <!-- Cost-scenario sweep (M2) — sensitivity across low / standard / high -->
+          <div x-show="executionResult?.cost_scenarios?.length" class="rounded-md bg-ink-900/60 border border-ink-700 p-3 mb-3">
+            <div class="text-[10px] uppercase text-slate-500 mb-2 inline-flex items-center">
+              Cost sensitivity sweep (low → standard → high)
+              <span class="info-i" role="button" tabindex="0"
+                    data-help="panel.cost_sensitivity"
+                    @click.stop="$store.help.openHelp('panel.cost_sensitivity')"
+                    aria-label="What is the cost sensitivity sweep?">i</span>
+            </div>
+            <div class="overflow-x-auto">
+              <table class="text-[11px] w-full font-mono">
+                <thead class="text-slate-500 uppercase border-b border-ink-700">
+                  <tr>
+                    <th class="text-left py-1 pr-3">Scenario</th>
+                    <th class="text-right py-1 pr-3">Fee bps</th>
+                    <th class="text-right py-1 pr-3">Half-spread bps</th>
+                    <th class="text-right py-1 pr-3">Impact bps</th>
+                    <th class="text-right py-1 pr-3">Notional</th>
+                    <th class="text-right py-1">Total cost</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="s in executionResult?.cost_scenarios" :key="s.label">
+                    <tr class="border-b border-ink-800">
+                      <td class="py-1 pr-3 text-slate-200" x-text="s.label"></td>
+                      <td class="py-1 pr-3 text-right text-slate-400" x-text="(s.model?.fees_bps ?? 0).toFixed(1)"></td>
+                      <td class="py-1 pr-3 text-right text-slate-400" x-text="(s.model?.half_spread_bps ?? 0).toFixed(1)"></td>
+                      <td class="py-1 pr-3 text-right text-slate-400" x-text="(s.model?.impact_bps_at_full_adv ?? 0).toFixed(1)"></td>
+                      <td class="py-1 pr-3 text-right text-slate-400" x-text="(s.notional ?? 0).toLocaleString('en-US', {style:'currency', currency:'USD', maximumFractionDigits:0})"></td>
+                      <td class="py-1 text-right text-amber-300" x-text="((s.cost_breakdown?.total ?? 0)).toLocaleString('en-US', {style:'currency', currency:'USD', maximumFractionDigits:2})"></td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Risk gates -->
+          <div x-show="executionResult?.risk_gate" class="rounded-md p-3 border"
+               :class="executionResult?.risk_gate?.passed ? 'bg-emerald-500/5 border-emerald-500/30' : 'bg-rose-500/5 border-rose-500/30'">
+            <div class="flex items-center justify-between mb-2">
+              <div class="text-[10px] uppercase text-slate-500 inline-flex items-center">
+                Risk gates (M5)
+                <span class="info-i" role="button" tabindex="0"
+                      data-help="panel.risk_gates"
+                      @click.stop="$store.help.openHelp('panel.risk_gates')"
+                      aria-label="What are the risk gates?">i</span>
+              </div>
+              <div class="flex items-center gap-2">
+                <span x-show="executionResult?.risk_gate?.kill_switch_triggered" class="px-2 py-0.5 rounded text-[10px] font-bold bg-rose-500/20 text-rose-300 border border-rose-500/50">KILL SWITCH</span>
+                <span class="text-[10px] font-bold" :class="executionResult?.risk_gate?.passed ? 'text-emerald-300' : 'text-rose-300'" x-text="executionResult?.risk_gate?.passed ? 'PASS' : `${executionResult?.risk_gate?.failures?.length} FAIL(S)`"></span>
+              </div>
+            </div>
+            <div x-show="executionResult?.risk_gate?.failures?.length" class="space-y-1">
+              <template x-for="f in executionResult?.risk_gate?.failures" :key="f[0]">
+                <div class="text-[11px] font-mono">
+                  <span class="text-rose-300 font-bold uppercase" x-text="f[0]"></span>
+                  <span class="text-slate-400 ml-2" x-text="f[1]"></span>
+                </div>
+              </template>
+            </div>
+          </div>
+        </div>
+
+        <div x-show="selectedNode" class="rounded-xl border border-ink-700 bg-ink-800/30 p-5">
+          <div class="flex items-center justify-between mb-3">
+            <div>
+              <h3 class="text-base font-semibold text-slate-200" x-text="selectedNode"></h3>
+              <p class="text-[11px] text-slate-500" x-text="nodeKindLabel(selectedNode)"></p>
+            </div>
+            <button @click="selectedNode = null" class="text-[11px] text-slate-500 hover:text-slate-300">close</button>
+          </div>
+          <div class="space-y-3 max-h-[480px] overflow-y-auto">
+            <template x-for="entry in nodeActivity(selectedNode)" :key="entry.key">
+              <div class="rounded-md bg-ink-900/60 border border-ink-700 p-3">
+                <div class="flex items-center gap-2 mb-1">
+                  <span class="text-[10px] font-bold uppercase px-1.5 py-0.5 rounded"
+                        :class="entryBadgeClass(entry)" x-text="entry.label"></span>
+                  <span class="text-[11px] text-slate-500" x-text="entry.subtitle"></span>
+                </div>
+                <template x-if="entry.markdown">
+                  <div class="report-body text-[13px]" x-html="renderMarkdown(entry.body)"></div>
+                </template>
+                <template x-if="!entry.markdown">
+                  <div class="text-xs text-slate-400 whitespace-pre-wrap break-words font-mono leading-relaxed"
+                       x-text="entry.body"></div>
+                </template>
+              </div>
+            </template>
+            <div x-show="nodeActivity(selectedNode).length === 0"
+                 class="text-[11px] text-slate-500 italic">No activity yet.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Charts Tab -->
+      <section x-show="activeTab === 'charts'" class="p-6 space-y-6">
+        <div class="rounded-xl border border-ink-700 bg-ink-800/30 p-5">
+          <div class="flex items-center justify-between mb-4 flex-wrap gap-3">
+            <div>
+              <h2 class="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Price &amp; technical indicators</h2>
+              <p class="text-[11px] text-slate-500 mt-0.5">
+                <span x-text="chartData?.ticker || form.ticker"></span> · 180-day lookback ending
+                <span x-text="chartData?.trade_date || form.trade_date"></span>
+              </p>
+            </div>
+            <div class="flex items-center gap-2 flex-wrap">
+              <template x-for="key in indicatorKeys" :key="key">
+                <label class="flex items-center gap-1.5 text-[11px] px-2 py-1 rounded-md border border-ink-600 bg-ink-700/30 cursor-pointer text-slate-400">
+                  <input type="checkbox" :value="key" x-model="enabledIndicators" />
+                  <span class="font-mono" x-text="indicatorLabels[key]"></span>
+                </label>
+              </template>
+              <button @click="reloadChart()"
+                      class="text-[11px] px-2 py-1 rounded-md bg-ink-700/60 hover:bg-ink-700 border border-ink-600 text-slate-300">
+                Reload
+              </button>
+            </div>
+          </div>
+          <div class="relative" style="height:420px">
+            <canvas id="price-chart"></canvas>
+            <div x-show="chartLoading" class="absolute inset-0 grid place-items-center bg-ink-900/60 backdrop-blur-sm rounded-md">
+              <div class="text-sm text-slate-400">Loading market data…</div>
+            </div>
+            <div x-show="chartError" class="absolute inset-0 grid place-items-center text-sm text-red-300" x-text="chartError"></div>
+          </div>
+        </div>
+
+        <div class="grid lg:grid-cols-2 gap-6">
+          <div class="rounded-xl border border-ink-700 bg-ink-800/30 p-5">
+            <h3 class="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-3">RSI</h3>
+            <div style="height:200px"><canvas id="rsi-chart"></canvas></div>
+          </div>
+          <div class="rounded-xl border border-ink-700 bg-ink-800/30 p-5">
+            <h3 class="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-3">MACD</h3>
+            <div style="height:200px"><canvas id="macd-chart"></canvas></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Reports Tab -->
+      <!-- Commodity-only: Futures tab (curve, COT, seasonality) -->
+      <section x-show="activeTab === 'futures' && assetClass === 'commodity'" class="p-6 space-y-6">
+        <!-- Term structure (futures curve) -->
+        <div class="rounded-xl border border-ink-700 bg-ink-800/30 p-5">
+          <div class="flex items-center justify-between mb-4">
+            <div>
+              <h2 class="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Term structure</h2>
+              <p class="text-[11px] text-slate-500 mt-1">Next 12 delivery contracts. Negative slope = backwardation (tight supply / pays you to hold the front). Positive slope = contango (storage market / pays you to carry).</p>
+            </div>
+            <button @click="loadCommodityCurve()" :disabled="commodityLoading.curve" class="px-3 py-1.5 bg-amber-500/20 border border-amber-500/40 text-amber-200 rounded text-[12px] hover:bg-amber-500/30 disabled:opacity-50">
+              <span x-show="!commodityLoading.curve">Refresh</span>
+              <span x-show="commodityLoading.curve">Loading…</span>
+            </button>
+          </div>
+          <div x-show="curveData?.error" class="rounded bg-amber-500/10 border border-amber-500/30 p-3 text-[12px] text-amber-200 mb-3" x-text="curveData?.error"></div>
+          <div x-show="curveData?.structure && !curveData?.error" class="flex flex-wrap items-center gap-3 mb-4 text-[11px] font-mono">
+            <span class="px-2 py-1 rounded font-semibold uppercase tracking-wider text-[10px]"
+                  :class="curveData?.structure === 'BACKWARDATION' ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/40'
+                        : curveData?.structure === 'CONTANGO' ? 'bg-rose-500/15 text-rose-300 border border-rose-500/40'
+                        : 'bg-slate-500/15 text-slate-300 border border-slate-500/40'"
+                  x-text="curveData?.structure"></span>
+            <span class="text-slate-400">Front→Back: <span class="font-semibold" :class="curveData?.front_back_slope_pct >= 0 ? 'text-rose-300' : 'text-emerald-300'" x-text="(curveData?.front_back_slope_pct > 0 ? '+' : '') + curveData?.front_back_slope_pct + '%'"></span></span>
+            <span class="text-slate-400">Annual roll-yield: <span class="font-semibold" :class="curveData?.ann_roll_yield_pct >= 0 ? 'text-emerald-300' : 'text-rose-300'" x-text="(curveData?.ann_roll_yield_pct > 0 ? '+' : '') + curveData?.ann_roll_yield_pct + '%'"></span></span>
+            <span class="text-slate-500">Contract size: <span x-text="curveData?.contract_size + ' ' + curveData?.unit"></span></span>
+          </div>
+          <div x-show="curveData?.contracts?.length" class="rounded-md bg-ink-900/40 border border-ink-700 p-3">
+            <canvas id="futures-curve-chart" height="200"></canvas>
+          </div>
+        </div>
+
+        <!-- COT positioning -->
+        <div class="rounded-xl border border-ink-700 bg-ink-800/30 p-5">
+          <div class="flex items-center justify-between mb-4">
+            <div>
+              <h2 class="text-[11px] font-semibold uppercase tracking-wider text-slate-400">CFTC Commitments of Traders — positioning</h2>
+              <p class="text-[11px] text-slate-500 mt-1">Weekly net positioning. Extreme Managed Money positioning (vs trailing range) is a classic counter-trend signal.</p>
+            </div>
+            <button @click="loadCommodityCOT()" :disabled="commodityLoading.cot" class="px-3 py-1.5 bg-amber-500/20 border border-amber-500/40 text-amber-200 rounded text-[12px] hover:bg-amber-500/30 disabled:opacity-50">
+              <span x-show="!commodityLoading.cot">Refresh</span>
+              <span x-show="commodityLoading.cot">Loading…</span>
+            </button>
+          </div>
+          <div x-show="cotData?.error" class="rounded bg-amber-500/10 border border-amber-500/30 p-3 text-[12px] text-amber-200 mb-3" x-text="cotData?.error"></div>
+          <div x-show="cotData?.count > 0" class="rounded-md bg-ink-900/40 border border-ink-700 p-3 mb-3">
+            <div class="text-[10px] text-slate-500 mb-2">CFTC report: <span class="font-mono text-slate-300" x-text="cotData?.cftc_name"></span></div>
+            <canvas id="cot-chart" height="220"></canvas>
+          </div>
+        </div>
+
+        <!-- Seasonality -->
+        <div class="rounded-xl border border-ink-700 bg-ink-800/30 p-5">
+          <div class="flex items-center justify-between mb-4">
+            <div>
+              <h2 class="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Monthly seasonality</h2>
+              <p class="text-[11px] text-slate-500 mt-1">Average return per calendar month over the trailing 5y. Useful for commodities with strong cycles (natural gas winters, grains around USDA).</p>
+            </div>
+            <button @click="loadCommoditySeasonality()" :disabled="commodityLoading.seasonality" class="px-3 py-1.5 bg-amber-500/20 border border-amber-500/40 text-amber-200 rounded text-[12px] hover:bg-amber-500/30 disabled:opacity-50">
+              <span x-show="!commodityLoading.seasonality">Refresh</span>
+              <span x-show="commodityLoading.seasonality">Loading…</span>
+            </button>
+          </div>
+          <div x-show="seasonalityData?.error" class="rounded bg-amber-500/10 border border-amber-500/30 p-3 text-[12px] text-amber-200 mb-3" x-text="seasonalityData?.error"></div>
+          <div x-show="seasonalityData?.months?.length" class="rounded-md bg-ink-900/40 border border-ink-700 p-3">
+            <canvas id="seasonality-chart" height="200"></canvas>
+          </div>
+        </div>
+      </section>
+
+      <section x-show="activeTab === 'reports'" class="p-6 space-y-6">
+        <template x-for="r in reportList" :key="r.role">
+          <div class="rounded-xl border p-5"
+               :class="r.degraded
+                 ? 'border-amber-500/40 bg-amber-500/5'
+                 : 'border-ink-700 bg-ink-800/30'">
+            <div class="flex items-center gap-2 mb-3">
+              <span class="size-2 rounded-full" :style="`background:${r.color}`"></span>
+              <h3 class="text-[11px] font-semibold uppercase tracking-wider text-slate-400" x-text="r.title"></h3>
+              <span x-show="r.degraded"
+                    class="ml-2 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider bg-amber-500/15 text-amber-300 border border-amber-500/30"
+                    :title="'The LLM emitted a tool-call list as its final answer instead of a synthesized report. See body for details.'">
+                Degraded
+              </span>
+            </div>
+            <div class="report-body" x-html="r.html"></div>
+          </div>
+        </template>
+        <div x-show="reportList.length === 0"
+             class="text-center text-[11px] text-slate-500 py-12">
+          Reports will appear here as the agents complete each stage.
+        </div>
+
+        <!-- Final Decision card -->
+        <template x-if="decisionPayload">
+          <div class="rounded-xl border border-ink-700 bg-ink-800/30 p-6">
+            <div class="flex items-center justify-between mb-4">
+              <div class="flex items-center gap-3">
+                <span class="text-2xl font-bold tracking-tight"
+                      :class="{
+                        'text-accent-bull': decisionPayload.action === 'OVERWEIGHT',
+                        'text-accent-bear': decisionPayload.action === 'UNDERWEIGHT',
+                        'text-accent-neutral': decisionPayload.action === 'NEUTRAL',
+                      }"
+                      x-text="decisionPayload.action"></span>
+                <span class="px-2 py-0.5 rounded text-[10px] font-bold tracking-wider uppercase"
+                      :class="{
+                        'bg-emerald-500/15 text-emerald-300': decisionPayload.compliance_status === 'CLEAR',
+                        'bg-amber-500/15 text-amber-300': decisionPayload.compliance_status === 'FLAGGED',
+                        'bg-red-500/15 text-red-300': decisionPayload.compliance_status === 'BLOCKED',
+                      }"
+                      x-text="decisionPayload.compliance_status"></span>
+              </div>
+              <div class="text-[12px] text-slate-400">
+                confidence <span class="font-mono text-slate-200" x-text="(decisionPayload.confidence * 100).toFixed(0) + '%'"></span>
+              </div>
+            </div>
+            <div class="grid grid-cols-3 lg:grid-cols-6 gap-2 text-[12px]">
+              <div class="kv"><div class="k">Size</div><div class="v" x-text="decisionPayload.size_pct_of_book.toFixed(2) + '%'"></div></div>
+              <div class="kv"><div class="k">Entry</div><div class="v" x-text="decisionPayload.entry_price"></div></div>
+              <div class="kv"><div class="k">Stop</div><div class="v" x-text="decisionPayload.stop_loss"></div></div>
+              <div class="kv"><div class="k">Target</div><div class="v" x-text="decisionPayload.target_price"></div></div>
+              <div class="kv"><div class="k">Horizon</div><div class="v" x-text="decisionPayload.horizon_days + 'd'"></div></div>
+              <div class="kv"><div class="k">Exp. ret</div><div class="v" x-text="decisionPayload.expected_return_pct.toFixed(1) + '%'"></div></div>
+            </div>
+            <div class="mt-4 text-[13px] text-slate-300 leading-relaxed pm-rationale" x-text="decisionPayload.rationale"></div>
+            <div class="mt-3 grid lg:grid-cols-2 gap-3 text-[12px]">
+              <div>
+                <div class="text-[10px] uppercase text-slate-500 mb-1">Key drivers</div>
+                <ul class="list-disc pl-5 space-y-0.5 text-slate-300">
+                  <template x-for="d in decisionPayload.key_drivers" :key="d">
+                    <li x-text="d"></li>
+                  </template>
+                </ul>
+              </div>
+              <div>
+                <div class="text-[10px] uppercase text-slate-500 mb-1">Key risks</div>
+                <ul class="list-disc pl-5 space-y-0.5 text-slate-300">
+                  <template x-for="d in decisionPayload.key_risks" :key="d">
+                    <li x-text="d"></li>
+                  </template>
+                </ul>
+              </div>
+              <div>
+                <div class="text-[10px] uppercase text-slate-500 mb-1">Falsifiers</div>
+                <ul class="list-disc pl-5 space-y-0.5 text-slate-300">
+                  <template x-for="d in decisionPayload.falsifiers" :key="d">
+                    <li x-text="d"></li>
+                  </template>
+                </ul>
+              </div>
+              <div x-show="decisionPayload.geopolitical_flags?.length">
+                <div class="text-[10px] uppercase text-slate-500 mb-1">Geopolitical flags</div>
+                <ul class="list-disc pl-5 space-y-0.5 text-slate-300">
+                  <template x-for="d in decisionPayload.geopolitical_flags" :key="d">
+                    <li x-text="d"></li>
+                  </template>
+                </ul>
+              </div>
+              <!--
+                Sources panel — the deduplicated provenance trail the PM
+                emits alongside the rationale. Each entry maps 1:1 to an
+                inline `[source: <identifier>]` tag inside the rationale,
+                so the Reflective Critic (and the human auditor) can verify
+                every numeric claim leads back to a real fetch (yfinance,
+                CFTC, Tavily URL, etc.).
+              -->
+              <div x-show="decisionPayload.sources?.length">
+                <div class="text-[10px] uppercase text-slate-500 mb-1 flex items-center gap-1.5">
+                  <span>Sources</span>
+                  <span class="info-i" role="button" tabindex="0"
+                        data-help="panel.sources"
+                        @click.stop="$store.help.openHelp('panel.sources')"
+                        aria-label="What are these sources?">i</span>
+                  <span class="text-slate-600">·</span>
+                  <span class="text-slate-500 font-mono"
+                        x-text="decisionPayload.sources?.length + ' cited'"></span>
+                </div>
+                <ul class="list-disc pl-5 space-y-0.5 text-slate-300 text-[11px] break-words">
+                  <template x-for="(s, i) in decisionPayload.sources" :key="i">
+                    <li>
+                      <template x-if="/^https?:\/\//.test(s.split(' ')[0])">
+                        <a :href="s.split(' ')[0]" target="_blank" rel="noopener"
+                           class="text-cyan-300 hover:text-cyan-200 underline decoration-cyan-300/30"
+                           x-text="s"></a>
+                      </template>
+                      <template x-if="!/^https?:\/\//.test(s.split(' ')[0])">
+                        <span class="font-mono" x-text="s"></span>
+                      </template>
+                    </li>
+                  </template>
+                </ul>
+              </div>
+            </div>
+          </div>
+        </template>
+      </section>
+
+      <!-- Logs Tab -->
+      <section x-show="activeTab === 'logs'" class="p-6">
+        <div class="rounded-xl border border-ink-700 bg-ink-800/30">
+          <div class="flex items-center justify-between p-4 border-b border-ink-700">
+            <h2 class="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Live event log</h2>
+            <div class="flex items-center gap-2">
+              <label class="flex items-center gap-1.5 text-[11px] text-slate-500">
+                <input type="checkbox" x-model="autoScroll" /> Auto-scroll
+              </label>
+              <button @click="logs = []; pendingLogCount = 0"
+                      class="text-[11px] text-slate-500 hover:text-slate-300">Clear</button>
+            </div>
+          </div>
+          <div id="logs-container"
+               class="font-mono text-[11px] leading-relaxed max-h-[640px] overflow-y-auto p-4 space-y-1"
+               @scroll="onLogsScroll()">
+            <template x-for="log in logs" :key="log.id">
+              <div class="flex gap-2">
+                <span class="text-slate-600 shrink-0" x-text="log.time"></span>
+                <span class="shrink-0 w-32 truncate" :class="log.color" x-text="log.tag"></span>
+                <span class="text-slate-300 whitespace-pre-wrap break-words" x-text="log.message"></span>
+              </div>
+            </template>
+            <div x-show="logs.length === 0" class="text-slate-600 italic">
+              No events yet — hit "Run analysis" to begin.
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- M3: Memory Tab -->
+      <section x-show="activeTab === 'memory'" class="p-6 space-y-6">
+        <div class="rounded-xl border border-ink-700 bg-ink-800/30 p-5">
+          <div class="flex items-center justify-between mb-4">
+            <div>
+              <h2 class="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Audit-grade episodic memory</h2>
+              <p class="text-[11px] text-slate-500 mt-1">Top-k past episodes for this ticker. Outcome-embargo enforced server-side: any episode whose outcome lands after the current trade date is excluded.</p>
+            </div>
+            <div class="flex items-center gap-2 flex-wrap">
+              <!-- Regime-aware retrieval (Phase 2A.2) — boosts same-regime
+                   episodes via the regime_match_bonus in EpisodicMemory. -->
+              <select x-model="memoryRegime"
+                      @change="loadMemoryRetrieval()"
+                      class="cfg-input text-[11px] py-1 px-2 w-auto"
+                      title="Boost retrieval of episodes from the same market regime">
+                <option value="">Regime: any</option>
+                <option value="TREND">TREND</option>
+                <option value="RANGE">RANGE</option>
+                <option value="HIGH_VOL">HIGH_VOL</option>
+                <option value="CRISIS">CRISIS</option>
+              </select>
+              <button
+                @click="resolveOutcomes(false)"
+                :disabled="resolveLoading"
+                :class="resolveLoading ? 'opacity-50 cursor-wait' : ''"
+                class="px-3 py-1.5 bg-emerald-500/20 border border-emerald-500/40 text-emerald-200 rounded text-[12px] hover:bg-emerald-500/30"
+                title="Sweep pending episodes whose outcome window has elapsed; compute realised return + alpha + max-drawdown + an LLM lesson, and write everything back so future runs retrieve it."
+              >
+                <span x-show="!resolveLoading">Resolve outcomes &amp; reflect</span>
+                <span x-show="resolveLoading">Resolving…</span>
+              </button>
+              <button
+                @click="resolveOutcomes(true)"
+                :disabled="resolveLoading"
+                class="px-3 py-1.5 bg-ink-700/40 border border-ink-600 text-slate-300 rounded text-[12px] hover:bg-ink-700/60"
+                title="Same sweep but skip the LLM step — just write the numeric outcomes."
+              >Outcomes only</button>
+              <button @click="loadMemoryRetrieval()" class="px-3 py-1.5 bg-blue-500/20 border border-blue-500/40 text-blue-200 rounded text-[12px] hover:bg-blue-500/30">Refresh</button>
+              <!-- Pruning (Phase 2A.3) — destructive so we wrap it in a confirm() prompt
+                   and visually mark it red. -->
+              <button @click="pruneMemory()"
+                      :disabled="pruneLoading"
+                      class="px-3 py-1.5 bg-rose-500/15 border border-rose-500/40 text-rose-200 rounded text-[12px] hover:bg-rose-500/25"
+                      title="Drop episodes older than 365d (unless retrieved before) and cap to 10k records.">
+                <span x-show="!pruneLoading">Prune older than 1y</span>
+                <span x-show="pruneLoading">Pruning…</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Embedder + memory-stats banner (Phase 2A.1).  Shows
+               which embedder the retrieval is currently routed through
+               so the user can verify the TRADINGCREW_MEMORY_EMBEDDER
+               env var actually took effect. -->
+          <div x-show="memoryMeta" class="rounded-md bg-ink-900/40 border border-ink-700 p-2.5 mb-3 text-[10.5px] font-mono flex flex-wrap items-center gap-3">
+            <span class="text-slate-500">Embedder:</span>
+            <span class="text-cyan-300" x-text="memoryMeta?.embedder || 'tfidf'"></span>
+            <span class="text-slate-500" x-show="memoryMeta?.regime">·</span>
+            <span class="text-amber-300" x-show="memoryMeta?.regime" x-text="`regime=${memoryMeta?.regime}`"></span>
+            <span class="text-slate-500" x-show="pruneResult">·</span>
+            <span class="text-rose-300" x-show="pruneResult"
+                  x-text="pruneResult ? `pruned ${pruneResult.removed}, kept ${pruneResult.remaining}` : ''"></span>
+          </div>
+
+          <!-- Resolution summary panel (rendered after Resolve outcomes completes) -->
+          <div x-show="resolveResult" class="rounded-md bg-ink-900/60 border border-ink-700 p-4 mb-4">
+            <div class="flex items-center gap-3 mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-300">
+              <span>Last resolution sweep</span>
+              <span class="text-emerald-300 font-mono" x-text="resolveResult?.count + ' episodes'"></span>
+              <span x-show="resolveResult?.skip_llm" class="px-2 py-0.5 rounded bg-amber-500/10 text-amber-300 text-[10px]">no-LLM</span>
+            </div>
+            <div x-show="resolveResult?.note" class="text-[11px] text-amber-200 mb-2" x-text="resolveResult?.note"></div>
+            <div class="flex flex-wrap gap-2 text-[10px] font-mono mb-3">
+              <template x-for="(n, status) in (resolveResult?.by_status || {})" :key="status">
+                <span class="px-2 py-0.5 rounded bg-ink-900/80 border border-ink-700 text-slate-300">
+                  <span x-text="status"></span>: <span class="text-emerald-300" x-text="n"></span>
+                </span>
+              </template>
+            </div>
+            <div class="space-y-1 max-h-72 overflow-y-auto pr-1">
+              <template x-for="rec in (resolveResult?.records || [])" :key="rec.episode_id">
+                <div class="text-[11px] font-mono bg-ink-900/40 border border-ink-800 rounded px-2 py-1.5">
+                  <div class="flex flex-wrap items-center gap-2">
+                    <span class="text-slate-200" x-text="rec.symbol"></span>
+                    <span class="text-slate-500" x-text="rec.decision_ts"></span>
+                    <span class="text-slate-500">→</span>
+                    <span class="text-slate-500" x-text="rec.outcome_ts"></span>
+                    <span class="text-cyan-300" x-text="rec.side"></span>
+                    <span class="px-1.5 py-0.5 rounded text-[10px]"
+                          :class="rec.status === 'RESOLVED' ? 'bg-emerald-500/15 text-emerald-300' : (rec.status === 'ABANDONED' ? 'bg-rose-500/15 text-rose-300' : 'bg-slate-500/15 text-slate-300')"
+                          x-text="rec.status"></span>
+                    <span x-show="rec.realised_return !== null"
+                          :class="rec.realised_return >= 0 ? 'text-emerald-300' : 'text-rose-300'">
+                      realised <span x-text="(rec.realised_return * 100).toFixed(2) + '%'"></span>
+                    </span>
+                    <span x-show="rec.alpha_return !== null"
+                          :class="rec.alpha_return >= 0 ? 'text-emerald-300' : 'text-rose-300'">
+                      α <span x-text="(rec.alpha_return * 100).toFixed(2) + '%'"></span>
+                    </span>
+                    <span x-show="rec.max_drawdown !== null" class="text-amber-300">
+                      mdd <span x-text="(rec.max_drawdown * 100).toFixed(2) + '%'"></span>
+                    </span>
+                  </div>
+                  <div x-show="rec.reflection" class="mt-1 text-slate-300 whitespace-pre-wrap" x-text="rec.reflection"></div>
+                  <div x-show="rec.note" class="mt-1 text-slate-500 italic" x-text="rec.note"></div>
+                </div>
+              </template>
+            </div>
+          </div>
+
+          <div x-show="episodeMeta" class="rounded-md bg-emerald-500/5 border border-emerald-500/20 p-3 mb-4 text-[11px] font-mono">
+            <div class="text-emerald-300 uppercase text-[10px] tracking-wider inline-flex items-center">
+              Latest run wrote an episode
+              <span class="info-i" role="button" tabindex="0"
+                    data-help="panel.episode"
+                    @click.stop="$store.help.openHelp('panel.episode')"
+                    aria-label="What is an episode?">i</span>
+            </div>
+            <div class="mt-1 text-slate-300"><span class="text-slate-500">id:</span> <span x-text="episodeMeta?.episode_id"></span></div>
+            <div class="text-slate-300"><span class="text-slate-500">regime:</span> <span x-text="episodeMeta?.regime"></span></div>
+            <div class="text-slate-300"><span class="text-slate-500">decision_ts:</span> <span x-text="episodeMeta?.decision_ts"></span></div>
+            <div class="text-slate-300"><span class="text-slate-500">outcome_ts (embargo until):</span> <span x-text="episodeMeta?.outcome_ts"></span></div>
+          </div>
+
+          <div x-show="retrievedEpisodes?.length === 0" class="rounded-md bg-ink-900/40 border border-ink-700 p-4 text-[12px] text-slate-500 italic">
+            No retrievable episodes yet — run analyses on the same ticker over several dates to build a memory.
+          </div>
+
+          <div x-show="retrievedEpisodes?.length" class="space-y-2">
+            <template x-for="ep in retrievedEpisodes" :key="ep.episode_id">
+              <div class="rounded-md bg-ink-900/60 border border-ink-700 p-3">
+                <div class="flex items-center gap-3 text-[11px] font-mono mb-2">
+                  <span class="font-semibold text-slate-200" x-text="ep.symbol"></span>
+                  <span class="text-cyan-300" x-text="ep.regime"></span>
+                  <span class="text-slate-500" x-text="ep.decision_ts"></span>
+                  <span class="text-slate-500">·</span>
+                  <span class="text-slate-400">score=<span x-text="ep.score?.toFixed(3)"></span></span>
+                  <span class="text-slate-500">sim=<span x-text="ep.similarity?.toFixed(3)"></span></span>
+                  <span class="text-slate-500">decay=<span x-text="ep.decay_factor?.toFixed(3)"></span></span>
+                  <span class="text-slate-500">Δ=<span x-text="ep.delta_days + 'd'"></span></span>
+                </div>
+                <div x-show="ep.reflection" class="text-[11px] text-slate-300" x-text="ep.reflection"></div>
+                <div x-show="ep.realised_return !== null" class="text-[11px] font-mono mt-1">
+                  <span class="text-slate-500">realised:</span>
+                  <span :class="ep.realised_return >= 0 ? 'text-emerald-300' : 'text-rose-300'" x-text="(ep.realised_return * 100).toFixed(2) + '%'"></span>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+      </section>
+
+      <!-- M7: Portfolio Tab -->
+      <section x-show="activeTab === 'portfolio'" class="p-6 space-y-6">
+        <div class="rounded-xl border border-ink-700 bg-ink-800/30 p-5">
+          <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+            <div>
+              <h2 class="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Portfolio book + multi-ticker allocator</h2>
+              <p class="text-[11px] text-slate-500 mt-1">Current positions, P&amp;L, drawdown — plus allocator preview across the most recent proposal per ticker.</p>
+            </div>
+            <div class="flex items-center gap-2 flex-wrap">
+              <!-- Phase 2B.3 — book partition (paper / prod).  Default
+                   paper so iterative experiments don't touch prod. -->
+              <div class="flex bg-ink-900/60 border border-ink-700 rounded overflow-hidden text-[11px] font-mono"
+                   title="paper = sandboxed book · prod = live book">
+                <button @click="form.book = 'paper'; loadPortfolio()"
+                        :class="form.book === 'paper' ? 'bg-blue-500/30 text-blue-100' : 'text-slate-400 hover:text-slate-200'"
+                        class="px-2 py-1">paper</button>
+                <button @click="form.book = 'prod'; loadPortfolio()"
+                        :class="form.book === 'prod' ? 'bg-rose-500/30 text-rose-100' : 'text-slate-400 hover:text-slate-200'"
+                        class="px-2 py-1">prod</button>
+              </div>
+              <!-- Phase 2B.1 — switchable allocator (HRP / MV / EQR).  -->
+              <div class="flex bg-ink-900/60 border border-ink-700 rounded overflow-hidden text-[11px] font-mono">
+                <template x-for="m in ['HRP','MV','EQR']" :key="m">
+                  <button @click="allocatorMethod = m; loadPortfolio()"
+                          :class="allocatorMethod === m ? 'bg-cyan-500/30 text-cyan-100' : 'text-slate-400 hover:text-slate-200'"
+                          class="px-2 py-1"
+                          x-text="m"></button>
+                </template>
+              </div>
+              <button @click="loadPortfolio()" class="px-3 py-1.5 bg-blue-500/20 border border-blue-500/40 text-blue-200 rounded text-[12px] hover:bg-blue-500/30">Refresh</button>
+            </div>
+          </div>
+
+          <div x-show="portfolio?.snapshot" class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-5">
+            <div class="rounded-md bg-ink-900/60 border border-ink-700 p-3">
+              <div class="text-[10px] uppercase text-slate-500">NAV</div>
+              <div class="text-lg font-mono mt-1 text-slate-100" x-text="portfolio?.snapshot?.nav?.toLocaleString('en-US', {style:'currency', currency:'USD'})"></div>
+            </div>
+            <div class="rounded-md bg-ink-900/60 border border-ink-700 p-3">
+              <div class="text-[10px] uppercase text-slate-500">Cash</div>
+              <div class="text-lg font-mono mt-1 text-slate-300" x-text="portfolio?.snapshot?.cash?.toLocaleString('en-US', {style:'currency', currency:'USD'})"></div>
+            </div>
+            <div class="rounded-md bg-ink-900/60 border border-ink-700 p-3">
+              <div class="text-[10px] uppercase text-slate-500">Realised P&amp;L</div>
+              <div class="text-lg font-mono mt-1" :class="portfolio?.snapshot?.realized_pnl >= 0 ? 'text-emerald-300' : 'text-rose-300'" x-text="portfolio?.snapshot?.realized_pnl?.toLocaleString('en-US', {style:'currency', currency:'USD'})"></div>
+            </div>
+            <div class="rounded-md bg-ink-900/60 border border-ink-700 p-3">
+              <div class="text-[10px] uppercase text-slate-500">Unrealised P&amp;L</div>
+              <div class="text-lg font-mono mt-1" :class="portfolio?.snapshot?.unrealized_pnl >= 0 ? 'text-emerald-300' : 'text-rose-300'" x-text="portfolio?.snapshot?.unrealized_pnl?.toLocaleString('en-US', {style:'currency', currency:'USD'})"></div>
+            </div>
+            <div class="rounded-md bg-ink-900/60 border border-ink-700 p-3">
+              <div class="text-[10px] uppercase text-slate-500">Max DD</div>
+              <div class="text-lg font-mono mt-1 text-rose-300" x-text="portfolio?.snapshot && (portfolio.snapshot.max_drawdown * 100).toFixed(2) + '%'"></div>
+            </div>
+          </div>
+
+          <div x-show="portfolio?.snapshot?.positions?.length" class="rounded-md bg-ink-900/40 border border-ink-700 p-3 mb-5">
+            <div class="text-[10px] uppercase text-slate-500 mb-2">Open positions</div>
+            <div class="overflow-x-auto">
+              <table class="text-[11px] w-full font-mono">
+                <thead class="text-slate-500 uppercase border-b border-ink-700">
+                  <tr>
+                    <th class="text-left py-1.5 pr-3">Symbol</th>
+                    <th class="text-right py-1.5 pr-3">Qty</th>
+                    <th class="text-right py-1.5 pr-3">Avg cost</th>
+                    <th class="text-right py-1.5 pr-3">Last</th>
+                    <th class="text-right py-1.5 pr-3">Mkt value</th>
+                    <th class="text-right py-1.5 pr-3">Weight</th>
+                    <th class="text-right py-1.5">Unrealised P&amp;L</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="pos in portfolio?.snapshot?.positions" :key="pos.symbol">
+                    <tr class="border-b border-ink-800">
+                      <td class="py-1.5 pr-3 text-slate-200 font-semibold" x-text="pos.symbol"></td>
+                      <td class="py-1.5 pr-3 text-right text-slate-300" x-text="pos.qty?.toFixed(0)"></td>
+                      <td class="py-1.5 pr-3 text-right text-slate-300" x-text="`$${pos.avg_cost?.toFixed(2)}`"></td>
+                      <td class="py-1.5 pr-3 text-right text-slate-300" x-text="`$${pos.last_price?.toFixed(2)}`"></td>
+                      <td class="py-1.5 pr-3 text-right text-slate-300" x-text="pos.market_value?.toLocaleString('en-US', {style:'currency', currency:'USD'})"></td>
+                      <td class="py-1.5 pr-3 text-right text-slate-300" x-text="(pos.weight * 100).toFixed(2) + '%'"></td>
+                      <td class="py-1.5 text-right" :class="pos.unrealized_pnl >= 0 ? 'text-emerald-300' : 'text-rose-300'" x-text="pos.unrealized_pnl?.toLocaleString('en-US', {style:'currency', currency:'USD'})"></td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div x-show="portfolio?.snapshot && !portfolio?.snapshot?.positions?.length" class="rounded-md bg-ink-900/40 border border-ink-700 p-4 text-[12px] text-slate-500 italic mb-5">
+            No open positions yet — the book is all cash.
+          </div>
+
+          <div x-show="portfolio?.allocator_preview" class="rounded-md bg-ink-900/40 border border-ink-700 p-3">
+            <div class="text-[10px] uppercase text-slate-500 mb-2">Multi-ticker allocator preview — <span class="text-cyan-300 font-mono" x-text="portfolio?.allocator_preview?.method"></span></div>
+            <p class="text-[11px] text-slate-500 mb-3" x-text="portfolio?.allocator_preview?.notes"></p>
+            <table class="text-[11px] w-full font-mono">
+              <thead class="text-slate-500 uppercase border-b border-ink-700">
+                <tr>
+                  <th class="text-left py-1.5 pr-3">Symbol</th>
+                  <th class="text-right py-1.5 pr-3">Target weight</th>
+                  <th class="text-right py-1.5">Risk contribution</th>
+                </tr>
+              </thead>
+              <tbody>
+                <template x-for="(w, sym) in portfolio?.allocator_preview?.weights" :key="sym">
+                  <tr class="border-b border-ink-800">
+                    <td class="py-1.5 pr-3 text-slate-200 font-semibold" x-text="sym"></td>
+                    <td class="py-1.5 pr-3 text-right" :class="w >= 0 ? 'text-emerald-300' : 'text-rose-300'" x-text="(w >= 0 ? '+' : '') + (w * 100).toFixed(2) + '%'"></td>
+                    <td class="py-1.5 text-right text-slate-300" x-text="portfolio?.allocator_preview?.risk_contributions?.[sym] ? (portfolio.allocator_preview.risk_contributions[sym] * 100).toFixed(1) + '%' : '—'"></td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- M6: Backtest Tab -->
+      <section x-show="activeTab === 'backtest'" class="p-6 space-y-6">
+        <div class="rounded-xl border border-ink-700 bg-ink-800/30 p-5">
+          <div class="flex items-center justify-between mb-4">
+            <div>
+              <h2 class="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Walk-forward backtest</h2>
+              <p class="text-[11px] text-slate-500 mt-1">Replays every logged ActionProposal for this ticker through the deterministic pipeline + risk gates. No new LLM calls.</p>
+            </div>
+            <div class="flex items-end gap-3">
+              <div><label class="text-[10px] uppercase text-slate-500 block">Train</label><input type="number" x-model.number="backtestConfig.train_size" min="5" max="500" class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] w-20 text-slate-200" /></div>
+              <div><label class="text-[10px] uppercase text-slate-500 block">Embargo</label><input type="number" x-model.number="backtestConfig.embargo_size" min="0" max="30" class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] w-16 text-slate-200" /></div>
+              <div><label class="text-[10px] uppercase text-slate-500 block">Test</label><input type="number" x-model.number="backtestConfig.test_size" min="1" max="200" class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] w-16 text-slate-200" /></div>
+              <button @click="loadBacktest()" :disabled="backtestLoading" class="px-3 py-1.5 bg-blue-500/20 border border-blue-500/40 text-blue-200 rounded text-[12px] hover:bg-blue-500/30 disabled:opacity-50">
+                <span x-show="!backtestLoading">Run backtest</span>
+                <span x-show="backtestLoading">Running…</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Not-enough-data: the server returned a friendly count or we pre-computed one -->
+          <div x-show="backtestEnoughData === false" class="rounded-md bg-amber-500/10 border border-amber-500/30 p-3 text-[12px] text-amber-200 mb-4">
+            <div class="font-semibold mb-1">Not enough proposals to walk-forward backtest <span x-text="form.ticker"></span></div>
+            <div>You have <span class="font-mono" x-text="backtestProposalCount"></span> proposals; this configuration needs <span class="font-mono" x-text="backtestRequiredProposals"></span> (train + embargo + test).</div>
+            <div class="mt-1 text-[11px] text-amber-100/70">Either shrink the windows above (try Train=2, Embargo=0, Test=1 for a minimal fold) or run more analyses on this ticker — each completed run records one proposal.</div>
+          </div>
+
+          <!-- Server-side error (parsed JSON had an "error" field) -->
+          <div x-show="backtestResult?.error" class="rounded-md bg-amber-500/10 border border-amber-500/30 p-3 text-[12px] text-amber-200 mb-4" x-text="backtestResult?.error"></div>
+
+          <!-- Network-level fetch failure (server restart, connection drop) -->
+          <div x-show="backtestNetworkError" class="rounded-md bg-rose-500/10 border border-rose-500/30 p-3 text-[12px] text-rose-200 mb-4">
+            Could not reach the backtest endpoint. The server may have restarted or the connection dropped. Click <strong>Run backtest</strong> to retry.
+          </div>
+
+          <div x-show="backtestResult?.overall_metrics" class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
+            <div class="rounded-md bg-ink-900/60 border border-ink-700 p-3">
+              <div class="text-[10px] uppercase text-slate-500">Total return</div>
+              <div class="text-lg font-mono mt-1" :class="backtestResult?.overall_metrics?.total_return_pct >= 0 ? 'text-emerald-300' : 'text-rose-300'" x-text="backtestResult?.overall_metrics && (backtestResult.overall_metrics.total_return_pct * 100).toFixed(2) + '%'"></div>
+            </div>
+            <div class="rounded-md bg-ink-900/60 border border-ink-700 p-3">
+              <div class="text-[10px] uppercase text-slate-500">Sharpe</div>
+              <div class="text-lg font-mono mt-1 text-slate-200" x-text="backtestResult?.overall_metrics?.sharpe?.toFixed(2)"></div>
+              <div class="text-[10px] text-slate-500 mt-1" x-show="backtestResult?.overall_metrics?.deflated_sharpe !== null">DSR: <span x-text="(backtestResult?.overall_metrics?.deflated_sharpe * 100).toFixed(1) + '%'"></span></div>
+            </div>
+            <div class="rounded-md bg-ink-900/60 border border-ink-700 p-3">
+              <div class="text-[10px] uppercase text-slate-500">Max DD</div>
+              <div class="text-lg font-mono mt-1 text-rose-300" x-text="backtestResult?.overall_metrics && (backtestResult.overall_metrics.max_drawdown * 100).toFixed(2) + '%'"></div>
+            </div>
+            <div class="rounded-md bg-ink-900/60 border border-ink-700 p-3">
+              <div class="text-[10px] uppercase text-slate-500">Folds × Proposals</div>
+              <div class="text-lg font-mono mt-1 text-slate-200"><span x-text="backtestResult?.n_folds"></span> × <span x-text="backtestResult?.n_proposals"></span></div>
+            </div>
+          </div>
+
+          <div x-show="backtestResult?.combined_equity?.length" class="rounded-md bg-ink-900/40 border border-ink-700 p-3 mb-5">
+            <div class="text-[10px] uppercase text-slate-500 mb-2">Equity curve (chained across folds)</div>
+            <canvas id="backtest-equity-chart" height="220"></canvas>
+          </div>
+
+          <!-- L3 Auto-tune (grid search) -->
+          <div class="rounded-md bg-ink-900/40 border border-ink-700 p-4 mb-5">
+            <div class="flex items-center justify-between mb-3">
+              <div>
+                <div class="text-[11px] font-semibold uppercase tracking-wider text-slate-300">Auto-tune sizing &amp; risk gates <span class="text-slate-500 normal-case font-normal">(agentic training L3)</span></div>
+                <div class="text-[11px] text-slate-500 mt-1">Sweep kelly fraction × vol target × position cap against your logged proposals. Best ranked by Deflated Sharpe (Bailey &amp; López de Prado 2014 — penalises multiple-comparison overfit).</div>
+              </div>
+              <div class="flex items-end gap-2">
+                <div>
+                  <label class="text-[10px] uppercase text-slate-500 block">Grid size</label>
+                  <select x-model="gridSearchSize" class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] text-slate-200">
+                    <option value="coarse">Coarse (8 pts)</option>
+                    <option value="default">Default (27 pts)</option>
+                    <option value="fine">Fine (125 pts)</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="text-[10px] uppercase text-slate-500 block">Rank by</label>
+                  <select x-model="gridSearchRankBy" class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] text-slate-200">
+                    <option value="deflated_sharpe">Deflated Sharpe</option>
+                    <option value="sharpe">Sharpe (raw)</option>
+                    <option value="sortino">Sortino</option>
+                    <option value="calmar">Calmar</option>
+                    <option value="total_return_pct">Total return</option>
+                  </select>
+                </div>
+                <button
+                  @click="runGridSearch()"
+                  :disabled="gridSearchLoading"
+                  class="px-3 py-1.5 bg-fuchsia-500/20 border border-fuchsia-500/40 text-fuchsia-200 rounded text-[12px] hover:bg-fuchsia-500/30 disabled:opacity-50"
+                >
+                  <span x-show="!gridSearchLoading">Auto-tune</span>
+                  <span x-show="gridSearchLoading">Searching…</span>
+                </button>
+              </div>
+            </div>
+
+            <!-- Phase 2C — extra axes + cost-model sweep + validation toggle + synthetic seeder -->
+            <div class="rounded bg-ink-900/50 border border-ink-700/60 p-3 mb-3 grid grid-cols-1 md:grid-cols-4 gap-3 text-[11px]">
+              <div class="flex flex-col gap-1">
+                <span class="text-slate-500 uppercase tracking-wider text-[10px]">Extra axes <span class="info-i" role="button" tabindex="0" data-help="panel.backtest_extra_axes" data-help-tip="panel.backtest_extra_axes">i</span></span>
+                <label class="flex items-center gap-2 text-slate-300">
+                  <input type="checkbox" x-model="gridSweepMaxLeverage" class="accent-fuchsia-500" /> max_leverage
+                </label>
+                <label class="flex items-center gap-2 text-slate-300">
+                  <input type="checkbox" x-model="gridSweepDrawdownKill" class="accent-fuchsia-500" /> drawdown_kill_threshold
+                </label>
+              </div>
+              <div class="flex flex-col gap-1">
+                <span class="text-slate-500 uppercase tracking-wider text-[10px]">Cost-model sweep <span class="info-i" role="button" tabindex="0" data-help="panel.backtest_cost_sweep" data-help-tip="panel.backtest_cost_sweep">i</span></span>
+                <label class="flex items-center gap-2 text-slate-300">
+                  <input type="checkbox" x-model="gridSweepCostModel" class="accent-fuchsia-500" /> sweep cost models
+                </label>
+                <select x-model="backtestCostModel" class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[11px] text-slate-200">
+                  <option value="standard">standard</option>
+                  <option value="low">low</option>
+                  <option value="high">high</option>
+                  <option value="futures_standard">futures_standard</option>
+                  <option value="futures_low">futures_low</option>
+                  <option value="futures_high">futures_high</option>
+                </select>
+              </div>
+              <div class="flex flex-col gap-1">
+                <span class="text-slate-500 uppercase tracking-wider text-[10px]">Validation <span class="info-i" role="button" tabindex="0" data-help="panel.backtest_validation" data-help-tip="panel.backtest_validation">i</span></span>
+                <label class="flex items-center gap-2 text-slate-300">
+                  <input type="radio" value="walk_forward" x-model="backtestValidation" class="accent-fuchsia-500" /> Walk-forward
+                </label>
+                <label class="flex items-center gap-2 text-slate-300">
+                  <input type="radio" value="cpcv" x-model="backtestValidation" class="accent-fuchsia-500" /> CPCV
+                </label>
+                <label class="flex items-center gap-2 text-slate-300 mt-1">
+                  <span class="text-[10px] text-slate-500">History</span>
+                  <select x-model.number="backtestLookbackYears" class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[11px] text-slate-200 flex-1">
+                    <option :value="1">1y (short-term only)</option>
+                    <option :value="2">2y</option>
+                    <option :value="3">3y</option>
+                    <option :value="5">5y (default)</option>
+                    <option :value="7">7y</option>
+                    <option :value="10">10y (full cycle)</option>
+                  </select>
+                  <span class="info-i" role="button" tabindex="0" data-help="panel.backtest_history" data-help-tip="panel.backtest_history">i</span>
+                </label>
+              </div>
+              <div class="flex flex-col gap-1">
+                <span class="text-slate-500 uppercase tracking-wider text-[10px]">Synthetic proposals <span class="info-i" role="button" tabindex="0" data-help="panel.backtest_seed" data-help-tip="panel.backtest_seed">i</span></span>
+                <div class="flex items-center gap-2">
+                  <input type="number" min="1" max="200" x-model.number="seedN" class="w-16 bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[11px] text-slate-200" />
+                  <button @click="seedSyntheticProposals()" :disabled="seedLoading"
+                    class="px-2 py-1 bg-fuchsia-500/20 border border-fuchsia-500/40 text-fuchsia-200 rounded text-[11px] hover:bg-fuchsia-500/30 disabled:opacity-50">
+                    <span x-show="!seedLoading">Seed</span>
+                    <span x-show="seedLoading">Seeding…</span>
+                  </button>
+                </div>
+                <div x-show="seedResult" class="text-slate-400 text-[10px]">
+                  <template x-if="seedResult?.error">
+                    <span class="text-amber-300" x-text="seedResult.error"></span>
+                  </template>
+                  <template x-if="seedResult?.seeded">
+                    <span>Seeded <span class="text-emerald-300" x-text="seedResult.seeded"></span> proposals for <span class="text-slate-200" x-text="seedResult.ticker"></span>.</span>
+                  </template>
+                </div>
+              </div>
+            </div>
+
+            <div x-show="gridSearchResult?.error" class="rounded bg-amber-500/10 border border-amber-500/30 p-2 text-[11px] text-amber-200" x-text="gridSearchResult?.error"></div>
+
+            <div x-show="gridSearchResult?.best && !gridSearchResult?.error" class="rounded bg-emerald-500/5 border border-emerald-500/30 p-3 mb-3">
+              <div class="flex items-center gap-3 mb-2 text-[11px] font-mono">
+                <span class="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-200 uppercase tracking-wider text-[10px]">winner</span>
+                <span class="text-slate-300">rank=<span class="font-semibold" x-text="gridSearchResult?.best?.rank_metric?.toFixed(3)"></span></span>
+                <span class="text-slate-500">sharpe=<span x-text="gridSearchResult?.best?.metrics?.sharpe?.toFixed(2)"></span></span>
+                <span class="text-slate-500">sortino=<span x-text="gridSearchResult?.best?.metrics?.sortino?.toFixed(2)"></span></span>
+                <span class="text-slate-500">mdd=<span x-text="(gridSearchResult?.best?.metrics?.max_drawdown * 100).toFixed(2) + '%'"></span></span>
+                <span class="text-slate-500" x-show="gridSearchResult?.best?.metrics?.deflated_sharpe !== null">DSR=<span x-text="(gridSearchResult?.best?.metrics?.deflated_sharpe * 100).toFixed(1) + '%'"></span></span>
+              </div>
+              <div class="grid grid-cols-2 md:grid-cols-3 gap-2 text-[11px] font-mono">
+                <template x-for="(v, k) in gridSearchResult?.best?.sizing_config" :key="'sz-' + k">
+                  <div class="bg-ink-900/60 border border-ink-700 rounded px-2 py-1">
+                    <span class="text-slate-500" x-text="k + ': '"></span>
+                    <span class="text-emerald-200" x-text="typeof v === 'number' ? v.toFixed(3) : v"></span>
+                  </div>
+                </template>
+              </div>
+            </div>
+
+            <div x-show="gridSearchResult?.points?.length" class="overflow-x-auto">
+              <table class="text-[11px] w-full font-mono">
+                <thead class="text-slate-500 uppercase border-b border-ink-700">
+                  <tr>
+                    <th class="text-left py-1.5 pr-3">#</th>
+                    <th class="text-right py-1.5 pr-3">kelly</th>
+                    <th class="text-right py-1.5 pr-3">vol_tgt</th>
+                    <th class="text-right py-1.5 pr-3">max_pos</th>
+                    <th class="text-right py-1.5 pr-3">Sharpe</th>
+                    <th class="text-right py-1.5 pr-3">Sortino</th>
+                    <th class="text-right py-1.5 pr-3">Mdd</th>
+                    <th class="text-right py-1.5">DSR</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="(pt, idx) in gridSearchResult?.points" :key="idx">
+                    <tr class="border-b border-ink-800" :class="idx === gridSearchResult?.best_index ? 'bg-emerald-500/5' : ''">
+                      <td class="py-1.5 pr-3 text-slate-300" x-text="idx"></td>
+                      <td class="py-1.5 pr-3 text-right text-slate-300" x-text="pt.sizing_config?.kelly_fraction?.toFixed(2)"></td>
+                      <td class="py-1.5 pr-3 text-right text-slate-300" x-text="pt.sizing_config?.vol_target?.toFixed(2)"></td>
+                      <td class="py-1.5 pr-3 text-right text-slate-300" x-text="pt.sizing_config?.max_position_weight?.toFixed(2)"></td>
+                      <td class="py-1.5 pr-3 text-right" :class="pt.metrics?.sharpe >= 0 ? 'text-emerald-300' : 'text-rose-300'" x-text="pt.metrics?.sharpe?.toFixed(2)"></td>
+                      <td class="py-1.5 pr-3 text-right text-slate-300" x-text="pt.metrics?.sortino?.toFixed(2)"></td>
+                      <td class="py-1.5 pr-3 text-right text-rose-300" x-text="(pt.metrics?.max_drawdown * 100).toFixed(2) + '%'"></td>
+                      <td class="py-1.5 text-right text-slate-300" x-text="pt.metrics?.deflated_sharpe !== null ? (pt.metrics?.deflated_sharpe * 100).toFixed(1) + '%' : '—'"></td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div x-show="backtestResult?.folds?.length" class="rounded-md bg-ink-900/40 border border-ink-700 p-3">
+            <div class="text-[10px] uppercase text-slate-500 mb-2">Per-fold metrics</div>
+            <div class="overflow-x-auto">
+              <table class="text-[11px] w-full font-mono">
+                <thead class="text-slate-500 uppercase border-b border-ink-700">
+                  <tr>
+                    <th class="text-left py-1.5 pr-3">Fold</th>
+                    <th class="text-left py-1.5 pr-3">Train idx</th>
+                    <th class="text-left py-1.5 pr-3">Test idx</th>
+                    <th class="text-right py-1.5 pr-3">Trades</th>
+                    <th class="text-right py-1.5 pr-3">Return</th>
+                    <th class="text-right py-1.5 pr-3">Sharpe</th>
+                    <th class="text-right py-1.5">Max DD</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="fr in backtestResult?.folds" :key="fr.fold_id">
+                    <tr class="border-b border-ink-800">
+                      <td class="py-1.5 pr-3 text-slate-300" x-text="`#${fr.fold_id}`"></td>
+                      <td class="py-1.5 pr-3 text-slate-500" x-text="`[${fr.train_start}, ${fr.train_end})`"></td>
+                      <td class="py-1.5 pr-3 text-slate-500" x-text="`[${fr.test_start}, ${fr.test_end})`"></td>
+                      <td class="py-1.5 pr-3 text-right text-slate-300" x-text="fr.trades?.length"></td>
+                      <td class="py-1.5 pr-3 text-right" :class="fr.metrics?.total_return_pct >= 0 ? 'text-emerald-300' : 'text-rose-300'" x-text="(fr.metrics?.total_return_pct * 100).toFixed(2) + '%'"></td>
+                      <td class="py-1.5 pr-3 text-right text-slate-300" x-text="fr.metrics?.sharpe?.toFixed(2)"></td>
+                      <td class="py-1.5 text-right text-rose-300" x-text="(fr.metrics?.max_drawdown * 100).toFixed(2) + '%'"></td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- L4: Reinforcement Learning Training Tab -->
+      <section x-show="activeTab === 'training'" x-init="loadRlRuns()" class="p-6 space-y-6">
+        <!-- Header / config / run controls -->
+        <div class="rounded-xl border border-ink-700 bg-ink-800/30 p-5">
+          <div class="flex items-start justify-between mb-4 gap-4">
+            <div>
+              <h2 class="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                RL training (Agentic L4 — PPO on the M2 simulator)
+              </h2>
+              <p class="text-[11px] text-slate-500 mt-1 max-w-3xl">
+                Trains a small actor-critic policy network end-to-end. The M2 execution simulator is the environment — every action pays realised PnL after fees + slippage + impact. Trained policies become available to the Market Analyst + Trader as an advisory tool (<code class="text-slate-400">rl_policy_recommendation</code>).
+              </p>
+            </div>
+          </div>
+
+          <!-- Phase 2F — short-vs-long-term horizon mode picks sensible
+               train/eval window defaults.  Mirrors the multi-horizon split
+               in backtest_setup so RL training, the walk-forward backtest,
+               and the trader/PM all reason about the same horizon families. -->
+          <div class="flex items-center gap-2 mb-3 text-[11px]">
+            <span class="text-slate-500 uppercase tracking-wider text-[10px]">
+              Horizon mode
+              <span class="info-i" role="button" tabindex="0" data-help="panel.rl_horizon_mode" data-help-tip="panel.rl_horizon_mode">i</span>
+            </span>
+            <label class="flex items-center gap-1 text-slate-300">
+              <input type="radio" value="short_term" x-model="rlConfig.horizon_mode" @change="applyRlHorizonMode()" class="accent-blue-500" />
+              Short-term (1y train · 30d eval)
+            </label>
+            <label class="flex items-center gap-1 text-slate-300">
+              <input type="radio" value="balanced" x-model="rlConfig.horizon_mode" @change="applyRlHorizonMode()" class="accent-blue-500" />
+              Balanced (3y · 60d)
+            </label>
+            <label class="flex items-center gap-1 text-slate-300">
+              <input type="radio" value="long_term" x-model="rlConfig.horizon_mode" @change="applyRlHorizonMode()" class="accent-blue-500" />
+              Long-term (5y train · 1y eval)
+            </label>
+            <label class="flex items-center gap-1 text-slate-300">
+              <input type="radio" value="custom" x-model="rlConfig.horizon_mode" class="accent-blue-500" />
+              Custom
+            </label>
+          </div>
+
+          <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+            <div>
+              <label class="text-[10px] uppercase text-slate-500 block">Total steps</label>
+              <input type="number" x-model.number="rlConfig.total_steps" min="500" max="500000" step="1000" class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] w-full text-slate-200" />
+            </div>
+            <div>
+              <label class="text-[10px] uppercase text-slate-500 block">Steps / rollout</label>
+              <input type="number" x-model.number="rlConfig.steps_per_rollout" min="64" max="4096" step="64" class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] w-full text-slate-200" />
+            </div>
+            <div>
+              <label class="text-[10px] uppercase text-slate-500 block">Learning rate</label>
+              <input type="number" x-model.number="rlConfig.learning_rate" step="0.0001" class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] w-full text-slate-200" />
+            </div>
+            <div>
+              <label class="text-[10px] uppercase text-slate-500 block">Entropy coef</label>
+              <input type="number" x-model.number="rlConfig.entropy_coef" step="0.001" class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] w-full text-slate-200" />
+            </div>
+            <div>
+              <label class="text-[10px] uppercase text-slate-500 block">Train window (days)</label>
+              <input type="number" x-model.number="rlConfig.train_window_days" min="120" max="2520" class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] w-full text-slate-200" />
+            </div>
+            <div>
+              <label class="text-[10px] uppercase text-slate-500 block">Eval window (days)</label>
+              <input type="number" x-model.number="rlConfig.eval_window_days" min="20" max="500" class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] w-full text-slate-200" />
+            </div>
+            <div>
+              <label class="text-[10px] uppercase text-slate-500 block">Drawdown kill</label>
+              <input type="number" x-model.number="rlConfig.drawdown_kill_pct" min="0.05" max="0.95" step="0.05" class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] w-full text-slate-200" />
+            </div>
+            <div>
+              <label class="text-[10px] uppercase text-slate-500 block">Cost preset</label>
+              <select x-model="rlConfig.cost_model_name" class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] w-full text-slate-200">
+                <option value="low">low</option>
+                <option value="standard">standard</option>
+                <option value="high">high</option>
+                <option value="futures_low">futures_low</option>
+                <option value="futures_standard">futures_standard</option>
+                <option value="futures_high">futures_high</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- Phase 2D — algorithm + risk + shaping + curriculum + universe -->
+          <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4 rounded bg-ink-900/40 border border-ink-700/60 p-3">
+            <div>
+              <label class="text-[10px] uppercase text-slate-500 block">
+                Algorithm <span class="info-i" role="button" tabindex="0" data-help="panel.rl_algorithm" data-help-tip="panel.rl_algorithm">i</span>
+              </label>
+              <select x-model="rlConfig.algorithm" class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] w-full text-slate-200">
+                <option value="ppo">PPO (default)</option>
+                <option value="cvar_ppo">CVaR-PPO</option>
+                <option value="cql">CQL (offline)</option>
+                <option value="c51">C51 distributional</option>
+                <option value="decision_transformer">Decision Transformer</option>
+              </select>
+            </div>
+            <div>
+              <label class="text-[10px] uppercase text-slate-500 block">
+                Risk aversion <span class="info-i" role="button" tabindex="0" data-help="panel.rl_risk_aversion" data-help-tip="panel.rl_risk_aversion">i</span>
+              </label>
+              <input type="number" x-model.number="rlConfig.risk_aversion" min="0" max="5" step="0.1"
+                     class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] w-full text-slate-200" />
+            </div>
+            <div>
+              <label class="text-[10px] uppercase text-slate-500 block">
+                CVaR α <span class="info-i" role="button" tabindex="0" data-help="panel.rl_cvar_alpha" data-help-tip="panel.rl_cvar_alpha">i</span>
+              </label>
+              <input type="number" x-model.number="rlConfig.cvar_alpha" min="0.01" max="0.5" step="0.05"
+                     class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] w-full text-slate-200" />
+            </div>
+            <div>
+              <label class="text-[10px] uppercase text-slate-500 block">
+                Turnover penalty (bps) <span class="info-i" role="button" tabindex="0" data-help="panel.rl_turnover_penalty" data-help-tip="panel.rl_turnover_penalty">i</span>
+              </label>
+              <input type="number" x-model.number="rlConfig.turnover_penalty_bps" min="0" max="100" step="0.5"
+                     class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] w-full text-slate-200" />
+            </div>
+            <div>
+              <label class="text-[10px] uppercase text-slate-500 block">
+                Drawdown penalty <span class="info-i" role="button" tabindex="0" data-help="panel.rl_drawdown_penalty" data-help-tip="panel.rl_drawdown_penalty">i</span>
+              </label>
+              <input type="number" x-model.number="rlConfig.drawdown_penalty_coef" min="0" max="5" step="0.1"
+                     class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] w-full text-slate-200" />
+            </div>
+            <div class="flex items-center gap-2 pt-4">
+              <input id="rlVolCurriculum" type="checkbox" x-model="rlConfig.volatility_curriculum" class="accent-blue-500" />
+              <label for="rlVolCurriculum" class="text-[12px] text-slate-300">
+                Volatility curriculum
+                <span class="info-i" role="button" tabindex="0" data-help="panel.rl_curriculum" data-help-tip="panel.rl_curriculum">i</span>
+              </label>
+            </div>
+            <div class="col-span-1 md:col-span-2">
+              <label class="text-[10px] uppercase text-slate-500 block">
+                Policy universe <span class="info-i" role="button" tabindex="0" data-help="panel.rl_universe" data-help-tip="panel.rl_universe">i</span>
+              </label>
+              <input type="text" x-model="rlConfig.policy_universe" placeholder="comma-separated tickers, e.g. NTNX,SPY,QQQ"
+                     class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] w-full text-slate-200 font-mono" />
+            </div>
+          </div>
+
+          <div class="flex items-center gap-3">
+            <button
+              @click="startRlTraining()"
+              :disabled="rlLoading.start || (rlStatus && rlStatus.active)"
+              class="px-3 py-1.5 bg-blue-500/20 border border-blue-500/40 text-blue-200 rounded text-[12px] hover:bg-blue-500/30 disabled:opacity-50"
+            >
+              <span x-show="!rlLoading.start && !(rlStatus && rlStatus.active)">Start training</span>
+              <span x-show="rlLoading.start">Launching…</span>
+              <span x-show="rlStatus && rlStatus.active && !rlLoading.start">Training…</span>
+            </button>
+            <button
+              @click="stopRlTraining()"
+              :disabled="!rlStatus || !rlStatus.active || rlLoading.stop"
+              class="px-3 py-1.5 bg-rose-500/15 border border-rose-500/40 text-rose-200 rounded text-[12px] hover:bg-rose-500/25 disabled:opacity-40"
+            >Stop</button>
+            <button
+              @click="previewRlRecommendation()"
+              :disabled="rlLoading.recommend"
+              class="px-3 py-1.5 bg-emerald-500/15 border border-emerald-500/40 text-emerald-200 rounded text-[12px] hover:bg-emerald-500/25 disabled:opacity-50"
+            >
+              <span x-show="!rlLoading.recommend">Preview promoted-policy action</span>
+              <span x-show="rlLoading.recommend">Scoring…</span>
+            </button>
+            <div class="ml-auto text-[11px] text-slate-500">
+              <span x-show="rlStatus && rlStatus.run_id">
+                Run <code class="text-slate-300" x-text="rlStatus?.run_id"></code> ·
+                <span x-text="rlStatus?.status"></span> ·
+                <span x-text="`${Math.round(rlStatus?.elapsed_sec || 0)}s`"></span>
+              </span>
+            </div>
+          </div>
+
+          <div x-show="rlError" class="mt-3 rounded-md bg-rose-500/10 border border-rose-500/30 p-3 text-[12px] text-rose-200" x-text="rlError"></div>
+        </div>
+
+        <!-- Live training chart -->
+        <div x-show="rlMetrics.length" class="rounded-xl border border-ink-700 bg-ink-800/30 p-5">
+          <div class="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-3">Training progress</div>
+          <div style="height: 280px;">
+            <canvas id="rl-training-chart"></canvas>
+          </div>
+          <div class="mt-4 grid grid-cols-2 md:grid-cols-5 gap-2 text-[11px] font-mono">
+            <template x-for="m in rlMetrics.slice(-1)" :key="'last-' + m.rollout_index">
+              <template x-for="kv in [
+                ['policy', m.policy_loss?.toFixed(3)],
+                ['value', m.value_loss?.toFixed(3)],
+                ['entropy', m.entropy?.toFixed(3)],
+                ['kl', m.approx_kl?.toFixed(4)],
+                ['clip%', (m.clip_fraction * 100)?.toFixed(1)],
+              ]" :key="kv[0]">
+                <div class="bg-ink-900/60 border border-ink-700 rounded px-2 py-1">
+                  <span class="text-slate-500" x-text="kv[0] + ': '"></span>
+                  <span class="text-slate-200" x-text="kv[1]"></span>
+                </div>
+              </template>
+            </template>
+          </div>
+
+          <!-- Final action distribution bars -->
+          <div x-show="rlMetrics.length" class="mt-4">
+            <div class="text-[10px] uppercase text-slate-500 mb-2">Action distribution (final rollout)</div>
+            <template x-if="rlMetrics.at(-1)?.final_action_dist?.length">
+              <div class="grid grid-cols-7 gap-1">
+                <template x-for="(p, i) in rlMetrics.at(-1)?.final_action_dist || []" :key="'d-' + i">
+                  <div class="text-center">
+                    <div class="bg-ink-900/60 border border-ink-700 rounded relative" style="height: 60px;">
+                      <div class="absolute bottom-0 left-0 right-0 bg-blue-500/60" :style="`height: ${Math.max(2, p * 100)}%;`"></div>
+                    </div>
+                    <div class="text-[10px] text-slate-500 mt-1" x-text="rlActionLabel([-0.20, -0.10, -0.05, 0.00, 0.05, 0.10, 0.20][i])"></div>
+                    <div class="text-[10px] text-slate-300 font-mono" x-text="(p * 100).toFixed(0) + '%'"></div>
+                  </div>
+                </template>
+              </div>
+            </template>
+          </div>
+        </div>
+
+        <!-- "What would the policy do today?" preview -->
+        <div x-show="rlRecommendation" class="rounded-xl border border-ink-700 bg-ink-800/30 p-5">
+          <div class="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-3">Promoted-policy preview</div>
+          <div x-show="rlRecommendation?.error" class="text-[12px] text-rose-200" x-text="rlRecommendation?.error"></div>
+          <div x-show="!rlRecommendation?.available && !rlRecommendation?.error" class="text-[12px] text-slate-400" x-text="rlRecommendation?.note || 'No policy promoted yet.'"></div>
+          <template x-if="rlRecommendation?.available && rlRecommendation?.recommendation">
+            <div>
+              <div class="flex items-center gap-3 mb-3">
+                <span class="px-2 py-0.5 rounded text-[10px] font-semibold uppercase"
+                      :class="rlRecommendation.recommendation.best_target_weight > 0 ? 'bg-emerald-500/20 text-emerald-200' : (rlRecommendation.recommendation.best_target_weight < 0 ? 'bg-rose-500/20 text-rose-200' : 'bg-slate-500/20 text-slate-200')"
+                      x-text="rlActionLabel(rlRecommendation.recommendation.best_target_weight)"></span>
+                <span class="text-[12px] text-slate-300">Confidence <span class="font-mono" x-text="(rlRecommendation.recommendation.confidence * 100).toFixed(0) + '%'"></span></span>
+                <span class="text-[12px] text-slate-300">Value est <span class="font-mono" x-text="(rlRecommendation.recommendation.value_estimate || 0).toFixed(3)"></span></span>
+                <span class="text-[11px] text-slate-500" x-text="`run ${rlRecommendation.recommendation.run_id}`"></span>
+              </div>
+              <div class="grid grid-cols-7 gap-1">
+                <template x-for="(p, i) in rlRecommendation.recommendation.action_distribution" :key="'rec-' + i">
+                  <div class="text-center">
+                    <div class="bg-ink-900/60 border border-ink-700 rounded relative" style="height: 60px;">
+                      <div class="absolute bottom-0 left-0 right-0 bg-emerald-500/60" :style="`height: ${Math.max(2, p * 100)}%;`"></div>
+                    </div>
+                    <div class="text-[10px] text-slate-500 mt-1" x-text="rlActionLabel(rlRecommendation.recommendation.action_weights[i])"></div>
+                    <div class="text-[10px] text-slate-300 font-mono" x-text="(p * 100).toFixed(0) + '%'"></div>
+                  </div>
+                </template>
+              </div>
+            </div>
+          </template>
+        </div>
+
+        <!-- Leaderboard: past runs for this ticker -->
+        <div class="rounded-xl border border-ink-700 bg-ink-800/30 p-5">
+          <div class="flex items-center justify-between mb-3">
+            <div class="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Run history</div>
+            <button @click="loadRlRuns()" :disabled="rlLoading.runs" class="text-[11px] text-slate-400 hover:text-slate-200">
+              <span x-show="!rlLoading.runs">Refresh</span>
+              <span x-show="rlLoading.runs">…</span>
+            </button>
+          </div>
+          <div x-show="!rlRuns.length" class="text-[12px] text-slate-500">No L4 training runs yet. Configure above and click <strong>Start training</strong>.</div>
+          <div x-show="rlRuns.length" class="overflow-x-auto">
+            <table class="text-[11px] w-full font-mono">
+              <thead class="text-slate-500 uppercase border-b border-ink-700">
+                <tr>
+                  <th class="text-left py-1.5 pr-3">Ticker</th>
+                  <th class="text-left py-1.5 pr-3">Run id</th>
+                  <th class="text-left py-1.5 pr-3">Status</th>
+                  <th class="text-right py-1.5 pr-3">Steps</th>
+                  <th class="text-right py-1.5 pr-3">Eval PnL%</th>
+                  <th class="text-right py-1.5 pr-3">vs B&amp;H</th>
+                  <th class="text-right py-1.5 pr-3">Eval Mdd</th>
+                  <th class="text-right py-1.5 pr-3">Duration</th>
+                  <th class="text-right py-1.5">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                <template x-for="run in rlRuns" :key="run.run_id">
+                  <tr class="border-b border-ink-800">
+                    <td class="py-1.5 pr-3 text-slate-300" x-text="run.ticker"></td>
+                    <td class="py-1.5 pr-3 text-slate-400" x-text="run.run_id"></td>
+                    <td class="py-1.5 pr-3">
+                      <span class="px-2 py-0.5 rounded text-[10px] uppercase"
+                            :class="{
+                              'bg-emerald-500/20 text-emerald-200': run.status === 'completed',
+                              'bg-blue-500/20 text-blue-200': run.status === 'running',
+                              'bg-rose-500/20 text-rose-200': run.status === 'failed',
+                              'bg-slate-500/20 text-slate-200': run.status === 'stopped',
+                            }"
+                            x-text="run.status"></span>
+                      <span x-show="isRunPromoted(run)" class="ml-2 text-[10px] uppercase bg-fuchsia-500/20 text-fuchsia-200 px-2 py-0.5 rounded">promoted</span>
+                    </td>
+                    <td class="py-1.5 pr-3 text-right text-slate-300" x-text="(run.metrics?.at(-1)?.steps_done || 0).toLocaleString()"></td>
+                    <td class="py-1.5 pr-3 text-right"
+                        :class="(run.eval_result?.mean_pnl_pct || 0) >= 0 ? 'text-emerald-300' : 'text-rose-300'"
+                        x-text="run.eval_result ? ((run.eval_result.mean_pnl_pct || 0) * 100).toFixed(2) + '%' : '—'"></td>
+                    <td class="py-1.5 pr-3 text-right text-slate-400"
+                        x-text="(run.eval_result && run.baseline_buy_and_hold)
+                          ? (((run.eval_result.mean_pnl_pct || 0) - (run.baseline_buy_and_hold.pnl_pct || 0)) * 100).toFixed(2) + '%'
+                          : '—'"></td>
+                    <td class="py-1.5 pr-3 text-right text-rose-300"
+                        x-text="run.eval_result ? ((run.eval_result.max_drawdown || 0) * 100).toFixed(2) + '%' : '—'"></td>
+                    <td class="py-1.5 pr-3 text-right text-slate-300"
+                        x-text="run.duration_sec ? Math.round(run.duration_sec) + 's' : '—'"></td>
+                    <td class="py-1.5 text-right">
+                      <button
+                        @click="promoteRun(run)"
+                        :disabled="run.status !== 'completed' || isRunPromoted(run) || rlLoading.promote"
+                        class="px-2 py-0.5 text-[10px] uppercase bg-fuchsia-500/20 border border-fuchsia-500/40 text-fuchsia-200 rounded hover:bg-fuchsia-500/30 disabled:opacity-30"
+                      >
+                        <span x-show="!isRunPromoted(run)">Promote</span>
+                        <span x-show="isRunPromoted(run)">Active</span>
+                      </button>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <!-- ============================== Help drawer ============================== -->
+  <!-- Slide-in panel on the right with a searchable, anchored render of
+       README content (help_content.js).  Opened from any (i) info-icon, the
+       floating '?' FAB, or Cmd/Ctrl+K. -->
+  <div x-data x-cloak
+       x-show="$store.help.isOpen"
+       @keydown.escape.window="$store.help.close()"
+       class="fixed inset-0 z-40 flex">
+    <div class="absolute inset-0 bg-black/50 backdrop-blur-sm"
+         @click="$store.help.close()"></div>
+    <aside class="help-drawer relative z-10 ml-auto h-full w-full max-w-[480px] bg-ink-800 border-l border-ink-700 shadow-2xl flex flex-col"
+           @click.stop>
+      <header class="px-4 py-3 border-b border-ink-700 flex items-center gap-2">
+        <svg class="size-4 text-blue-300 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+        </svg>
+        <input x-model="$store.help.query"
+               @input="$store.help.search()"
+               @keydown.escape.stop="$store.help.close()"
+               placeholder="Search help (Cmd/Ctrl+K)…"
+               class="flex-1 bg-transparent text-sm text-slate-100 placeholder-slate-500 focus:outline-none" />
+        <button class="text-slate-400 hover:text-slate-100 px-1" @click="$store.help.close()" title="Close (Esc)">
+          <svg class="size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+          </svg>
+        </button>
+      </header>
+
+      <!-- Search results -->
+      <div class="help-search-results overflow-y-auto"
+           x-show="$store.help.query.trim().length > 0">
+        <template x-for="r in $store.help.results" :key="r.id">
+          <button class="help-search-row"
+                  @click="$store.help.openHelp(r.id)">
+            <div class="text-[10px] uppercase tracking-wide text-slate-500" x-text="r.section"></div>
+            <div class="text-sm text-slate-100 font-medium" x-text="r.title"></div>
+            <div class="text-[11.5px] text-slate-400 mt-0.5 line-clamp-2" x-text="r.short"></div>
+          </button>
+        </template>
+        <div x-show="$store.help.results.length === 0" class="px-4 py-6 text-sm text-slate-500">
+          No matches for "<span x-text="$store.help.query"></span>".
+        </div>
+      </div>
+
+      <!-- Selected entry -->
+      <div class="help-body flex-1 overflow-y-auto px-5 py-4"
+           x-show="$store.help.query.trim().length === 0">
+        <template x-if="$store.help.entry">
+          <div>
+            <div class="text-[10px] uppercase tracking-wide text-slate-500"
+                 x-text="$store.help.entry.section"></div>
+            <h2 class="text-lg font-semibold text-slate-100 mt-0.5 mb-2"
+                x-text="$store.help.entry.title"></h2>
+            <p class="text-[12.5px] text-slate-400 mb-3 leading-relaxed"
+               x-text="$store.help.entry.short"></p>
+            <div class="prose prose-invert prose-sm max-w-none help-long"
+                 x-html="$store.help.renderLong($store.help.entry.long)"></div>
+          </div>
+        </template>
+        <template x-if="!$store.help.entry">
+          <div class="text-slate-400 text-sm">Pick a topic below or click any (i) in the UI.</div>
+        </template>
+      </div>
+
+      <!-- TOC at the bottom of the drawer when no entry selected, for browsing -->
+      <div class="border-t border-ink-700 overflow-y-auto max-h-[40%]"
+           x-show="$store.help.query.trim().length === 0">
+        <template x-for="group in $store.help.groups" :key="group.name">
+          <div class="px-4 py-2">
+            <div class="text-[10px] uppercase tracking-wide text-slate-500 font-semibold mb-1"
+                 x-text="group.label"></div>
+            <div class="flex flex-wrap gap-1.5">
+              <template x-for="e in group.items" :key="e.id">
+                <button class="help-chip"
+                        @click="$store.help.openHelp(e.id)"
+                        :class="$store.help.entry && $store.help.entry.id === e.id ? 'is-active' : ''"
+                        x-text="e.title"></button>
+              </template>
+            </div>
+          </div>
+        </template>
+
+        <!-- Drawer footer — restart the guided tour for users who skipped
+             it or want a refresher. -->
+        <div class="px-4 py-3 border-t border-ink-700 flex items-center justify-between text-[11px] text-slate-500">
+          <span>Need a walk-through?</span>
+          <button type="button"
+                  class="px-2 py-1 rounded border border-ink-600 hover:border-blue-500 hover:text-blue-300"
+                  @click="$store.help.close(); window.TcTour && window.TcTour.start(window.TcDashboard || {});">
+            Restart tour
+          </button>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- Floating Help launcher -->
+  <button x-cloak
+          x-data
+          @click="$store.help.openHelp('_intro')"
+          class="help-fab"
+          title="Help (Cmd/Ctrl+K to search)">
+    <span class="font-bold">?</span>
+  </button>
+
+  <!-- Global hover tooltip (mounted once, positioned via JS) -->
+  <div x-cloak
+       x-data
+       x-show="$store.help.tooltip.visible"
+       :style="`top:${$store.help.tooltip.y}px;left:${$store.help.tooltip.x}px;`"
+       class="tc-tooltip">
+    <div class="tc-tooltip-title" x-text="$store.help.tooltip.title"></div>
+    <div class="tc-tooltip-body" x-text="$store.help.tooltip.body"></div>
+    <div class="tc-tooltip-hint">Click for full details</div>
+  </div>
+
+  <script src="/static/help_content.js"></script>
+  <script src="/static/diagram.js"></script>
+  <script src="/static/charts.js"></script>
+  <script src="/static/auto_glossary.js"></script>
+  <script src="/static/help.js"></script>
+  <script src="/static/tour.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

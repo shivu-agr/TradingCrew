@@ -1,0 +1,451 @@
+# =============================================================================
+# TradingCrew tasks
+# =============================================================================
+# Task graph (sequential, with async_execution wired in code for the analyst
+# fan-out and context= chains wired in code from the @task decorators):
+#
+#   8 analysts (parallel via async_execution=True)
+#     -> DEBATE_ROUNDS x (Bull -> Bear)
+#       -> Research Manager synthesis
+#         -> Quality Reviewer audit
+#           -> Trader plan
+#             -> RISK_ROUNDS x (Aggressive -> Conservative -> Neutral)
+#               -> Compliance Officer
+#                 -> Portfolio Manager (typed PortfolioDecision + guardrail)
+#
+# {ticker} is substituted from the kickoff inputs dict.
+#
+# Provenance rule (enforced in every task description below)
+# -----------------------------------------------------------
+# Every numeric / quantitative claim MUST end with an inline tag
+# ``[source: <identifier>]`` whose ``<identifier>`` is the text printed
+# on the matching tool's ``Source: …`` footer.  Downstream tasks
+# (manager, QA, trader, risk, compliance, PM) MUST preserve those tags
+# verbatim when they paraphrase or summarise.  The Portfolio Manager
+# emits the deduplicated set of identifiers in the ``sources`` field of
+# its typed ``PortfolioDecision`` — that's how the Reflective Critic
+# distinguishes real data from hallucinated numbers.
+# =============================================================================
+
+# ----- Analyst phase (all 8 run with async_execution=True in code) ----------
+
+market_task:
+  description: >
+    Analyze the price action of {ticker}. Call get_stock_data once for
+    5-year OHLCV (5y overview + monthly aggregates + last 30 daily
+    sessions) and get_indicators once for
+    SMA20/SMA50/SMA200/RSI14/60d-return/1y-return. Identify the trend
+    regime (uptrend / downtrend / range) using BOTH the multi-year
+    monthly trend and the recent daily action, key levels, and any
+    divergences.
+
+    PROVENANCE: every number you write (price, SMA, RSI, return %) MUST
+    be followed by an inline tag ``[source: <identifier>]`` where
+    ``<identifier>`` is copied verbatim from the matching tool's
+    "Source: …" footer (e.g. ``[source: yfinance OHLCV NTNX (5y,
+    indicators)]`` or ``[source: yfinance OHLCV NTNX (5y, monthly +
+    recent daily)]``). Do NOT write a number you can't cite — say
+    "not available" instead.
+  expected_output: >
+    A short MARKET REPORT with: trend regime, last close, SMA20/SMA50/
+    RSI14, momentum read, and 1-line bias (bullish / bearish / neutral).
+    Every number must carry an inline ``[source: <identifier>]`` tag.
+
+social_task:
+  description: >
+    Surface social and sentiment signals about {ticker}. FIRST call
+    get_market_context({ticker}) once so your news search uses the
+    company's full legal name (the symbol alone is ambiguous — e.g.
+    "MAZDOCK" returns unrelated headlines, "Mazagon Dock Shipbuilders"
+    does not). THEN call get_news once. Summarize tone
+    (positive/negative/mixed), the dominant narrative, and any
+    sentiment shift you see.
+
+    PROVENANCE: cite each narrative bullet with the article URL from
+    the tool output as ``[source: <url>]`` (the news tool prints a URL
+    on the second line of each row). If you summarise a headline,
+    keep that headline's URL tag.
+  expected_output: >
+    A SOCIAL REPORT with: overall sentiment, top 3 narrative themes
+    (one line each, each carrying a ``[source: <url>]`` tag), and a
+    1-line bias.
+
+news_task:
+  description: >
+    Find material news catalysts for {ticker}.
+
+    Mandatory order:
+      1. Call get_market_context({ticker}) ONCE so you know the company's
+         country, industry, and the country-/industry-specific news themes
+         to query.  Do NOT default to US-centric themes (Fed, treasury,
+         DXY) unless the brief tells you the company is US-listed.
+      2. Call get_news({ticker}) for company-specific catalysts (the
+         tool now searches by the long name from the brief).
+      3. Call get_global_news({ticker}) so the macro headlines surfaced
+         are for the company's home country (RBI / Union Budget /
+         INR for an Indian name, Fed / CPI / DXY for a US name, …).
+      4. Call get_insider_transactions for executive activity.
+
+    Tie each headline to a likely impact (positive / negative / neutral).
+
+    PROVENANCE: every catalyst line ends with the article's URL as
+    ``[source: <url>]``. Insider-activity counts / dollar values end
+    with ``[source: yfinance insider_transactions {ticker}]``.
+  expected_output: >
+    A NEWS REPORT with: 3-5 company catalysts (drawn from the news
+    THEMES in the market context — e.g. defence procurement, shipping
+    insurance, OPEC quota — not generic US macro lines), 2-3 macro
+    items from the company's HOME-COUNTRY basket, insider activity
+    summary, and 1-line bias. Every numeric claim and every headline
+    carries an inline ``[source: <url-or-identifier>]`` tag.
+
+fundamentals_task:
+  description: >
+    Evaluate the fundamentals of {ticker}. Call get_fundamentals,
+    get_balance_sheet, get_cashflow and get_income_statement (one call
+    each). Assess growth, profitability, balance-sheet strength and
+    free-cash-flow quality.
+
+    PROVENANCE: every metric (P/E, EPS, revenue, margin, growth) must
+    carry ``[source: <identifier>]`` — typically
+    ``[source: yfinance .info {ticker} (fundamentals)]`` for ratios or
+    ``[source: yfinance income_stmt {ticker} (latest period)]`` for
+    statement-level figures.
+  expected_output: >
+    A FUNDAMENTALS REPORT with: growth, profitability, leverage/cash,
+    valuation snapshot (P/E, P/B), and 1-line bias. Every figure
+    cited carries an inline ``[source: <identifier>]`` tag.
+
+macro_task:
+  description: >
+    Assess the macro regime for the COUNTRY where {ticker} is listed —
+    not the US by default.
+
+    Mandatory order:
+      1. Call get_market_context({ticker}) ONCE to learn the country,
+         currency, and the macro basket / themes that apply.
+      2. Call get_macro_data({ticker}) — the basket is now country-
+         aware: US → 10y UST + DXY + VIX + WTI + gold; India → Nifty
+         + India VIX + INR/USD + Sensex + Brent; UK / HK / JP get
+         their own equivalents.
+      3. Call get_global_news({ticker}) so the macro news headlines
+         match the country (RBI repo / Union Budget for India,
+         FOMC / CPI for the US, BoE for the UK, …).
+
+    State whether the regime is risk-on or risk-off in the COMPANY'S
+    home country, and how it tilts a {ticker} position. Translate
+    foreign-currency moves into a P&L direction (e.g. a stronger INR
+    is a tailwind for an Indian importer, headwind for an exporter).
+
+    PROVENANCE: cite macro levels with the macro-data Source line
+    (e.g. ``[source: yfinance OHLCV macro basket (India) [...] (2mo)]``);
+    cite news items with their per-row URL as ``[source: <url>]``.
+  expected_output: >
+    A MACRO REPORT with: regime call for the company's home country,
+    top 3 macro signals from that country's basket (each with its
+    inline ``[source: …]`` tag), and tilt on the trade.
+
+geopolitical_task:
+  description: >
+    Identify geopolitical risk specific to {ticker} — anchored to its
+    COUNTRY + INDUSTRY, not the US-China baseline.
+
+    Mandatory order:
+      1. Call get_market_context({ticker}) ONCE to learn the industry
+         themes that matter for this name (e.g. shipbuilder → ship
+         insurance war risk + Strait of Hormuz + naval procurement;
+         semis → chip export controls + Taiwan strait; oil & gas →
+         OPEC quota + Red Sea shipping).
+      2. Call get_geopolitical_news({ticker}) — the query is now
+         derived from the brief's country + industry seeds.
+      3. Call get_global_news({ticker}) AND get_supply_chain_risk
+         ({ticker}) to map customer / supplier concentration.
+
+    Quantify exposure where possible (e.g. "X% of revenue from region
+    Y", "top customer is Z% of revenue", "Make-in-India order book
+    INR N crore").  Do NOT invent percentages.
+
+    PROVENANCE: every risk callout cites the news URL as
+    ``[source: <url>]``; every revenue/customer concentration % cites
+    the underlying article URL.
+  expected_output: >
+    A GEOPOLITICAL REPORT with: 3-5 active risks tied to the COMPANY'S
+    home country + industry, supply-chain & customer-concentration
+    callouts, exposure estimates, and a 1-line tilt. Every claim has
+    an inline ``[source: …]`` tag.
+
+sector_task:
+  description: >
+    Compare {ticker} to its sector peers.
+
+    Mandatory order:
+      1. Call get_market_context({ticker}) ONCE to see the curated
+         peer basket (e.g. MAZDOCK.NS → COCHINSHIP.NS / GRSE.NS /
+         BEL.NS / HAL.NS rather than US semis).
+      2. Call get_sector_peers({ticker}) for YTD return / market-cap /
+         P/E across the basket.
+      3. Call get_indicators({ticker}) for relative momentum.
+
+    Call out alpha vs the median peer.
+
+    PROVENANCE: peer figures cite
+    ``[source: yfinance OHLCV + .info peer basket [...] (YTD)]``;
+    momentum figures cite the get_indicators Source line.
+  expected_output: >
+    A SECTOR REPORT with: peer table (using the country-appropriate
+    basket), alpha vs median, and a 1-line bias. Every number
+    carries an inline ``[source: …]`` tag.
+
+quant_task:
+  description: >
+    Read positioning on {ticker}. Call get_options_summary for ATM IV,
+    put/call ratio and OI, and get_analyst_recommendations for sell-side
+    consensus and price targets. Conclude what the options market and
+    the street are pricing in.
+
+    PROVENANCE: IV / OI / put-call cite
+    ``[source: yfinance option_chain {ticker} expiry=…]``; sell-side
+    consensus cites
+    ``[source: yfinance recommendations_summary {ticker}]``.
+  expected_output: >
+    A QUANT REPORT with: implied move, put/call read, sell-side consensus,
+    and a 1-line tilt. Every figure carries an inline ``[source: …]`` tag.
+
+# ----- Bull / Bear debate (per-round tasks generated in code) ---------------
+
+bull_round:
+  description: >
+    Debate round {round_num} of {total_rounds} (BULL turn). Read all eight
+    analyst reports and prior debate turns in context. State the strongest
+    bullish argument for {ticker} in 4-6 bullets, each tied to a specific
+    analyst report or earlier debate point. If round_num > 1, explicitly
+    rebut the most recent BEAR turn.
+
+    PROVENANCE: copy each ``[source: <identifier>]`` tag verbatim from
+    the analyst report you cite. Do NOT introduce new numbers — only
+    paraphrase or aggregate analyst figures, keeping their tags
+    attached.
+  expected_output: >
+    Bull argument for round {round_num} (bulleted, each bullet keeps
+    the analyst's ``[source: …]`` tag on every quantitative claim).
+
+bear_round:
+  description: >
+    Debate round {round_num} of {total_rounds} (BEAR turn). State the
+    strongest bearish argument in 4-6 bullets, each tied to evidence in
+    the analyst reports or prior debate. Explicitly rebut the BULL turn
+    that just ran.
+
+    PROVENANCE: keep every ``[source: <identifier>]`` tag from the
+    analyst figures you cite. Do NOT introduce numbers without a tag.
+  expected_output: >
+    Bear argument for round {round_num} (bulleted, each numeric claim
+    carries an inline ``[source: …]`` tag).
+
+# ----- Research synthesis ----------------------------------------------------
+
+research_synthesis:
+  description: >
+    As Research Manager, read the full bull/bear debate plus the eight
+    analyst reports (market, social, news, fundamentals, macro,
+    geopolitical, sector, quant). Pick the side with stronger evidence —
+    do NOT split the difference. Note 1-2 things that would change your
+    mind.
+
+    PROVENANCE: every quantitative driver / risk / falsifier MUST carry
+    the underlying ``[source: <identifier>]`` tag inherited from the
+    analyst report you took it from. The trader and the Portfolio
+    Manager rely on these tags being present — strip them and the
+    Reflective Critic will mark the decision unsupported.
+  expected_output: >
+    A RESEARCH THESIS with: STANCE (BULL/BEAR), 3 key drivers, 3 key
+    risks, and 1-2 falsifiers. Every line that contains a number ends
+    with an inline ``[source: …]`` tag.
+
+# ----- Quality review --------------------------------------------------------
+
+quality_review:
+  description: >
+    Audit the Research Manager's thesis. For every claim, mark
+    (SUPPORTED) and cite the analyst report or debate turn it leans on,
+    or (UNSUPPORTED) if no reference exists. Then grade the thesis 0-10
+    on evidence-grounding, and list 1-3 gaps the trader should be aware
+    of. Recommend size reduction ONLY if the score is below 4 (genuine
+    evidence gap, not a single missing tag). A 4-6 thesis is "actionable
+    with caveats", not "size-down".
+
+    A claim counts as SUPPORTED ONLY if it carries an inline
+    ``[source: <identifier>]`` tag (added by the analyst layer and
+    preserved by the manager). A bare number with no tag is automatic
+    UNSUPPORTED — flag it explicitly so the trader can omit it from
+    the plan.
+  expected_output: >
+    A QUALITY REVIEW with: per-claim audit (SUPPORTED with the tag it
+    cites / UNSUPPORTED with the missing-tag warning), overall score
+    X/10, and 1-3 gap statements.
+
+# ----- Trader ----------------------------------------------------------------
+
+trader_task:
+  description: >
+    As the trader, turn the Research Manager's thesis into a concrete
+    plan for {ticker}.
+
+    Mandatory workflow:
+      1. Call get_event_proximity once. If days_to_event is less than your
+         intended horizon_days, either shorten the horizon to fit before
+         earnings, or explicitly size for the catalyst (and flag that the
+         trade is event-driven).
+      2. Draft direction, entry, stop, target, horizon_days, and an
+         initial size as a fraction of risk budget.
+      3. Call backtest_setup(ticker, horizon_days, target_pct, stop_pct)
+         once — pass target_pct and stop_pct as positive percentages
+         computed from your entry/stop/target prices.  The tool returns
+         BOTH a short-term and a long-term (60d/120d/252d) panel.  When
+         comparing your stated confidence to the historical base rate,
+         use BOTH hit-rate AND expectancy / payoff:
+           * a sub-40% hit-rate with positive expectancy and payoff >= 1.5
+             is still an actionable trade — do NOT slash conviction.
+           * a sub-40% hit-rate with negative expectancy IS a signal to
+             tighten the plan or shrink the size.
+         If your short-term setup is weak BUT the 120d / 252d panel is
+         strong, mention that explicitly so the PM can size the trade as
+         a longer-horizon thesis.
+      4. If the Quality Reviewer scored the thesis below 4, reduce your
+         default size by 25% and explicitly cite the gaps the reviewer
+         flagged.  Scores in [4, 6] are "actionable with caveats" — keep
+         the size, but address the caveats in the rationale.
+
+    Cite both tool outputs verbatim in the plan so the PM can see the
+    catalyst gap and the historical base rate.
+
+    PROVENANCE: tag earnings-window figures with
+    ``[source: yfinance .calendar + .earnings_dates {ticker}]`` and
+    backtest figures with ``[source: backtest_setup(...) on yfinance
+    5y OHLCV]``. Keep every analyst-figure tag the manager handed
+    down — the PM uses those to populate the decision's ``sources`` list.
+  expected_output: >
+    A TRADE PLAN with: direction, entry, stop, target, horizon_days,
+    days_to_earnings, historical hit-rate from backtest_setup, and the
+    sizing rationale. Every numeric claim carries an inline
+    ``[source: …]`` tag.
+
+# ----- Risk debate (per-round tasks generated in code) ----------------------
+
+risk_aggressive_round:
+  description: >
+    Risk round {round_num} of {total_rounds} (AGGRESSIVE turn). Argue for
+    higher conviction sizing or a more proactive execution path. Reference
+    the trader's plan and the prior risk turns directly.
+
+    PROVENANCE: keep every ``[source: …]`` tag from the figures you cite.
+  expected_output: >
+    Aggressive risk argument round {round_num} (bulleted, each numeric
+    claim carries an inline ``[source: …]`` tag).
+
+risk_conservative_round:
+  description: >
+    Risk round {round_num} of {total_rounds} (CONSERVATIVE turn). Argue
+    for tighter stops, smaller size, or skipping the trade. Rebut the
+    AGGRESSIVE turn that just ran.
+
+    PROVENANCE: keep every ``[source: …]`` tag from the figures you cite.
+  expected_output: >
+    Conservative risk argument round {round_num} (bulleted, each numeric
+    claim carries an inline ``[source: …]`` tag).
+
+risk_neutral_round:
+  description: >
+    Risk round {round_num} of {total_rounds} (NEUTRAL turn). Synthesize
+    the aggressive and conservative arguments into a balanced
+    sizing/execution recommendation for this round.
+
+    PROVENANCE: keep every ``[source: …]`` tag from the figures you cite.
+  expected_output: >
+    Neutral risk synthesis round {round_num} (bulleted, each numeric
+    claim carries an inline ``[source: …]`` tag).
+
+# ----- Compliance gate -------------------------------------------------------
+
+compliance_review:
+  description: >
+    Review the trade plan and the risk debate for compliance: sanctions /
+    export-control collisions (e.g. chip-export rules, Russia sanctions),
+    restricted-list overlaps, ESG red flags, and conflict-of-interest
+    concerns. Issue ONE of: CLEAR / FLAGGED / BLOCKED, with explicit
+    rationale and any size-cap recommendation.
+
+    PROVENANCE: any factual claim (e.g. "X is on the SDN list",
+    "Y% revenue from Russia") MUST cite a tagged analyst figure or a
+    news URL. Use ``[source: <url>]`` for news, or copy the analyst's
+    inline tag.
+  expected_output: >
+    A COMPLIANCE REVIEW with: status (CLEAR / FLAGGED / BLOCKED), specific
+    concerns (each with an inline ``[source: …]`` tag if quantitative),
+    and size-cap recommendation.
+
+# ----- Portfolio Manager final decision (typed Pydantic output) -------------
+
+pm_decision:
+  description: >
+    As Portfolio Manager, weigh the trader's plan, the risk debate, the
+    geopolitical report, and the compliance review. Issue ONE final
+    decision on {ticker}.
+
+    Time horizons — REQUIRED reasoning:
+      The trader's plan is sized around a SHORT-TERM horizon, but the
+      ``backtest_setup`` panel covers both the trader's window AND a 60d,
+      120d, and 252d long-term view of the SAME target/stop. You MUST
+      explicitly state, in the rationale, how the trade looks on the
+      short-term horizon AND on the long-term (>=120d) horizon. NEUTRAL
+      is only the right call when BOTH horizons disagree with the thesis
+      OR neither has a meaningful edge.
+
+    Decision quality — when to express conviction:
+      Default to OVERWEIGHT or UNDERWEIGHT whenever a directional thesis
+      is supported by the analyst evidence AND at least one horizon in
+      the backtest panel has positive expectancy with payoff ratio >= 1.5.
+      NEUTRAL is reserved for genuinely contradictory evidence — do not
+      use it as a "soft veto" when one signal is mildly weak.
+
+    Hard rules:
+      - If compliance_status is BLOCKED, action MUST be NEUTRAL and
+        size_pct_of_book MUST be 0.
+      - If compliance_status is FLAGGED, cap size_pct_of_book at 1.0 and
+        explain.
+      - confidence is a probability in [0, 1]; calibrate it to the
+        evidence (do not output a 0.50 placeholder); never claim >0.88
+        on a single-name trade.
+      - Hit-rate alone is NOT a confidence cap. Apply the cap "do not
+        exceed confidence 0.6" ONLY when BOTH conditions hold:
+          (a) every horizon in the backtest panel shows expectancy <= 0%,
+              AND
+          (b) the best-horizon hit-rate is below 40%.
+        If any horizon has expectancy > 0 with payoff >= 1.5, calibrate
+        confidence to the strength of the directional signal regardless
+        of the short-term hit-rate.
+
+    PROVENANCE — non-negotiable, the Reflective Critic checks this:
+      - The ``rationale`` MUST keep every ``[source: <identifier>]``
+        tag from the figures you cite. If you can't keep the tag, omit
+        the figure.
+      - The ``sources`` field MUST be a deduplicated list of those
+        ``<identifier>`` strings (just the bit inside the brackets,
+        without "[source: " and "]"). Every distinct identifier you
+        cite in the rationale, drivers, risks, or falsifiers must
+        appear in ``sources``; no extras, no missing ones.
+      - ``key_drivers`` / ``key_risks`` / ``falsifiers`` entries that
+        contain numbers also carry an inline ``[source: …]`` tag.
+      - If you have no quantitative evidence to cite, lower
+        ``confidence`` and acknowledge it in the rationale rather than
+        inventing a figure.
+
+    Return ONLY a JSON object that matches the PortfolioDecision schema.
+    Populate geopolitical_flags from the geopolitical report. Populate
+    compliance_status from the compliance review. Populate ``sources``
+    per the rule above.
+  expected_output: >
+    A JSON object matching the PortfolioDecision schema, with all fields
+    populated, every numeric claim carrying an inline ``[source: …]``
+    tag in the rationale/drivers/risks/falsifiers, and a deduplicated
+    ``sources`` list that mirrors those tags.

@@ -1,0 +1,94 @@
+{
+  "ticker": "NTNX",
+  "params": {
+    "horizon": 20,
+    "target_pct": 6.0,
+    "stop_pct": 3.0
+  },
+  "horizons": [
+    {
+      "horizon_days": 20,
+      "is_trader": true,
+      "hit_rate": 0.373581847649919,
+      "expectancy": 0.2553295200727555,
+      "payoff": 1.7187690419759847,
+      "avg": 0.25532952007275467,
+      "median": -3.331283680193209,
+      "n": 1234,
+      "wins": 461,
+      "losses": 735,
+      "timeouts": 38,
+      "avg_win": 8.543379106013738,
+      "avg_loss": -4.970638228503251
+    },
+    {
+      "horizon_days": 60,
+      "is_trader": false,
+      "hit_rate": 0.37185929648241206,
+      "expectancy": 0.06228494801020812,
+      "payoff": 1.7227789781533034,
+      "avg": 0.06228494801020827,
+      "median": -3.4163550178314295,
+      "n": 1194,
+      "wins": 444,
+      "losses": 750,
+      "timeouts": 0,
+      "avg_win": 8.590664361107567,
+      "avg_loss": -4.986515664543428
+    },
+    {
+      "horizon_days": 120,
+      "is_trader": false,
+      "hit_rate": 0.3800705467372134,
+      "expectancy": 0.17797287281486973,
+      "payoff": 1.7246332751779532,
+      "avg": 0.17797287281486926,
+      "median": -3.394917833121913,
+      "n": 1134,
+      "wins": 431,
+      "losses": 703,
+      "timeouts": 0,
+      "avg_win": 8.633284382976166,
+      "avg_loss": -5.005866758592696
+    },
+    {
+      "horizon_days": 252,
+      "is_trader": false,
+      "hit_rate": 0.3972055888223553,
+      "expectancy": 0.43468024498871305,
+      "payoff": 1.7361800494138628,
+      "avg": 0.43468024498871305,
+      "median": -3.3346850693665164,
+      "n": 1002,
+      "wins": 398,
+      "losses": 604,
+      "timeouts": 0,
+      "avg_win": 8.691902226503434,
+      "avg_loss": -5.006336888525953
+    }
+  ],
+  "decision_old": {
+    "rules": "old",
+    "action": "OVERWEIGHT",
+    "confidence": 0.6,
+    "size_pct": 1.5,
+    "rationale": "hit-rate 37.4% \u2014 confidence capped at 0.60 (old hit-rate rule)"
+  },
+  "decision_new": {
+    "rules": "new",
+    "action": "OVERWEIGHT",
+    "confidence": 0.787,
+    "size_pct": 1.5,
+    "rationale": "best-expectancy horizon = 252d (exp +0.43%, hit-rate 39.7%, payoff 1.74x). Positive expectancy with payoff \u2265 1.5 \u2014 hit-rate cap not binding."
+  },
+  "walk_forward": {
+    "n_proposals": 8,
+    "n_folds": 4,
+    "total_return_pct": -1.036378310004249e-05,
+    "sharpe": -7.937253933193771,
+    "max_drawdown": 1.0363783100037836e-05,
+    "deflated_sharpe": null,
+    "notes": "OK"
+  },
+  "timestamp": "20260626T093843Z"
+}

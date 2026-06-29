@@ -1,0 +1,94 @@
+{
+  "ticker": "HINDUNILVR.NS",
+  "params": {
+    "horizon": 20,
+    "target_pct": 8.0,
+    "stop_pct": 3.0
+  },
+  "horizons": [
+    {
+      "horizon_days": 20,
+      "is_trader": true,
+      "hit_rate": 0.13311421528348397,
+      "expectancy": 0.06341386353600964,
+      "payoff": 2.452918143049891,
+      "avg": 0.06341386353600958,
+      "median": -2.1940030425978807,
+      "n": 1217,
+      "wins": 162,
+      "losses": 591,
+      "timeouts": 464,
+      "avg_win": 9.414242823902919,
+      "avg_loss": -3.8379767586526587
+    },
+    {
+      "horizon_days": 60,
+      "is_trader": false,
+      "hit_rate": 0.25658453695836875,
+      "expectancy": -0.21302968708256825,
+      "payoff": 2.3828538306311957,
+      "avg": -0.21302968708256861,
+      "median": -3.219680535870595,
+      "n": 1177,
+      "wins": 302,
+      "losses": 812,
+      "timeouts": 63,
+      "avg_win": 9.168642047519791,
+      "avg_loss": -3.847756807261276
+    },
+    {
+      "horizon_days": 120,
+      "is_trader": false,
+      "hit_rate": 0.2811101163831692,
+      "expectancy": -0.19709357744662218,
+      "payoff": 2.3673732347918737,
+      "avg": -0.1970935774466222,
+      "median": -3.244252018933902,
+      "n": 1117,
+      "wins": 314,
+      "losses": 802,
+      "timeouts": 1,
+      "avg_win": 9.136175076683168,
+      "avg_loss": -3.8592035013382118
+    },
+    {
+      "horizon_days": 252,
+      "is_trader": false,
+      "hit_rate": 0.2893401015228426,
+      "expectancy": -0.12254694998949223,
+      "payoff": 2.3473159686396587,
+      "avg": -0.12254694998949199,
+      "median": -3.247505405546991,
+      "n": 985,
+      "wins": 285,
+      "losses": 700,
+      "timeouts": 0,
+      "avg_win": 9.135645104504912,
+      "avg_loss": -3.891953715033642
+    }
+  ],
+  "decision_old": {
+    "rules": "old",
+    "action": "NEUTRAL",
+    "confidence": 0.55,
+    "size_pct": 0.0,
+    "rationale": "hit-rate 13.3% < 40% caps confidence at 0.60; quality penalty halves size; both binding => NEUTRAL by default."
+  },
+  "decision_new": {
+    "rules": "new",
+    "action": "OVERWEIGHT",
+    "confidence": 0.713,
+    "size_pct": 1.125,
+    "rationale": "best-expectancy horizon = 20d (exp +0.06%, hit-rate 13.3%, payoff 2.45x). Positive expectancy with payoff \u2265 1.5 \u2014 hit-rate cap not binding."
+  },
+  "walk_forward": {
+    "n_proposals": 0,
+    "n_folds": 0,
+    "total_return_pct": null,
+    "sharpe": null,
+    "max_drawdown": null,
+    "deflated_sharpe": null,
+    "notes": "Only 0 proposals for HINDUNILVR.NS; walk-forward needs \u2265 5."
+  },
+  "timestamp": "20260626T093334Z"
+}

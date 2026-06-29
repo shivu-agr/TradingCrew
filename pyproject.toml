@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading_crew"
+version = "0.1.0"
+description = "Multi-agent stock-research workflow with CrewAI (notebook -> project conversion)"
+requires-python = ">=3.10"
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["trading_crew*", "web*"]
+
+[tool.setuptools.package-data]
+"trading_crew" = ["config/*.yaml"]

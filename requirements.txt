@@ -1,0 +1,17 @@
+crewai>=1.14.0
+python-dotenv>=1.0.0
+pydantic>=2.6.0
+pyyaml>=6.0
+yfinance>=0.2.0
+tavily-python>=0.3.0
+pandas>=2.0.0
+lxml>=5.0.0
+stockstats>=0.6.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+websockets>=12.0
+python-multipart>=0.0.9
+# L4 RL training: PyTorch hosts the PPO actor-critic network +
+# optimiser. Numpy is already pulled in by pandas, so no separate pin
+# is needed.
+torch>=2.0.0

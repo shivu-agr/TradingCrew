@@ -1,0 +1,366 @@
+# =============================================================================
+# CommodityCrew task chain
+# =============================================================================
+# Task graph (sequential, with async_execution on the analyst fan-out and
+# context= chains wired in code):
+#
+#   7 analysts (parallel)
+#     -> DEBATE_ROUNDS x (Bull -> Bear)
+#       -> Research Manager synthesis
+#         -> Quality Reviewer audit
+#           -> Senior Futures Trader (trade plan, NOT the final decision)
+#             -> RISK_ROUNDS x (Aggressive -> Conservative -> Neutral)
+#               -> Compliance Officer
+#                 -> Portfolio Manager (typed FuturesDecision)
+#
+# Only the PM task carries output_pydantic=FuturesDecision so the
+# downstream M1 bridge / reflective critic see a single typed artefact.
+#
+# Provenance rule (enforced in every task description below)
+# -----------------------------------------------------------
+# Every numeric / quantitative claim MUST end with an inline tag
+# ``[source: <identifier>]`` whose ``<identifier>`` is copied verbatim
+# from the matching tool's ``Source: …`` footer (e.g.
+# ``[source: yfinance futures curve CL]``, ``[source: CFTC COT ...]``,
+# ``[source: <Tavily article URL>]``). Downstream tasks (manager, QA,
+# trader, risk, compliance, PM) MUST preserve those tags. The
+# Portfolio Manager emits the deduplicated identifiers in the
+# ``sources`` field of the typed ``FuturesDecision`` so the Reflective
+# Critic can distinguish real data from hallucinated numbers.
+# =============================================================================
+
+market_task:
+  description: >
+    Analyse price action and technicals for {ticker}.
+    Pull OHLCV + indicators via tool calls; identify the active regime
+    (TREND / RANGE / HIGH_VOL), key levels (support/resistance), ATR, and
+    the implied stop placement. Pull past episodes if any.
+
+    PROVENANCE: every price / SMA / RSI / ATR figure ends with an inline
+    ``[source: <identifier>]`` tag copied verbatim from the tool's
+    "Source: …" footer (e.g.
+    ``[source: yfinance futures OHLCV {ticker} (5y, indicators)]``).
+    Do NOT write a number without a tag.
+  expected_output: >
+    A concise (~150 word) technical readout. State the regime, the
+    levels, the ATR-derived 1-day expected move, and your directional
+    bias plus a confidence on a 0-1 scale. Every numeric claim carries
+    an inline ``[source: …]`` tag.
+
+curve_task:
+  description: >
+    Map the futures curve for {ticker}: pull at least 12 forward months.
+    Identify CONTANGO / BACKWARDATION / FLAT; quantify the annualised
+    roll yield a long-only holder would absorb over a 30-day hold.
+    Comment on what the curve shape implies about physical supply.
+
+    PROVENANCE: curve prices and roll-yield % cite
+    ``[source: yfinance futures curve <root> (next N contracts)]``.
+  expected_output: >
+    A short paragraph stating the curve structure, the front-back slope,
+    the annualised roll yield, and the supply implication. Every figure
+    has an inline ``[source: …]`` tag. Include the raw price points so
+    the next agent can verify.
+
+inventories_task:
+  description: >
+    Source the most recent inventory data for the commodity behind {ticker}
+    (e.g. EIA petroleum, USDA WASDE, LME stocks, ICE warehouse). Frame the
+    current level relative to the 5-year range and the seasonal expectation.
+
+    PROVENANCE: cite each headline-derived inventory number with the
+    article URL from get_commodity_news as ``[source: <url>]``. Bare
+    numbers without a URL tag are not acceptable — write "(unconfirmed)"
+    instead.
+  expected_output: >
+    A 100-150 word inventory note: current days-of-supply (or
+    stocks-to-use for ag), the surprise vs consensus if any, the
+    rate-of-change, and the direction this points price. Every figure
+    carries an inline ``[source: <url>]`` tag.
+
+supply_demand_task:
+  description: >
+    Write the supply-demand balance for {ticker} for the next 1-3 months.
+    Identify the dominant marginal driver (e.g. "Chinese refinery runs"
+    for diesel, "US planting weather" for corn).
+
+    PROVENANCE: cite news-derived demand / supply numbers with the
+    article URL as ``[source: <url>]``.
+  expected_output: >
+    A short balance paragraph identifying the marginal driver, the
+    expected supply / demand trajectory, and the implied price path.
+    Every numeric claim carries an inline ``[source: <url>]`` tag.
+
+macro_task:
+  description: >
+    Place {ticker} in the macro: DXY, US real yields, growth proxies,
+    inflation expectations. Identify the single macro variable most
+    likely to move it over the next 30 days.
+
+    PROVENANCE: each named macro level cites either a news URL via
+    ``[source: <url>]`` or — if you have the get_macro_data output in
+    context — its Source identifier.
+  expected_output: >
+    A short paragraph naming the dominant macro driver, its current
+    level / trend, and the directional sensitivity. Every figure carries
+    an inline ``[source: …]`` tag.
+
+geopolitical_task:
+  description: >
+    Scan for geopolitical risks that could disrupt {ticker} supply or
+    transit. Be specific — name the event, the asset path, and the
+    timing.
+
+    PROVENANCE: every risk line ends with the article URL as
+    ``[source: <url>]``.
+  expected_output: >
+    A bulleted list of identified risks. Each item gives: event,
+    asset path, probability assessment, expected magnitude, and an
+    inline ``[source: <url>]`` tag.
+
+quant_task:
+  description: >
+    Pull the last 6 weeks of CFTC COT positioning for {ticker} and
+    the historical monthly seasonality. Score positioning against the
+    5-year range; flag if Managed Money is at an extreme.
+
+    PROVENANCE: COT figures cite ``[source: CFTC COT <url> (<cftc_name>)]``;
+    seasonality figures cite ``[source: yfinance OHLCV {ticker} (Ny,
+    monthly aggregation)]``.
+  expected_output: >
+    A short readout: net managed money positioning (with absolute number),
+    percentile vs trailing 1y, the current month's historical seasonal
+    return, and a contrarian / momentum tag. Every figure carries an
+    inline ``[source: …]`` tag.
+
+# ----- Bull / Bear debate (per-round tasks generated in code) ---------------
+
+bull_round:
+  description: >
+    Futures debate round {round_num} of {total_rounds} (BULL turn). Read
+    all seven analyst reports and prior debate turns in context. State
+    the strongest LONG case for {ticker} in 4-6 bullets, each tied to a
+    specific analyst report or earlier debate point. Pay explicit
+    attention to the curve (backwardation = bullish), inventories
+    (draws), and managed-money positioning. If round_num > 1, rebut
+    the most recent BEAR turn directly.
+
+    PROVENANCE: copy every ``[source: <identifier>]`` tag verbatim from
+    the analyst report you cite. Do NOT introduce new numbers.
+  expected_output: >
+    Bull argument for round {round_num} (bulleted, evidence-tied,
+    each numeric bullet carries its inline ``[source: …]`` tag).
+
+bear_round:
+  description: >
+    Futures debate round {round_num} of {total_rounds} (BEAR turn).
+    State the strongest case AGAINST going long on {ticker} (short or
+    stay flat) in 4-6 bullets, each tied to evidence in the analyst
+    reports or prior debate. Quantify any contango drag, stretched
+    managed-money long positioning, or inventory build that argues
+    against price upside. Explicitly rebut the BULL turn that just ran.
+
+    PROVENANCE: keep every ``[source: <identifier>]`` tag from the
+    figures you cite.
+  expected_output: >
+    Bear argument for round {round_num} (bulleted, each numeric claim
+    carries an inline ``[source: …]`` tag).
+
+# ----- Research synthesis ----------------------------------------------------
+
+research_synthesis:
+  description: >
+    As Futures Research Manager, read the full bull/bear debate plus
+    the seven analyst reports (market, curve, inventories, supply &
+    demand, macro, geopolitical, positioning). Pick the side with
+    stronger evidence — do NOT split the difference. Weigh the
+    annualised roll-yield drag explicitly against the directional edge.
+    Note 1-2 specific data points that would change your mind.
+
+    PROVENANCE: every quantitative driver / risk / falsifier MUST carry
+    the underlying ``[source: <identifier>]`` tag from the analyst
+    report you took it from. Strip the tags and the Reflective Critic
+    will mark the decision unsupported.
+  expected_output: >
+    A FUTURES RESEARCH THESIS with: STANCE (LONG/SHORT/NEUTRAL), 3 key
+    drivers (one each from curve, fundamentals, positioning),
+    3 key risks, and 1-2 falsifiers expressed as observable data.
+    Every line that contains a number ends with an inline
+    ``[source: …]`` tag.
+
+# ----- Quality review --------------------------------------------------------
+
+quality_review:
+  description: >
+    Audit the Research Manager's thesis on {ticker}. For every claim,
+    mark (SUPPORTED) and cite the analyst report or debate turn it
+    leans on, or (UNSUPPORTED) if no reference exists. Then grade the
+    thesis 0-10 on evidence-grounding, and list 1-3 gaps the trader
+    should be aware of. If the score is below 5, recommend the trader
+    sizes the position smaller. Pay extra attention to claims about
+    the curve, inventories, and positioning — those are the most
+    common places where a futures narrative outruns the data.
+
+    A claim counts as SUPPORTED ONLY if it carries an inline
+    ``[source: <identifier>]`` tag. A bare number with no tag is
+    automatic UNSUPPORTED — call it out so the trader knows not to
+    quote it.
+  expected_output: >
+    A QUALITY REVIEW with: per-claim audit (SUPPORTED with the cited
+    tag / UNSUPPORTED with the missing-tag warning), overall score
+    X/10, and 1-3 gap statements.
+
+# ----- Trader plan (NOT the final decision) ---------------------------------
+
+trader_task:
+  description: >
+    As the Senior Futures Trader, turn the Research Manager's thesis
+    on {ticker} into a concrete TRADE PLAN. You produce the plan,
+    NOT the final FuturesDecision (that's the Portfolio Manager's job).
+
+    Mandatory workflow:
+      1. Pick a specific delivery month (e.g. 2026-08 for August 2026
+         WTI) — use the curve analyst's price table to confirm liquidity.
+      2. State direction (LONG / SHORT / NEUTRAL), entry, stop, target
+         and horizon_days. Stops must respect the ATR you read off the
+         market analyst's report.
+      3. Recommend an initial sizing as % of risk budget (NOT % of
+         notional — futures notional is leveraged). Cap at 5% per
+         trade by default; halve if Quality Reviewer scored < 5/10.
+      4. State the curve_view (CONTANGO / BACKWARDATION / FLAT) and
+         the annualised roll yield from the curve analyst's report so
+         the PM can subtract it from your expected return.
+      5. If the past-episodes tool surfaces a closely-comparable trade,
+         cite its realised return and what was learned.
+
+    Cite analyst reports by name in your rationale; do not invent
+    numbers.
+
+    PROVENANCE: every numeric claim in the plan (entry, stop, target,
+    ATR, roll yield, hit-rate) carries an inline ``[source: …]`` tag.
+    Tools you call yourself add a Source line — copy that identifier
+    into the relevant figure's tag. The PM will dedupe the set into
+    the FuturesDecision.sources list.
+  expected_output: >
+    A TRADE PLAN with: direction, entry, stop, target, horizon_days,
+    contract_month, contract_size, curve_view, roll_yield_pct,
+    recommended_size_pct (initial recommendation only — risk team and
+    PM will adjust), and a short rationale. Every numeric claim carries
+    an inline ``[source: …]`` tag.
+
+# ----- Risk debate (per-round tasks generated in code) ----------------------
+
+risk_aggressive_round:
+  description: >
+    Risk round {round_num} of {total_rounds} (AGGRESSIVE turn). Argue
+    for higher conviction sizing on the {ticker} futures trade or a
+    more proactive execution path. Reference the trader's plan and the
+    prior risk turns directly. Reason in vol-target / Kelly terms, not
+    gross notional.
+
+    PROVENANCE: keep every ``[source: …]`` tag on the figures you cite.
+  expected_output: >
+    Aggressive risk argument round {round_num} (bulleted, every numeric
+    claim carries an inline ``[source: …]`` tag).
+
+risk_conservative_round:
+  description: >
+    Risk round {round_num} of {total_rounds} (CONSERVATIVE turn).
+    Argue for tighter stops, smaller size, or skipping the {ticker}
+    futures trade. Rebut the AGGRESSIVE turn that just ran. Be
+    specific about tail risks (USDA/EIA surprise reports, geopolitical
+    headlines, OPEC actions) and roll-yield drag.
+
+    PROVENANCE: keep every ``[source: …]`` tag on the figures you cite.
+  expected_output: >
+    Conservative risk argument round {round_num} (bulleted, every
+    numeric claim carries an inline ``[source: …]`` tag).
+
+risk_neutral_round:
+  description: >
+    Risk round {round_num} of {total_rounds} (NEUTRAL turn).
+    Synthesize the aggressive and conservative arguments into a
+    balanced sizing / execution recommendation for {ticker}. Apply
+    the roll-yield haircut: every -3% annualised contango = -10%
+    on recommended size, every +3% backwardation = +5% size headroom.
+
+    PROVENANCE: keep every ``[source: …]`` tag on the figures you cite.
+  expected_output: >
+    Neutral risk synthesis round {round_num} (bulleted, with a final
+    recommended_size_pct that survives both arguments; every numeric
+    claim carries an inline ``[source: …]`` tag).
+
+# ----- Compliance gate -------------------------------------------------------
+
+compliance_review:
+  description: >
+    Review the {ticker} futures trade plan and risk debate for:
+    CFTC speculative position-limit collisions (especially in ag and
+    natural gas), sanctions issues (Russian / Iranian grades, certain
+    trade routes), exchange position-accountability thresholds, and
+    delivery-month roll obligations vs the holder's operational
+    capability. Issue ONE of CLEAR / FLAGGED / BLOCKED with explicit
+    rationale and any size-cap recommendation.
+
+    PROVENANCE: any factual claim (e.g. "spec position limit is X
+    contracts", "route Y is sanctioned") MUST carry a tagged figure or
+    a news URL: ``[source: <url>]`` for news, or copy the analyst's
+    inline tag.
+  expected_output: >
+    A COMPLIANCE REVIEW with: status (CLEAR / FLAGGED / BLOCKED),
+    specific concerns (each quantitative concern carries an inline
+    ``[source: …]`` tag), and size-cap recommendation.
+
+# ----- Portfolio Manager final decision (typed Pydantic output) -------------
+
+pm_decision:
+  description: >
+    As Portfolio Manager for the commodity book, weigh the trader's
+    plan, the risk debate, the geopolitical report, and the compliance
+    review. Issue ONE final FuturesDecision on {ticker}.
+
+    You MUST set action (LONG / NEUTRAL / SHORT), confidence in [0,1],
+    size_pct_of_book in [0, 100], entry_price, stop_loss, target_price,
+    horizon_days, expected_return_pct, contract_month (ISO YYYY-MM
+    like '2026-08'), contract_size (use the curve analyst's table),
+    curve_view (CONTANGO / BACKWARDATION / FLAT), and
+    roll_yield_pct_annualised.
+
+    Hard rules:
+      - If compliance_status is BLOCKED, action MUST be NEUTRAL and
+        size_pct_of_book MUST be 0.
+      - If compliance_status is FLAGGED, cap size_pct_of_book at the
+        compliance review's recommendation.
+      - If positioning is at a 95th-percentile extreme AND the curve
+        argues against the move, choose NEUTRAL (size 0).
+      - Subtract the absolute annualised roll-yield drag from
+        expected_return_pct.
+      - confidence is a probability in [0, 1]; do not output 0.5 as a
+        default; never claim >0.85 on a single-name futures trade.
+
+    PROVENANCE — non-negotiable, the Reflective Critic checks this:
+      - The ``rationale`` MUST keep every ``[source: <identifier>]``
+        tag from the figures you cite. If you can't keep the tag, omit
+        the figure.
+      - The ``sources`` field MUST be a deduplicated list of those
+        ``<identifier>`` strings (just the bit inside the brackets,
+        without "[source: " and "]"). Every distinct identifier you
+        cite in the rationale / drivers / risks / falsifiers must
+        appear in ``sources``; no extras, no missing ones.
+      - ``key_drivers`` / ``key_risks`` / ``falsifiers`` entries that
+        contain numbers also carry an inline ``[source: …]`` tag.
+      - If you have no quantitative evidence to cite, lower
+        ``confidence`` and acknowledge it in the rationale rather than
+        inventing a figure.
+
+    Return ONLY a JSON object that matches the FuturesDecision schema.
+    Populate geopolitical_flags from the geopolitical report. Populate
+    compliance_status from the compliance review. Populate ``sources``
+    per the rule above.
+  expected_output: >
+    A JSON object matching the FuturesDecision schema, with every
+    field populated, every numeric claim carrying an inline
+    ``[source: …]`` tag in the rationale/drivers/risks/falsifiers, a
+    deduplicated ``sources`` list mirroring those tags, and a
+    rationale of at least 150 words that names which reports / risk
+    turns drove the call.
