@@ -53,6 +53,14 @@ Open <http://localhost:8001>, pick a ticker, and hit **Run analysis**. For a hea
 
 **➡️ [Full documentation](docs/README.md)** — configuration, model/serving guide, the deterministic design, and a [finance primer](docs/finance/README.md) for non-finance readers.
 
+## Inspiration & references
+
+- **TauricResearch/TradingAgents** — the high-level multi-agent debate topology (analyst team → bull/bear → trader → 3-way risk → PM) is inspired by this Apache-2.0 project. <https://github.com/TauricResearch/TradingAgents>
+- **Xiao et al., "TradingAgents: Multi-Agents LLM Financial Trading Framework"** — arXiv:[2412.20138](https://arxiv.org/abs/2412.20138) (2025).
+- **Deterministic Layer-A design** — the M1–M7 contract (bridge, simulator, memory, critic, sizer + gates, walk-forward, allocator) draws on arXiv:[2605.19337](https://arxiv.org/pdf/2605.19337).
+
+TradingCrew is an independent implementation built on **CrewAI**, with its own futures dashboard, FastAPI/WebSocket web UI, and deterministic post-LLM pipeline. No source code is copied from the upstream project. See [`NOTICE`](NOTICE) for the full attribution.
+
 ## Disclaimer
 
 For **research and educational purposes only**. Market data is delayed and back-tested performance is not a guarantee of future returns. **Nothing here is investment advice.**
