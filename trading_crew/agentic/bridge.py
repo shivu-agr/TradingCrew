@@ -12,8 +12,28 @@ This bridge is **deterministic**: it does not call the LLM.  We map fields
 1-to-1 where possible and synthesize the missing ones from existing data
 (``ValidityCheck`` is filled by inspecting the proposal's own coherence so
 M5's risk gate has something to check).  When the source decision is
-inconsistent (e.g. ``OVERWEIGHT`` with ``size_pct_of_book == 0``), we fall
+inconsistent (e.g. ``BUY`` with ``size_pct_of_book == 0``), we fall
 back to ``ABSTAIN`` rather than emitting a malformed proposal.
+
+Action tier mapping
+-------------------
+The CrewAI Portfolio Manager emits the retail-friendly 5-tier
+``PortfolioDecision.action`` (``STRONG_BUY`` / ``BUY`` / ``HOLD`` /
+``SELL`` / ``STRONG_SELL``).  The downstream M1 ``ActionProposal`` only
+carries the 4-value ``ActionSide`` (``BUY`` / ``SELL`` / ``HOLD`` /
+``ABSTAIN``).  We collapse:
+
+* ``STRONG_BUY``  → ``ActionSide.BUY``   (conviction is captured by
+  ``conviction_score`` + ``target_weight`` — no separate side needed)
+* ``BUY``         → ``ActionSide.BUY``
+* ``HOLD``        → ``ActionSide.HOLD``
+* ``SELL``        → ``ActionSide.SELL``
+* ``STRONG_SELL`` → ``ActionSide.SELL``
+
+Legacy ``OVERWEIGHT`` / ``NEUTRAL`` / ``UNDERWEIGHT`` inputs are
+normalised through the schema's coercion validator before we ever see
+them here, but ``_action_side_from_decision`` also handles them
+defensively (belt-and-braces).
 """
 
 from __future__ import annotations
@@ -30,25 +50,43 @@ from trading_crew.agentic.execution.contracts import (
     SizingBasis,
     ValidityCheck,
 )
+from trading_crew.horizons import Horizon, MAX_ACTIONABLE_HORIZON_DAYS
+
+
+# Alias to the single source of truth so old callers keep working.
+# See ``trading_crew.horizons.MAX_ACTIONABLE_HORIZON_DAYS`` for the
+# rationale (5-year cap on outcome accounting even though the LLM's
+# stated horizon can be a 5-10 year narrative view).
+_MAX_ACTIONABLE_HORIZON_DAYS = MAX_ACTIONABLE_HORIZON_DAYS
+
 from trading_crew.schemas import PortfolioDecision
 
 logger = logging.getLogger(__name__)
 
 
+_LONG_TIERS = {"BUY", "STRONG_BUY", "OVERWEIGHT"}
+_SHORT_TIERS = {"SELL", "STRONG_SELL", "UNDERWEIGHT"}
+_FLAT_TIERS = {"HOLD", "NEUTRAL"}
+
+
 def _action_side_from_decision(action: str, size_pct: float) -> ActionSide:
     """Map (action, size_pct) to an ``ActionSide``.
 
-    ``NEUTRAL`` *and* ``size_pct == 0`` -> HOLD.  ``OVERWEIGHT`` -> BUY,
-    ``UNDERWEIGHT`` -> SELL.  An ``OVERWEIGHT/UNDERWEIGHT`` with zero size
-    is degenerate and rolled back to ``ABSTAIN`` so M5's risk gate doesn't
-    have to defend against contradictions.
+    Long tiers (``BUY``, ``STRONG_BUY``) → ``BUY``; short tiers
+    (``SELL``, ``STRONG_SELL``) → ``SELL``; ``HOLD`` → ``HOLD``.  A
+    directional tier with ``size_pct == 0`` is degenerate (the
+    guardrail should have caught it upstream) and rolled back to
+    ``ABSTAIN`` so M5's risk gate doesn't have to defend against
+    contradictions.  Legacy ``OVERWEIGHT`` / ``UNDERWEIGHT`` /
+    ``NEUTRAL`` strings are accepted defensively for records emitted by
+    older builds.
     """
-    action = (action or "NEUTRAL").upper()
-    if action == "OVERWEIGHT":
+    action = (action or "HOLD").upper()
+    if action in _LONG_TIERS:
         return ActionSide.BUY if size_pct > 0 else ActionSide.ABSTAIN
-    if action == "UNDERWEIGHT":
+    if action in _SHORT_TIERS:
         return ActionSide.SELL if size_pct > 0 else ActionSide.ABSTAIN
-    if action == "NEUTRAL":
+    if action in _FLAT_TIERS:
         return ActionSide.HOLD
     return ActionSide.ABSTAIN
 
@@ -152,12 +190,27 @@ def portfolio_decision_to_action_proposal(
             f"{rationale}\nKey drivers: {drivers}.\nLevels: {targets}."
         ).strip()
 
+        # Clamp horizon_days for the ActionProposal outcome window.  For
+        # SHORT/MEDIUM this is a no-op; for LONG (up to 2520d in the
+        # decision) we cap at 5y = 1260d so the outcome-resolution
+        # loop still finishes within the RLMF training window.  We
+        # emit a tag so downstream consumers (memory, UI) know the
+        # decision's *narrative* horizon differs from the *accounting*
+        # horizon.
+        raw_horizon = max(1, int(decision.horizon_days or 21))
+        accounting_horizon = min(raw_horizon, _MAX_ACTIONABLE_HORIZON_DAYS)
+        tags = list(decision.geopolitical_flags or [])
+        if accounting_horizon < raw_horizon:
+            tags.append(
+                f"horizon_capped:{raw_horizon}d→{accounting_horizon}d"
+            )
+
         return ActionProposal(
             symbol=symbol.upper(),
             decision_ts=decision_ts,
             side=side,
             target_weight=target_weight,
-            horizon_days=max(1, int(decision.horizon_days or 21)),
+            horizon_days=accounting_horizon,
             limit_price=decision.entry_price if decision.entry_price > 0 else None,
             tif=OrderTimeInForce.DAY,
             conviction_score=max(0.0, min(1.0, float(decision.confidence or 0.0))),
@@ -166,7 +219,7 @@ def portfolio_decision_to_action_proposal(
             expected_return_pct=float(decision.expected_return_pct or 0.0),
             rationale=rationale,
             validity_check=validity,
-            tags=list(decision.geopolitical_flags or []),
+            tags=tags,
         )
     except Exception as exc:
         logger.warning("PortfolioDecision -> ActionProposal failed (%s); abstaining", exc)

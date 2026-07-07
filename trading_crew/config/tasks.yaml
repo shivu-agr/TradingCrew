@@ -4,14 +4,17 @@
 # Task graph (sequential, with async_execution wired in code for the analyst
 # fan-out and context= chains wired in code from the @task decorators):
 #
-#   8 analysts (parallel via async_execution=True)
+#   4 analysts (parallel via async_execution=True)
 #     -> DEBATE_ROUNDS x (Bull -> Bear)
 #       -> Research Manager synthesis
-#         -> Quality Reviewer audit
 #           -> Trader plan
 #             -> RISK_ROUNDS x (Aggressive -> Conservative -> Neutral)
-#               -> Compliance Officer
 #                 -> Portfolio Manager (typed PortfolioDecision + guardrail)
+#
+#   Quality Reviewer audit (optional) + Compliance Officer (optional) run
+#   ASYNC / advisory: they are wired as PM-context inputs (not trader
+#   gates) so they overlap the trader/risk stretch instead of extending
+#   the critical path.  Both are toggle-controlled and default OFF.
 #
 # {ticker} is substituted from the kickoff inputs dict.
 #
@@ -25,209 +28,300 @@
 # emits the deduplicated set of identifiers in the ``sources`` field of
 # its typed ``PortfolioDecision`` — that's how the Reflective Critic
 # distinguishes real data from hallucinated numbers.
+#
+# REPORT FORMAT contract (enforced in every analyst task below)
+# -------------------------------------------------------------
+# Every analyst report MUST open with a 3-5 line ``TLDR:`` block:
+#
+#     TLDR:
+#     - <one-line headline finding with [source: …] tag>
+#     - <one-line headline finding with [source: …] tag>
+#     - Bias: bullish / bearish / neutral
+#
+# This lets the Research Manager / Trader / PM read just the TLDR block
+# of every upstream report when the LLM has a smaller context window
+# (e.g. Gemma-4 at ~42K tokens), and gives the OSS-120B tool-loop a
+# clear "I'm done — write the summary now" signal instead of looping
+# on more tool calls.  The full body that follows is still rendered in
+# the Reports tab and consumed by the LLM verbatim when the window has
+# room — but the TLDR is the canonical compacted form.
+#
+# Tool budget (helps with OSS-120B tool-loop degradation pattern on
+# tool-heavy Indian-ticker runs)
+# ----------------------------------------------------------------
+# Tool-heavy tasks (news, social, geopolitical) state an explicit MAX
+# number of tool calls; once exhausted the analyst MUST stop calling
+# tools and write the report from whatever it has, rather than
+# emitting another tool-call object as the final answer.
 # =============================================================================
 
-# ----- Analyst phase (all 8 run with async_execution=True in code) ----------
+# ----- Analyst phase (all 4 run with async_execution=True in code) ----------
+#
+# The four desks below were consolidated from an earlier eight-analyst
+# layout.  Each one now covers a wider remit under a batched tool budget:
+#   * market_analyst        = price/technicals + options/positioning (was market + quant)
+#   * news_analyst          = catalysts + corporate actions + sentiment + insider (was news + social)
+#   * fundamentals_analyst  = financials + long-term thesis + sector/peers (was fundamentals + sector)
+#   * macro_analyst         = macro regime + geopolitical + supply-chain (was macro + geopolitical)
 
 market_task:
   description: >
-    Analyze the price action of {ticker}. Call get_stock_data once for
-    5-year OHLCV (5y overview + monthly aggregates + last 30 daily
-    sessions) and get_indicators once for
-    SMA20/SMA50/SMA200/RSI14/60d-return/1y-return. Identify the trend
-    regime (uptrend / downtrend / range) using BOTH the multi-year
-    monthly trend and the recent daily action, key levels, and any
-    divergences.
+    Analyze the price action AND option-implied positioning of {ticker}.
 
-    PROVENANCE: every number you write (price, SMA, RSI, return %) MUST
-    be followed by an inline tag ``[source: <identifier>]`` where
-    ``<identifier>`` is copied verbatim from the matching tool's
+    Tool budget: call each tool AT MOST ONCE, then write the report.
+    Do NOT loop for more calls — emitting another tool call instead of
+    a final report counts as task failure.
+
+    Mandatory order:
+      1. get_stock_data — 5-year OHLCV (5y overview + monthly
+         aggregates + last 30 daily sessions).
+      2. get_indicators — SMA20/SMA50/SMA200/RSI14/60d-return/1y-return.
+      3. get_options_summary — ATM IV, put/call ratio and OI (what the
+         options market is pricing in).  If the ticker has no listed
+         options the tool says so — note it and move on.
+      4. get_analyst_recommendations — sell-side consensus + price
+         targets (what the street is pricing in).
+
+    Identify the trend regime (uptrend / downtrend / range) using BOTH
+    the multi-year monthly trend and the recent daily action, key
+    levels, divergences, the implied move, and how the options / street
+    view lines up with (or contradicts) the chart.
+
+    PROVENANCE: every number you write (price, SMA, RSI, return %, IV,
+    put/call, target) MUST be followed by an inline tag
+    ``[source: <identifier>]`` copied verbatim from the matching tool's
     "Source: …" footer (e.g. ``[source: yfinance OHLCV NTNX (5y,
-    indicators)]`` or ``[source: yfinance OHLCV NTNX (5y, monthly +
-    recent daily)]``). Do NOT write a number you can't cite — say
-    "not available" instead.
+    indicators)]``, ``[source: yfinance option_chain {ticker} expiry=…]``,
+    ``[source: yfinance recommendations_summary {ticker}]``). Do NOT
+    write a number you can't cite — say "not available" instead.  A
+    qualitative read with no citable figure must be labelled
+    ``[analyst judgement]`` — never invent a URL or placeholder link
+    (``example.com``) to satisfy this rule.
   expected_output: >
-    A short MARKET REPORT with: trend regime, last close, SMA20/SMA50/
-    RSI14, momentum read, and 1-line bias (bullish / bearish / neutral).
-    Every number must carry an inline ``[source: <identifier>]`` tag.
-
-social_task:
-  description: >
-    Surface social and sentiment signals about {ticker}. FIRST call
-    get_market_context({ticker}) once so your news search uses the
-    company's full legal name (the symbol alone is ambiguous — e.g.
-    "MAZDOCK" returns unrelated headlines, "Mazagon Dock Shipbuilders"
-    does not). THEN call get_news once. Summarize tone
-    (positive/negative/mixed), the dominant narrative, and any
-    sentiment shift you see.
-
-    PROVENANCE: cite each narrative bullet with the article URL from
-    the tool output as ``[source: <url>]`` (the news tool prints a URL
-    on the second line of each row). If you summarise a headline,
-    keep that headline's URL tag.
-  expected_output: >
-    A SOCIAL REPORT with: overall sentiment, top 3 narrative themes
-    (one line each, each carrying a ``[source: <url>]`` tag), and a
-    1-line bias.
+    A MARKET REPORT that opens with a ``TLDR:`` 3-line block
+    (trend regime + implied move / positioning + bias) and then lists
+    trend regime, last close, SMA20/SMA50/RSI14, momentum read, the
+    implied move + put/call read, sell-side consensus, and a 1-line
+    bias (bullish / bearish / neutral).  Keep under ~2000 chars.  Every
+    number must carry an inline ``[source: <identifier>]`` tag.
 
 news_task:
   description: >
-    Find material news catalysts for {ticker}.
+    Find material news catalysts AND read the sentiment / tone for
+    {ticker}.
+
+    Tool budget: AT MOST 5 tool calls in this fixed order.  After the
+    fifth tool returns you MUST stop calling tools and write the
+    report.  Emitting more tool calls instead of a final report
+    counts as task failure.
 
     Mandatory order:
       1. Call get_market_context({ticker}) ONCE so you know the company's
          country, industry, and the country-/industry-specific news themes
          to query.  Do NOT default to US-centric themes (Fed, treasury,
          DXY) unless the brief tells you the company is US-listed.
-      2. Call get_news({ticker}) for company-specific catalysts (the
-         tool now searches by the long name from the brief).
-      3. Call get_global_news({ticker}) so the macro headlines surfaced
+      2. Call get_news({ticker}) for company-specific catalysts and the
+         overall sentiment / tone (the tool searches by the long name
+         from the brief).
+      3. Call get_corporate_actions({ticker}) — this is the **specific**
+         hook for buybacks, dividends, splits, M&A, guidance updates,
+         and board / management changes that the generic
+         ``get_news`` sentiment query routinely misses.  If the company
+         has announced a share buyback, dividend, acquisition, or
+         leadership change during the analysis window it will surface
+         here.  Treat any hits as first-class catalysts in the report,
+         even if get_news did not surface them.
+      4. Call get_global_news({ticker}) so the macro headlines surfaced
          are for the company's home country (RBI / Union Budget /
          INR for an Indian name, Fed / CPI / DXY for a US name, …).
-      4. Call get_insider_transactions for executive activity.
+      5. Call get_insider_transactions for executive activity.
 
-    Tie each headline to a likely impact (positive / negative / neutral).
+    Tie each headline to a likely impact (positive / negative / neutral),
+    and summarize the dominant narrative + tone (positive / negative /
+    mixed) and any sentiment shift.  Treat a buyback / special dividend /
+    acquisition announcement as a **first-tier catalyst** — name it
+    explicitly under a dedicated "Corporate actions" subsection (or note
+    "none in window" if get_corporate_actions returned no hits).
 
     PROVENANCE: every catalyst line ends with the article's URL as
     ``[source: <url>]``. Insider-activity counts / dollar values end
     with ``[source: yfinance insider_transactions {ticker}]``.
+    If you state a qualitative catalyst, sentiment read, or context that
+    has no citable URL from the tools (reasoned domain knowledge — e.g.
+    "the domestic capex upcycle supports order inflow"), label it
+    ``[analyst judgement]`` — an explicit, honest tag.  NEVER invent a
+    URL or a placeholder link (``example.com``, a made-up path) to
+    satisfy this rule: a fabricated citation is worse than an honest
+    ``[analyst judgement]`` label and will be flagged and stripped
+    downstream.
   expected_output: >
-    A NEWS REPORT with: 3-5 company catalysts (drawn from the news
-    THEMES in the market context — e.g. defence procurement, shipping
-    insurance, OPEC quota — not generic US macro lines), 2-3 macro
+    A NEWS & SENTIMENT REPORT that opens with a ``TLDR:`` 3-5 line block
+    (top company catalyst + top corporate action + overall sentiment +
+    bias) and then has: a CORPORATE ACTIONS subsection (buyback /
+    dividend / split / M&A / guidance / board — each hit cited with
+    its ``[source: <url>]`` URL, or one line "none in window" if
+    get_corporate_actions found nothing), 3-5 company catalysts (drawn
+    from the news THEMES in the market context — e.g. defence
+    procurement, shipping insurance, OPEC quota — not generic US macro
+    lines), an overall sentiment / dominant-narrative read, 2-3 macro
     items from the company's HOME-COUNTRY basket, insider activity
-    summary, and 1-line bias. Every numeric claim and every headline
-    carries an inline ``[source: <url-or-identifier>]`` tag.
+    summary, and 1-line bias.  Keep under ~2800 chars total.  Every
+    numeric claim and every headline carries an inline
+    ``[source: <url-or-identifier>]`` tag.
 
 fundamentals_task:
   description: >
-    Evaluate the fundamentals of {ticker}. Call get_fundamentals,
-    get_balance_sheet, get_cashflow and get_income_statement (one call
-    each). Assess growth, profitability, balance-sheet strength and
-    free-cash-flow quality.
+    Evaluate the fundamentals of {ticker} across BOTH the near-term
+    (last 1-2 years) AND the LONG (5-10 year) horizon, AND place the
+    name against its sector peers.
 
-    PROVENANCE: every metric (P/E, EPS, revenue, margin, growth) must
-    carry ``[source: <identifier>]`` — typically
-    ``[source: yfinance .info {ticker} (fundamentals)]`` for ratios or
-    ``[source: yfinance income_stmt {ticker} (latest period)]`` for
-    statement-level figures.
+    Tool budget: call each tool AT MOST ONCE, then write the report.
+
+    Mandatory tool sequence:
+      1. get_fundamentals — snapshot ratios (P/E, EPS, margins).
+      2. get_balance_sheet + get_cashflow + get_income_statement —
+         near-term Ind-AS / GAAP statement view.
+      3. get_shareholding_pattern (Indian tickers only) — promoter
+         / FII / DII / public drift.
+      4. **get_long_term_thesis** — required.  This is the aggregator
+         the PM anchors the LONG-tier decision on: revenue / net-profit
+         / EPS CAGR over the longest available window, ROCE trend,
+         debt trajectory, and screener.in's structural pros/cons.
+         For Indian names this is ~10y of Ind-AS data; for global
+         names it degrades to 3-4y of yfinance annuals (and the tool
+         says so explicitly — quote that caveat).
+      5. get_sector_peers — YTD return / market-cap / P/E across the
+         country-appropriate peer basket, so you can state the alpha
+         vs the median peer.
+
+    Assess growth, profitability, balance-sheet strength, free-cash-flow
+    quality, the multi-year compounding quality, AND relative strength
+    vs peers.
+
+    Write the report in TWO sections so the trader + PM can consume it
+    at the appropriate horizon:
+      * "Near-term view (SHORT / MEDIUM)": current-year snapshot,
+        margin trajectory, quarterly print, alpha vs median peer.
+      * "Long-term view (LONG)": revenue / EPS CAGR, ROCE trend,
+        debt trajectory, shareholding stability, structural
+        pros/cons.  If the CAGR is negative or ROCE is degrading,
+        flag it as a value-trap warning — the PM must NOT pick
+        horizon=LONG on a broken compounder thesis.
+
+    PROVENANCE: every metric (P/E, EPS, revenue, margin, growth, CAGR,
+    peer figure) must carry ``[source: <identifier>]`` — typically
+    ``[source: yfinance .info {ticker} (fundamentals)]`` or
+    ``[source: screener.in ... #profit-loss]`` or
+    ``[source: screener.in ... #ratios]`` or
+    ``[source: yfinance OHLCV + .info peer basket [...] (YTD)]``.  A
+    qualitative structural read with no citable figure (e.g. "the
+    franchise has durable pricing power") must be labelled
+    ``[analyst judgement]`` — never invent a URL or placeholder link
+    (``example.com``) to satisfy this rule.
   expected_output: >
-    A FUNDAMENTALS REPORT with: growth, profitability, leverage/cash,
-    valuation snapshot (P/E, P/B), and 1-line bias. Every figure
+    A FUNDAMENTALS & SECTOR REPORT that opens with a ``TLDR:`` 3-5 line
+    block (growth pct + margin + leverage + alpha vs median peer +
+    long-term compounder bias) and then splits into "Near-term view"
+    and "Long-term view" sections.  The long-term view MUST cite at
+    least one CAGR line and one ROCE-trend line (or explicitly say the
+    data is not available).  Keep under ~3800 chars.  Every figure
     cited carries an inline ``[source: <identifier>]`` tag.
 
 macro_task:
   description: >
-    Assess the macro regime for the COUNTRY where {ticker} is listed —
-    not the US by default.
+    Assess the macro regime AND the geopolitical / supply-chain risk
+    for {ticker} — anchored to the COUNTRY where it is listed and its
+    INDUSTRY, not the US / US-China baseline.
+
+    Tool budget: AT MOST 5 tool calls in this fixed order.  After the
+    fifth tool returns you MUST stop calling tools and write the
+    report.  Emitting more tool calls counts as task failure (this was
+    the degraded-output failure mode on tool-heavy runs).
 
     Mandatory order:
       1. Call get_market_context({ticker}) ONCE to learn the country,
-         currency, and the macro basket / themes that apply.
-      2. Call get_macro_data({ticker}) — the basket is now country-
-         aware: US → 10y UST + DXY + VIX + WTI + gold; India → Nifty
-         + India VIX + INR/USD + Sensex + Brent; UK / HK / JP get
-         their own equivalents.
+         currency, the macro basket, and the industry themes that
+         matter for this name (e.g. shipbuilder → ship insurance war
+         risk + Strait of Hormuz + naval procurement; semis → chip
+         export controls + Taiwan strait; oil & gas → OPEC quota +
+         Red Sea shipping).
+      2. Call get_macro_data({ticker}) — the basket is country-aware:
+         US → 10y UST + DXY + VIX + WTI + gold; India → Nifty +
+         India VIX + INR/USD + Sensex + Brent; UK / HK / JP get their
+         own equivalents.
       3. Call get_global_news({ticker}) so the macro news headlines
          match the country (RBI repo / Union Budget for India,
          FOMC / CPI for the US, BoE for the UK, …).
+      4. Call get_geopolitical_news({ticker}) — the query is derived
+         from the brief's country + industry seeds.
+      5. Call get_supply_chain_risk({ticker}) to map customer /
+         supplier concentration.
 
     State whether the regime is risk-on or risk-off in the COMPANY'S
-    home country, and how it tilts a {ticker} position. Translate
-    foreign-currency moves into a P&L direction (e.g. a stronger INR
-    is a tailwind for an Indian importer, headwind for an exporter).
+    home country, how it tilts a {ticker} position (translate FX moves
+    into a P&L direction — a stronger INR is a tailwind for an Indian
+    importer, headwind for an exporter), and 3-5 active geopolitical /
+    supply-chain risks tied to the country + industry.  Quantify
+    exposure where possible ("X% of revenue from region Y", "top
+    customer is Z% of revenue").  Do NOT invent percentages.
 
     PROVENANCE: cite macro levels with the macro-data Source line
     (e.g. ``[source: yfinance OHLCV macro basket (India) [...] (2mo)]``);
-    cite news items with their per-row URL as ``[source: <url>]``.
+    cite news / risk items with their per-row URL as ``[source: <url>]``.
+    A qualitative regime or geopolitical read with no citable URL must
+    be labelled ``[analyst judgement]`` — never invent a URL or
+    placeholder link (``example.com``) to satisfy this rule.
   expected_output: >
-    A MACRO REPORT with: regime call for the company's home country,
-    top 3 macro signals from that country's basket (each with its
-    inline ``[source: …]`` tag), and tilt on the trade.
-
-geopolitical_task:
-  description: >
-    Identify geopolitical risk specific to {ticker} — anchored to its
-    COUNTRY + INDUSTRY, not the US-China baseline.
-
-    Mandatory order:
-      1. Call get_market_context({ticker}) ONCE to learn the industry
-         themes that matter for this name (e.g. shipbuilder → ship
-         insurance war risk + Strait of Hormuz + naval procurement;
-         semis → chip export controls + Taiwan strait; oil & gas →
-         OPEC quota + Red Sea shipping).
-      2. Call get_geopolitical_news({ticker}) — the query is now
-         derived from the brief's country + industry seeds.
-      3. Call get_global_news({ticker}) AND get_supply_chain_risk
-         ({ticker}) to map customer / supplier concentration.
-
-    Quantify exposure where possible (e.g. "X% of revenue from region
-    Y", "top customer is Z% of revenue", "Make-in-India order book
-    INR N crore").  Do NOT invent percentages.
-
-    PROVENANCE: every risk callout cites the news URL as
-    ``[source: <url>]``; every revenue/customer concentration % cites
-    the underlying article URL.
-  expected_output: >
-    A GEOPOLITICAL REPORT with: 3-5 active risks tied to the COMPANY'S
-    home country + industry, supply-chain & customer-concentration
-    callouts, exposure estimates, and a 1-line tilt. Every claim has
-    an inline ``[source: …]`` tag.
-
-sector_task:
-  description: >
-    Compare {ticker} to its sector peers.
-
-    Mandatory order:
-      1. Call get_market_context({ticker}) ONCE to see the curated
-         peer basket (e.g. MAZDOCK.NS → COCHINSHIP.NS / GRSE.NS /
-         BEL.NS / HAL.NS rather than US semis).
-      2. Call get_sector_peers({ticker}) for YTD return / market-cap /
-         P/E across the basket.
-      3. Call get_indicators({ticker}) for relative momentum.
-
-    Call out alpha vs the median peer.
-
-    PROVENANCE: peer figures cite
-    ``[source: yfinance OHLCV + .info peer basket [...] (YTD)]``;
-    momentum figures cite the get_indicators Source line.
-  expected_output: >
-    A SECTOR REPORT with: peer table (using the country-appropriate
-    basket), alpha vs median, and a 1-line bias. Every number
-    carries an inline ``[source: …]`` tag.
-
-quant_task:
-  description: >
-    Read positioning on {ticker}. Call get_options_summary for ATM IV,
-    put/call ratio and OI, and get_analyst_recommendations for sell-side
-    consensus and price targets. Conclude what the options market and
-    the street are pricing in.
-
-    PROVENANCE: IV / OI / put-call cite
-    ``[source: yfinance option_chain {ticker} expiry=…]``; sell-side
-    consensus cites
-    ``[source: yfinance recommendations_summary {ticker}]``.
-  expected_output: >
-    A QUANT REPORT with: implied move, put/call read, sell-side consensus,
-    and a 1-line tilt. Every figure carries an inline ``[source: …]`` tag.
+    A MACRO & GEOPOLITICAL REPORT that opens with a ``TLDR:`` 3-line
+    block (regime + top active risk + tilt) and then has: the regime
+    call for the company's home country, top 3 macro signals from that
+    country's basket (each with its inline ``[source: …]`` tag), 3-5
+    geopolitical / supply-chain risks tied to the country + industry
+    with exposure estimates, and a 1-line tilt on the trade.  Keep
+    under ~2800 chars.  Every claim carries an inline ``[source: …]``
+    tag.
 
 # ----- Bull / Bear debate (per-round tasks generated in code) ---------------
 
 bull_round:
   description: >
-    Debate round {round_num} of {total_rounds} (BULL turn). Read all eight
+    Debate round {round_num} of {total_rounds} (BULL turn). Read all four
     analyst reports and prior debate turns in context. State the strongest
     bullish argument for {ticker} in 4-6 bullets, each tied to a specific
-    analyst report or earlier debate point. If round_num > 1, explicitly
-    rebut the most recent BEAR turn.
+    analyst report or earlier debate point.
+
+    Round-{round_num} discipline (REQUIRED — the runner persists every
+    round separately now, so duplicate rounds are visible to the
+    reviewer):
+      * If round_num == 1: open with your strongest 4-6 drivers.
+      * If round_num > 1: this turn MUST be materially different from
+        your round (round_num - 1).  Specifically:
+          (a) Open with a one-line "REBUTTAL:" pasting the exact bear
+              bullet (with its ``[source: …]`` tag) that you are
+              attacking, then explain in 1-2 lines why it does not
+              hold.  Repeat for the next strongest bear bullet if
+              space allows.
+          (b) Introduce AT LEAST ONE driver from an analyst lens you
+              did not lead with in earlier rounds (news / social /
+              macro / geopolitical / sector / quant), so the new round
+              is not a paraphrase of round (round_num - 1).
+          (c) State explicit conviction direction vs the prior round:
+              "Conviction vs prior round: ↑ / → / ↓ — because <one
+              line citing what shifted>."
+          (d) Do NOT repeat verbatim any bullet from your earlier
+              round; if a driver still applies, restate it in fewer
+              words and add what's new since.
 
     PROVENANCE: copy each ``[source: <identifier>]`` tag verbatim from
     the analyst report you cite. Do NOT introduce new numbers — only
     paraphrase or aggregate analyst figures, keeping their tags
     attached.
   expected_output: >
-    Bull argument for round {round_num} (bulleted, each bullet keeps
-    the analyst's ``[source: …]`` tag on every quantitative claim).
+    Bull argument for round {round_num} (bulleted; for round_num > 1
+    starts with one or more ``REBUTTAL:`` lines that paste the bear
+    bullet under attack, ends with a ``Conviction vs prior round:``
+    line, and introduces at least one previously-unused analyst
+    lens).  Every numeric claim keeps its ``[source: …]`` tag.
 
 bear_round:
   description: >
@@ -236,21 +330,62 @@ bear_round:
     the analyst reports or prior debate. Explicitly rebut the BULL turn
     that just ran.
 
+    Round-{round_num} discipline (REQUIRED):
+      * Open with one or more ``REBUTTAL:`` lines that paste the exact
+        bull bullet (with its ``[source: …]`` tag) you are attacking,
+        followed by 1-2 lines explaining why it does not hold.
+      * If round_num > 1, additionally:
+          (a) Introduce AT LEAST ONE risk that draws on a non-yfinance
+              lens (news / social / macro / geopolitical / sector /
+              quant) that you did not lead with in round
+              (round_num - 1).
+          (b) Add a "Conviction vs prior round: ↑ / → / ↓ — <reason>"
+              line tracking how your downside conviction has shifted.
+          (c) Do NOT repeat any prior-round bullet verbatim.
+
     PROVENANCE: keep every ``[source: <identifier>]`` tag from the
     analyst figures you cite. Do NOT introduce numbers without a tag.
   expected_output: >
-    Bear argument for round {round_num} (bulleted, each numeric claim
-    carries an inline ``[source: …]`` tag).
+    Bear argument for round {round_num} (bulleted; starts with one or
+    more ``REBUTTAL:`` lines pasting the bull bullet under attack,
+    introduces at least one new analyst lens vs the previous bear
+    round, and ends with a ``Conviction vs prior round:`` line).
+    Every numeric claim carries an inline ``[source: …]`` tag.
 
 # ----- Research synthesis ----------------------------------------------------
 
 research_synthesis:
   description: >
-    As Research Manager, read the full bull/bear debate plus the eight
-    analyst reports (market, social, news, fundamentals, macro,
-    geopolitical, sector, quant). Pick the side with stronger evidence —
-    do NOT split the difference. Note 1-2 things that would change your
-    mind.
+    As Research Manager, read the full bull/bear debate plus the four
+    analyst reports (market/positioning, news/sentiment,
+    fundamentals/sector, macro/geopolitical). Pick the side with stronger
+    evidence — do NOT split the difference. Note 1-2 things that would
+    change your mind.
+
+    Multi-lens grounding (REQUIRED — anti yfinance-only bias).
+    Reports tend to collapse onto market + fundamentals because those
+    analysts emit hard yfinance numbers and the prompt rewards
+    quantitative citations.  Counter that explicitly:
+
+      * Across the 3 KEY DRIVERS and the 3 KEY RISKS combined, at
+        least **TWO** entries must source primarily from a NON-yfinance
+        lens — i.e. the underlying ``[source: …]`` tag must be a news
+        URL, an article from get_corporate_actions, a macro-basket
+        line tied to a news headline, a geopolitical / supply-chain
+        item, a sector / peer comparison, or an options/quant
+        indicator that is not just a yfinance fundamentals figure.
+      * If the News, Social, Geopolitical, or Macro reports surfaced
+        a material catalyst (e.g. share buyback, special dividend,
+        acquisition, leadership change, sanctions action), that
+        catalyst MUST appear in either the drivers or the risks (or
+        in falsifiers if it's the single thing that would flip the
+        thesis) — not silently dropped because the headlines feel
+        soft compared to yfinance numbers.
+      * If an analyst was DEGRADED (their report opens with
+        ``[[DEGRADED_TOOL_CALL_OUTPUT]]``), explicitly note "the X
+        lens was unavailable this run" instead of pretending the
+        analysis is complete — that drop is itself a risk factor for
+        the trader to know about.
 
     PROVENANCE: every quantitative driver / risk / falsifier MUST carry
     the underlying ``[source: <identifier>]`` tag inherited from the
@@ -259,8 +394,12 @@ research_synthesis:
     Reflective Critic will mark the decision unsupported.
   expected_output: >
     A RESEARCH THESIS with: STANCE (BULL/BEAR), 3 key drivers, 3 key
-    risks, and 1-2 falsifiers. Every line that contains a number ends
-    with an inline ``[source: …]`` tag.
+    risks (with at least TWO entries across drivers+risks sourcing
+    from a non-yfinance lens — news, corporate actions, geopolitical,
+    macro headlines, sector peers, options/quant), 1-2 falsifiers,
+    and (if any analyst was degraded) a one-line note flagging the
+    missing lens.  Every line that contains a number ends with an
+    inline ``[source: …]`` tag.
 
 # ----- Quality review --------------------------------------------------------
 
@@ -274,61 +413,108 @@ quality_review:
     evidence gap, not a single missing tag). A 4-6 thesis is "actionable
     with caveats", not "size-down".
 
-    A claim counts as SUPPORTED ONLY if it carries an inline
+    A claim counts as SUPPORTED when it carries an inline
     ``[source: <identifier>]`` tag (added by the analyst layer and
-    preserved by the manager). A bare number with no tag is automatic
-    UNSUPPORTED — flag it explicitly so the trader can omit it from
-    the plan.
+    preserved by the manager).  A claim explicitly labelled
+    ``[analyst judgement]`` counts as SUPPORTED-qualitative — it is an
+    honest, reasoned view without a single citable URL, NOT a fatal
+    gap; treat it as valid supporting context (right-size its weight,
+    do not delete the thesis).  Only an UNTAGGED bare number, or a
+    citation pointing at a fabricated / placeholder URL (``example.com``,
+    a made-up path), is UNSUPPORTED — flag those explicitly so the
+    trader can omit them.  A single missing tag NEVER triggers a
+    size-down on its own; reserve the size-down recommendation for a
+    genuine, thesis-wide evidence gap (score below 4).
   expected_output: >
     A QUALITY REVIEW with: per-claim audit (SUPPORTED with the tag it
-    cites / UNSUPPORTED with the missing-tag warning), overall score
-    X/10, and 1-3 gap statements.
+    cites / SUPPORTED-qualitative for ``[analyst judgement]`` labels /
+    UNSUPPORTED with the missing-tag or fabricated-URL warning),
+    overall score X/10, and 1-3 gap statements.
 
 # ----- Trader ----------------------------------------------------------------
 
 trader_task:
   description: >
     As the trader, turn the Research Manager's thesis into a concrete
-    plan for {ticker}.
+    plan for {ticker}.  This desk operates across three horizon tiers:
+
+      * **SHORT** — up to 60 trading days (~3 months). Catalyst /
+        event trades, technical breakouts.  The exception, not the rule.
+      * **MEDIUM** — 61–252 days (~few months to a year).  The desk's
+        DEFAULT.  Most Ind-AS / earnings-driven theses live here.
+      * **LONG** — 253+ days (1–10 years).  A compounder / value thesis
+        anchored on multi-year fundamentals; requires
+        ``get_long_term_thesis`` evidence from the fundamentals analyst.
+
+    Pick the horizon tier based on the CHARACTER of the analyst
+    evidence.  The thesis you were handed will naturally live on one
+    of these time-scales:
+
+      * A multi-year compounder / value / structural-break thesis
+        (revenue + EPS CAGR, ROCE trend, balance-sheet re-rating,
+        multi-year debt collapse or debt build-up) => LONG.
+      * A quarterly / annual earnings-and-margin trajectory,
+        sector-rotation, or valuation-mean-reversion thesis => MEDIUM.
+      * A discrete near-term catalyst (specific earnings print, FDA
+        decision, buyback close, index-inclusion date) => SHORT.
+
+    The horizon comes from the CHARACTER of the thesis (above) — a
+    forward-looking view built on the analyst evidence.  Do NOT
+    downgrade a genuine multi-year thesis to a shorter window on the
+    basis of how the stock behaved historically: past price paths were
+    measured in a different regime and India in particular is in an
+    investment / production / earnings upcycle where the past is a poor
+    guide to the forward window.  A structural-break SELL on collapsing
+    ROCE is a LONG-tier trade; a multi-year compounder BUY is a
+    LONG-tier trade — regardless of what the last few years of prices
+    did.
 
     Mandatory workflow:
-      1. Call get_event_proximity once. If days_to_event is less than your
-         intended horizon_days, either shorten the horizon to fit before
-         earnings, or explicitly size for the catalyst (and flag that the
-         trade is event-driven).
+      1. Call get_event_proximity once. If days_to_event is less than
+         60 days, plan a position that *survives* the catalyst rather
+         than races against it — keep horizon_days >= 60 and either
+         (a) widen the stop to absorb the post-event volatility while
+         keeping the longer-horizon target, or (b) explicitly note the
+         catalyst as a milestone within the mid-term thesis.  ONLY
+         shorten horizon_days below 60 when the entire trade rationale
+         is a near-term event (e.g. a binary FDA decision) and say so
+         in plain English.
       2. Draft direction, entry, stop, target, horizon_days, and an
-         initial size as a fraction of risk budget.
-      3. Call backtest_setup(ticker, horizon_days, target_pct, stop_pct)
-         once — pass target_pct and stop_pct as positive percentages
-         computed from your entry/stop/target prices.  The tool returns
-         BOTH a short-term and a long-term (60d/120d/252d) panel.  When
-         comparing your stated confidence to the historical base rate,
-         use BOTH hit-rate AND expectancy / payoff:
-           * a sub-40% hit-rate with positive expectancy and payoff >= 1.5
-             is still an actionable trade — do NOT slash conviction.
-           * a sub-40% hit-rate with negative expectancy IS a signal to
-             tighten the plan or shrink the size.
-         If your short-term setup is weak BUT the 120d / 252d panel is
-         strong, mention that explicitly so the PM can size the trade as
-         a longer-horizon thesis.
-      4. If the Quality Reviewer scored the thesis below 4, reduce your
-         default size by 25% and explicitly cite the gaps the reviewer
-         flagged.  Scores in [4, 6] are "actionable with caveats" — keep
-         the size, but address the caveats in the rationale.
+         initial size as a fraction of risk budget.  Choose
+         horizon_days by tier:
+           * SHORT plans: horizon_days in [10, 60].
+           * MEDIUM plans (default): horizon_days in [90, 252].
+           * LONG plans: horizon_days in [504, 1260] (representative
+             day-counts, meaning a 2–5 year *review* window; the
+             underlying thesis is 5–10 years but outcome resolution
+             can't wait a decade).
+         Targets and stops must match the horizon:
+           * A SHORT target is a multi-percent move (e.g. 5–15%).
+           * A MEDIUM target is typically a 10–35% multi-quarter move.
+           * A LONG target is a multi-year total return (e.g. +80–200%
+             for 5y) — anchor it on the revenue / EPS CAGR from the
+             long-term-thesis tool, not a chart level.
+      3. If the Research Manager flagged a degraded / missing analyst
+         lens or a thin-evidence risk, reduce your default size by 25%
+         and explicitly cite the gap.  Otherwise keep the size and
+         address any caveats in the rationale.
 
-    Cite both tool outputs verbatim in the plan so the PM can see the
-    catalyst gap and the historical base rate.
+    Size the position from the STRENGTH and BREADTH of the forward
+    thesis (how many analyst lenses agree, how one-sided the
+    fundamentals are, catalyst proximity), not from how the stock
+    performed historically.
 
     PROVENANCE: tag earnings-window figures with
-    ``[source: yfinance .calendar + .earnings_dates {ticker}]`` and
-    backtest figures with ``[source: backtest_setup(...) on yfinance
-    5y OHLCV]``. Keep every analyst-figure tag the manager handed
-    down — the PM uses those to populate the decision's ``sources`` list.
+    ``[source: yfinance .calendar + .earnings_dates {ticker}]``.  Keep
+    every analyst-figure tag the manager handed down — the PM uses
+    those to populate the decision's ``sources`` list.
   expected_output: >
     A TRADE PLAN with: direction, entry, stop, target, horizon_days,
-    days_to_earnings, historical hit-rate from backtest_setup, and the
-    sizing rationale. Every numeric claim carries an inline
-    ``[source: …]`` tag.
+    the horizon tier label (SHORT / MEDIUM / LONG), days_to_earnings,
+    and the sizing rationale. The plan states plainly which tier
+    the desk should adopt and why (grounded in the forward thesis,
+    not historical price behaviour).  Every numeric claim carries an
+    inline ``[source: …]`` tag.
 
 # ----- Risk debate (per-round tasks generated in code) ----------------------
 
@@ -338,10 +524,20 @@ risk_aggressive_round:
     higher conviction sizing or a more proactive execution path. Reference
     the trader's plan and the prior risk turns directly.
 
+    Round-{round_num} discipline (REQUIRED for round_num > 1):
+      * Open with "REBUTTAL:" pasting the Conservative bullet (with
+        ``[source: …]`` tag) you are countering, then 1-2 lines why.
+      * Introduce at least one NEW size-up driver not used in your
+        earlier aggressive round.
+      * End with "Conviction vs prior round: ↑ / → / ↓ — <reason>".
+      * Do NOT repeat any prior-round bullet verbatim.
+
     PROVENANCE: keep every ``[source: …]`` tag from the figures you cite.
   expected_output: >
-    Aggressive risk argument round {round_num} (bulleted, each numeric
-    claim carries an inline ``[source: …]`` tag).
+    Aggressive risk argument round {round_num} (for round_num > 1:
+    starts with ``REBUTTAL:``, ends with ``Conviction vs prior
+    round:``).  Each numeric claim carries an inline ``[source: …]``
+    tag.
 
 risk_conservative_round:
   description: >
@@ -349,10 +545,21 @@ risk_conservative_round:
     for tighter stops, smaller size, or skipping the trade. Rebut the
     AGGRESSIVE turn that just ran.
 
+    Round-{round_num} discipline (REQUIRED for round_num > 1):
+      * Open with "REBUTTAL:" pasting the Aggressive bullet you are
+        countering (with its ``[source: …]`` tag) then 1-2 lines why
+        the size-up case does not hold.
+      * Introduce at least one NEW size-down driver not used in your
+        prior conservative round.
+      * End with "Conviction vs prior round: ↑ / → / ↓ — <reason>".
+      * Do NOT repeat any prior-round bullet verbatim.
+
     PROVENANCE: keep every ``[source: …]`` tag from the figures you cite.
   expected_output: >
-    Conservative risk argument round {round_num} (bulleted, each numeric
-    claim carries an inline ``[source: …]`` tag).
+    Conservative risk argument round {round_num} (for round_num > 1:
+    starts with ``REBUTTAL:``, ends with ``Conviction vs prior
+    round:``).  Each numeric claim carries an inline ``[source: …]``
+    tag.
 
 risk_neutral_round:
   description: >
@@ -360,10 +567,15 @@ risk_neutral_round:
     the aggressive and conservative arguments into a balanced
     sizing/execution recommendation for this round.
 
+    For round_num > 1, the synthesis MUST acknowledge how your verdict
+    has shifted vs the prior neutral round.  End with: "Recommended
+    size shift vs prior round: +X bps / 0 / -X bps — <reason>".
+
     PROVENANCE: keep every ``[source: …]`` tag from the figures you cite.
   expected_output: >
-    Neutral risk synthesis round {round_num} (bulleted, each numeric
-    claim carries an inline ``[source: …]`` tag).
+    Neutral risk synthesis round {round_num} (for round_num > 1: ends
+    with a "Recommended size shift vs prior round:" line).  Each
+    numeric claim carries an inline ``[source: …]`` tag.
 
 # ----- Compliance gate -------------------------------------------------------
 
@@ -375,10 +587,26 @@ compliance_review:
     concerns. Issue ONE of: CLEAR / FLAGGED / BLOCKED, with explicit
     rationale and any size-cap recommendation.
 
+    Calibrate the status to the SEVERITY of what you can actually
+    establish:
+      * BLOCKED is reserved for a CONCRETE, established hit — the name
+        (or a controlling entity) is on a sanctioned / restricted /
+        SDN list, or a specific legal prohibition applies.  A merely
+        UNVERIFIABLE exposure (e.g. "may have some revenue from a
+        sensitive region" with no confirming source) is NOT grounds
+        for BLOCKED.
+      * FLAGGED (with a size cap) is the right response to an
+        unverifiable or partial exposure concern — right-size the
+        position, do not veto it.  An unverifiable claim should reduce
+        conviction / size, never force the desk to HOLD.
+      * CLEAR when nothing material surfaces.
+
     PROVENANCE: any factual claim (e.g. "X is on the SDN list",
     "Y% revenue from Russia") MUST cite a tagged analyst figure or a
     news URL. Use ``[source: <url>]`` for news, or copy the analyst's
-    inline tag.
+    inline tag.  A qualitative compliance concern with no citable
+    source must be labelled ``[analyst judgement]`` and treated as a
+    FLAGGED / size-cap input, never a BLOCKED trigger.
   expected_output: >
     A COMPLIANCE REVIEW with: status (CLEAR / FLAGGED / BLOCKED), specific
     concerns (each with an inline ``[source: …]`` tag if quantitative),
@@ -388,52 +616,190 @@ compliance_review:
 
 pm_decision:
   description: >
-    As Portfolio Manager, weigh the trader's plan, the risk debate, the
-    geopolitical report, and the compliance review. Issue ONE final
-    decision on {ticker}.
+    As Portfolio Manager, weigh the four analyst reports
+    (market/positioning, news/sentiment, fundamentals/sector,
+    macro/geopolitical), the trader's plan, and the risk debate. If a
+    Quality Review audit and/or a Compliance review are present in
+    context, treat them as ADVISORY inputs: a Quality Review score
+    below 4 or a FLAGGED compliance status should right-size (cut) the
+    position, never by itself force a HOLD.  Issue ONE final decision
+    on {ticker}.
 
-    Time horizons — REQUIRED reasoning:
-      The trader's plan is sized around a SHORT-TERM horizon, but the
-      ``backtest_setup`` panel covers both the trader's window AND a 60d,
-      120d, and 252d long-term view of the SAME target/stop. You MUST
-      explicitly state, in the rationale, how the trade looks on the
-      short-term horizon AND on the long-term (>=120d) horizon. NEUTRAL
-      is only the right call when BOTH horizons disagree with the thesis
-      OR neither has a meaningful edge.
+    Action alphabet — 5-tier, retail-recognisable:
+      Choose ``action`` from EXACTLY ONE of:
+
+        * ``STRONG_BUY``  — high-conviction long.  Reserve for cases
+                            where the analyst thesis is CLEARLY bullish
+                            and one-sided across the mid-/long-term
+                            fundamentals (revenue + EPS CAGR, ROCE,
+                            valuation, macro / sector alignment), with
+                            AT LEAST one independent corroboration
+                            beyond a single analyst report — a
+                            sector/peer confirmation, a macro tailwind,
+                            a news catalyst, or a supportive
+                            get_long_term_thesis output.  A strong,
+                            broad forward thesis is sufficient; you do
+                            NOT need historical price-simulation
+                            evidence to justify conviction.
+                            Typical shape: size_pct_of_book >= 2.0 and
+                            confidence in [0.70, 0.88].
+        * ``BUY``         — standard long.  Directional thesis is
+                            supported but conviction or edge doesn't
+                            warrant STRONG_BUY.  Typical shape:
+                            size_pct_of_book in (0, 2.0] and confidence
+                            in [0.55, 0.75].
+        * ``HOLD``        — sit out. ``size_pct_of_book`` MUST be 0.
+                            Choose only when directional evidence is
+                            genuinely contradictory, when neither the
+                            short-term nor the mid-/long-term panels
+                            have a meaningful edge, or when compliance
+                            forces a stand-down.
+        * ``SELL``        — standard short (mirror of BUY).
+        * ``STRONG_SELL`` — high-conviction short (mirror of STRONG_BUY).
+
+      Do NOT emit the legacy labels ``OVERWEIGHT`` / ``UNDERWEIGHT`` /
+      ``NEUTRAL``.  The schema still accepts them for backwards
+      compatibility but they will be silently rewritten and the UI will
+      display the collapsed BUY / SELL / HOLD form.
+
+    Time horizons — REQUIRED reasoning (3-tier: SHORT / MEDIUM / LONG):
+      Every decision MUST populate BOTH:
+
+        * ``horizon_days`` — the primary review-window in trading days.
+        * ``horizon`` — one of ``SHORT`` (≤60d, ≤3 months),
+          ``MEDIUM`` (61–252d, ~few months to a year), or ``LONG``
+          (253+ days, 1–10 year buy-and-hold thesis).
+
+      **Pick the horizon that matches the CHARACTER of the thesis.**
+      The horizon is a forward-looking judgement built on the analyst
+      evidence — how the stock behaved historically does NOT set it:
+
+        * LONG (253+ days): a multi-year compounder / value thesis
+          OR a multi-year structural-break thesis (e.g. ROCE
+          collapse, debt spiral, terminal-value re-rating).  Escalate
+          to LONG when the analyst evidence names multi-year
+          fundamentals — revenue / EPS CAGR (positive for BUY,
+          deteriorating for SELL), ROCE trend, balance-sheet quality,
+          valuation vs peers.  A ``get_long_term_thesis`` report you
+          can cite (``[source: long_term_thesis ...]``) is much
+          stronger corroboration, but its absence does not
+          automatically disqualify LONG — the multi-year evidence may
+          still be sufficient.
+        * MEDIUM (61-252d): a quarterly-to-annual earnings /
+          margin / macro trajectory thesis, sector-rotation, or
+          valuation-mean-reversion play.  This is the DEFAULT ONLY
+          if the thesis doesn't naturally fit LONG or SHORT.
+        * SHORT (up to 60d): a genuine discrete near-term catalyst
+          (specific earnings beat, buyback close, FDA print, index
+          inclusion).  Do NOT pick SHORT for a genuine multi-year
+          thesis just to shorten the review window.
+
+      The decision is anchored on the ANALYST EVIDENCE (fundamentals,
+      macro, sector, news, geopolitical), the trader's plan, and (for
+      LONG-tier calls) the multi-year fundamentals.  India especially
+      is in an investment / production / earnings upcycle where the
+      past is a poor guide to the forward window — do not let historic
+      price behaviour dictate the direction, the tier, or the size.
+
+      Populate ``long_term_view`` on EVERY decision — it is the
+      permanent home of the multi-year context in the final report,
+      independent of the chosen tier:
+        * horizon == LONG: 2-5 sentence narrative tying revenue / EPS
+          CAGR + ROCE trend to the multi-year target return.  Lead
+          with the FUNDAMENTALS (cite the ``[source: long_term_thesis
+          ...]`` tag if available).
+        * horizon in {SHORT, MEDIUM}: 1-2 sentence "the multi-year
+          compounding thesis is intact / broken / not applicable"
+          line, LEADING with the fundamental picture (revenue /
+          margin / ROCE trend, valuation).  If no long-term data is
+          available, write "Long-term data unavailable for this
+          ticker" — never leave the field empty.
+
+      HOLD is reserved for cases where the analyst evidence is
+      genuinely contradictory across the mid- and long-term
+      fundamentals, OR none of them have a meaningful edge.
 
     Decision quality — when to express conviction:
-      Default to OVERWEIGHT or UNDERWEIGHT whenever a directional thesis
-      is supported by the analyst evidence AND at least one horizon in
-      the backtest panel has positive expectancy with payoff ratio >= 1.5.
-      NEUTRAL is reserved for genuinely contradictory evidence — do not
-      use it as a "soft veto" when one signal is mildly weak.
+      Default to a directional tier (BUY / STRONG_BUY / SELL /
+      STRONG_SELL) whenever the ANALYST EVIDENCE supports a
+      directional thesis.  A strong qualitative thesis backed by
+      fundamentals + at least one corroborating lens is a directional
+      tier — you do NOT need historical price-simulation evidence to
+      commit.
+
+      Upgrade to STRONG_BUY / STRONG_SELL only when the analyst
+      evidence is one-sided across the mid- AND long-term horizons
+      AND at least one independent corroboration (sector alignment OR
+      macro tailwind OR news catalyst OR ``get_long_term_thesis``)
+      points the same way.
+
+      Weight the MULTI-YEAR compounding picture (revenue / EPS CAGR,
+      ROCE trend, structural pros/cons from get_long_term_thesis) at
+      LEAST as heavily as the near-term signal.  When the long-term
+      thesis is intact and the fundamentals are strong, prefer the LONG
+      horizon and let the multi-year evidence, not a soft near-term
+      wobble, drive the tier — this is especially important for Indian
+      names in a multi-year investment / production upcycle.
+
+      HOLD is reserved for genuinely contradictory evidence — do not
+      use it as a "soft veto" when one signal is mildly weak, when
+      only the short-term picture is weak, or when you are uncertain
+      about a single quantitative claim.  A HOLD with size 0 is a
+      real position decision (sit out) — only choose it when the
+      evidence genuinely cannot resolve direction.
+
+      A well-reasoned QUALITATIVE thesis stands on its own.  When the
+      fundamentals + macro + sector lenses align on a direction, that
+      is a directional call even if some supporting context is labelled
+      ``[analyst judgement]`` rather than backed by a URL for every
+      sentence.  A missing or unverifiable source downgrades the weight
+      of THAT ONE claim — never the whole thesis, and never into a
+      HOLD.  Do NOT convert a clear directional thesis into HOLD merely
+      because a citation is qualitative or an exposure claim is
+      unverifiable — cut the size (or defer to the compliance cap)
+      instead.
 
     Hard rules:
-      - If compliance_status is BLOCKED, action MUST be NEUTRAL and
+      - If compliance_status is BLOCKED, action MUST be HOLD and
         size_pct_of_book MUST be 0.
-      - If compliance_status is FLAGGED, cap size_pct_of_book at 1.0 and
-        explain.
+      - If compliance_status is FLAGGED, cap size_pct_of_book at 1.0
+        and explain.  A FLAGGED compliance status is compatible with
+        any directional tier as long as the size cap is honoured.
+      - HOLD ⇒ size_pct_of_book == 0.  Any directional tier ⇒
+        size_pct_of_book > 0.  The guardrail rejects mismatches.
       - confidence is a probability in [0, 1]; calibrate it to the
         evidence (do not output a 0.50 placeholder); never claim >0.88
         on a single-name trade.
-      - Hit-rate alone is NOT a confidence cap. Apply the cap "do not
-        exceed confidence 0.6" ONLY when BOTH conditions hold:
-          (a) every horizon in the backtest panel shows expectancy <= 0%,
-              AND
-          (b) the best-horizon hit-rate is below 40%.
-        If any horizon has expectancy > 0 with payoff >= 1.5, calibrate
-        confidence to the strength of the directional signal regardless
-        of the short-term hit-rate.
+      - Confidence is set by the STRENGTH and BREADTH of the forward
+        analyst evidence.  Apply the cap "do not exceed confidence
+        0.6" ONLY when the qualitative analyst evidence (fundamentals,
+        macro, sector, news, geopolitical) is genuinely weak or
+        contradictory across lenses.  A clear, broad thesis warrants
+        conviction commensurate with how one-sided the evidence is.
+      - ``long_term_view`` MUST be non-empty on EVERY decision.  When
+        horizon == LONG it is a 2-5 sentence narrative; when horizon in
+        {SHORT, MEDIUM} it is a 1-2 sentence "thesis intact / broken /
+        N/A" line.  An empty string is a schema violation the
+        Reflective Critic will treat as UNSUPPORTED.
 
     PROVENANCE — non-negotiable, the Reflective Critic checks this:
       - The ``rationale`` MUST keep every ``[source: <identifier>]``
         tag from the figures you cite. If you can't keep the tag, omit
         the figure.
+      - A qualitative point with no citable source is written with an
+        ``[analyst judgement]`` label — this is honest and acceptable.
+        NEVER invent a URL or a placeholder link (``example.com``, a
+        made-up path) to satisfy the provenance rule: a fabricated
+        citation is a hard integrity failure the Reflective Critic will
+        flag and strip, whereas an honest ``[analyst judgement]`` label
+        is fine.
       - The ``sources`` field MUST be a deduplicated list of those
         ``<identifier>`` strings (just the bit inside the brackets,
         without "[source: " and "]"). Every distinct identifier you
         cite in the rationale, drivers, risks, or falsifiers must
-        appear in ``sources``; no extras, no missing ones.
+        appear in ``sources``; no extras, no missing ones.  Do NOT put
+        ``analyst judgement`` in ``sources`` — it is a label, not a
+        source identifier.
       - ``key_drivers`` / ``key_risks`` / ``falsifiers`` entries that
         contain numbers also carry an inline ``[source: …]`` tag.
       - If you have no quantitative evidence to cite, lower
@@ -441,8 +807,9 @@ pm_decision:
         inventing a figure.
 
     Return ONLY a JSON object that matches the PortfolioDecision schema.
-    Populate geopolitical_flags from the geopolitical report. Populate
-    compliance_status from the compliance review. Populate ``sources``
+    Populate geopolitical_flags from the geopolitical / supply-chain
+    section of the macro report. Populate compliance_status from the
+    compliance review if present, else "CLEAR". Populate ``sources``
     per the rule above.
   expected_output: >
     A JSON object matching the PortfolioDecision schema, with all fields

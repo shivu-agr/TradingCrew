@@ -161,19 +161,30 @@ def _futures_decision(**overrides) -> FuturesDecision:
     return FuturesDecision(**base)
 
 
-def test_bridge_maps_long_to_overweight():
+def test_bridge_maps_long_to_buy():
+    """FuturesDecision.action=LONG collapses to the retail 5-tier BUY.
+
+    The commodity crew keeps its native ``LONG`` / ``NEUTRAL`` /
+    ``SHORT`` alphabet because those are the terms operators use for
+    futures.  The bridge into the shared ``PortfolioDecision`` schema
+    now translates them into the retail 5-tier (STRONG_BUY / BUY /
+    HOLD / SELL / STRONG_SELL).  We map to the non-STRONG tier because
+    the ``FuturesDecision`` has no separate conviction bit; downstream
+    code can promote to STRONG_* post-hoc based on
+    ``confidence`` × ``size_pct_of_book``.
+    """
     pd = futures_decision_to_portfolio_decision(_futures_decision(action="LONG"))
-    assert pd.action == "OVERWEIGHT"
+    assert pd.action == "BUY"
 
 
-def test_bridge_maps_short_to_underweight():
+def test_bridge_maps_short_to_sell():
     pd = futures_decision_to_portfolio_decision(_futures_decision(action="SHORT"))
-    assert pd.action == "UNDERWEIGHT"
+    assert pd.action == "SELL"
 
 
-def test_bridge_maps_neutral_to_neutral():
+def test_bridge_maps_neutral_to_hold():
     pd = futures_decision_to_portfolio_decision(_futures_decision(action="NEUTRAL"))
-    assert pd.action == "NEUTRAL"
+    assert pd.action == "HOLD"
 
 
 def test_bridge_preserves_futures_context_in_rationale():

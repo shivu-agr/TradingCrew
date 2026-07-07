@@ -64,7 +64,21 @@ class RunRecord:
 
     # CrewAI — narrative outputs
     expected_role_order: List[str] = field(default_factory=list)
+    # Most-recent output per role.  For roles that fire over multiple
+    # debate / risk rounds (Bullish Researcher, Bearish Researcher, the
+    # three Risk personas) this holds ONLY the last round — the full
+    # per-round history lives in ``reports_by_round`` below.  Kept for
+    # backward compatibility with existing run records and downstream
+    # consumers that just want "the latest take".
     reports: Dict[str, str] = field(default_factory=dict)
+    # Full per-round audit.  Key = role name (same as ``reports`` keys),
+    # value = list of ``{"round": N, "output": "...", "degraded": bool}``
+    # entries in chronological order.  Single-round roles (analysts,
+    # research manager, trader, compliance, PM) get exactly one entry;
+    # multi-round roles get one entry per round.  Lets the Reports tab
+    # render round 1 / round 2 / … side by side so the user can see
+    # how the debate actually evolves instead of only the final stance.
+    reports_by_round: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
     # Roles whose final answer came back as the degraded placeholder
     # (see ``trading_crew/_patches.py``).  Persisted so the UI's Recent
     # Runs panel can flag the record on rehydrate, and so post-hoc

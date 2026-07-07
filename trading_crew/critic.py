@@ -36,7 +36,17 @@ from typing import Any, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
-from trading_crew.schemas import PortfolioDecision
+from trading_crew.schemas import PortfolioDecision, normalise_action
+
+
+# Canonical 5-tier action space the critic understands.  Kept in sync with
+# ``PortfolioDecision.action`` — the schema is the source of truth; this is
+# a fast lookup so ``_apply_revision`` can validate a critic-suggested
+# replacement without instantiating a full ``PortfolioDecision`` just to
+# leverage the Pydantic Literal.
+_VALID_ACTION_TIERS: frozenset[str] = frozenset(
+    {"STRONG_BUY", "BUY", "HOLD", "SELL", "STRONG_SELL"}
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +69,11 @@ class CritiqueResponse(BaseModel):
     """
 
     intent_ok: bool = Field(
-        description="True if the proposal's action (OVERWEIGHT/NEUTRAL/UNDERWEIGHT) follows from the analyst evidence as cited in the rationale.",
+        description=(
+            "True if the proposal's action (STRONG_BUY / BUY / HOLD / SELL "
+            "/ STRONG_SELL) follows from the analyst evidence as cited in "
+            "the rationale."
+        ),
     )
     intent_reason: str = Field(
         description="Brief justification for the intent check (1-2 sentences). Cite which analyst report supports or contradicts the action.",
@@ -103,7 +117,10 @@ class CritiqueResponse(BaseModel):
 
     revised_action: Optional[str] = Field(
         default=None,
-        description="When verdict=REVISE, the suggested replacement action (OVERWEIGHT / NEUTRAL / UNDERWEIGHT). Otherwise null.",
+        description=(
+            "When verdict=REVISE, the suggested replacement action. MUST be "
+            "one of STRONG_BUY, BUY, HOLD, SELL, STRONG_SELL. Otherwise null."
+        ),
     )
     revised_size_pct: Optional[float] = Field(
         default=None,
@@ -152,6 +169,10 @@ def _build_prompt(decision: PortfolioDecision, ticker: str, iteration: int, max_
 
 Apply the 5-stage protocol below to the Portfolio Manager's decision. Be strict but fair — your job is to catch failure modes before any fill is attempted, not to second-guess every reasonable trade.
 
+**Default to RATIFY when the decision is internally consistent and supported.** Only choose REVISE for a specific, named flaw (e.g. confidence > 0.8 while the qualitative evidence is thin or contradictory, or a fabricated source).  Only choose ABSTAIN when the decision is **structurally compromised** — i.e. the rationale internally contradicts the action, compliance is BLOCKED, OR every numeric claim is unsourced.  A weak / mixed signal is NOT grounds for ABSTAIN; it is grounds for REVISE with a smaller size or a lower-conviction tier (e.g. STRONG_BUY → BUY, or BUY → HOLD).  HOLD is a legitimate action — do NOT REVISE a HOLD to a directional bet unless the rationale already argues for direction.
+
+The 5-tier action alphabet is: **STRONG_BUY**, **BUY**, **HOLD**, **SELL**, **STRONG_SELL**.  Use ``revised_action`` (only when verdict=REVISE) to suggest a tier change — e.g. cut size AND downgrade STRONG_BUY to BUY when the analyst evidence is thinner than the conviction implies, or promote BUY to STRONG_BUY only if the evidence is overwhelming (which is rare).
+
 Iteration {iteration + 1} of {max_iters}. On REVISE the decision is amended and re-fed; on RATIFY it is locked in; ABSTAIN is terminal.
 
 ## Decision under audit
@@ -183,7 +204,7 @@ Iteration {iteration + 1} of {max_iters}. On REVISE the decision is amended and 
 
 ## Protocol
 
-1. **Intent**         — Does the action (OVERWEIGHT/NEUTRAL/UNDERWEIGHT) follow from the rationale and drivers?
+1. **Intent**         — Does the action (STRONG_BUY / BUY / HOLD / SELL / STRONG_SELL) follow from the rationale and drivers? Does the *tier* (STRONG_* vs plain) match the conviction level implied by the evidence?
 
 2. **Evidence**       — Provenance check. Every numeric / quantitative claim in the rationale (and drivers / risks / falsifiers) MUST end with an inline ``[source: <identifier>]`` tag, AND that ``<identifier>`` MUST appear in the "Sources cited" list above. The tag IS the evidence — you do not need to (and must not) re-verify the underlying data. Mark ``evidence_ok=False`` ONLY when:
      (a) a numeric claim has no inline ``[source: …]`` tag at all, OR
@@ -191,11 +212,19 @@ Iteration {iteration + 1} of {max_iters}. On REVISE the decision is amended and 
      (c) the "Sources cited" list is empty while the rationale carries quantitative claims.
    Do NOT mark False just because the numbers feel "uncited" — if the tag is there and listed, that is sufficient provenance for this stage.
 
-3. **Counterfactual** — What single piece of evidence, if reversed, would flip the decision? Keep to one sentence.
+3. **Source realism**  — Judge the HONESTY of the citations, not their completeness.  Two very different cases:
 
-4. **Risk**           — Is key_risks complete? Missing macro / liquidity / regime / compliance risks → False.
+     (a) FABRICATED source — a citation that points at an obviously placeholder / made-up URL (``example.com``, ``example.org``, ``example.net``, ``test.com``, a bare ``http(s)://`` with no host, or a plainly invented path).  This is a real integrity problem: the model invented a source to satisfy a provenance rule.  Flag ``evidence_ok=False`` and REVISE — the fabricated citation must be removed and the underlying claim either re-sourced or re-labelled as ``[analyst judgement]``.
 
-5. **Verdict**        — RATIFY, REVISE (with revised_action/size/confidence), or ABSTAIN.
+     (b) HONEST qualitative judgement — a claim the analyst explicitly labelled ``[analyst judgement]`` (i.e. reasoned domain knowledge with no single citable URL).  This is ACCEPTABLE, not a violation.  Do NOT push such a claim to REVISE / ABSTAIN and do NOT force HOLD merely because a well-reasoned thesis leans on labelled judgement rather than a URL for every sentence.  A missing URL downgrades at most that ONE claim's weight — never the whole thesis.
+
+   A rationale that says "management guided 18% revenue CAGR [source: yfinance ...]" plus "the domestic capex cycle favours the sector [analyst judgement]" is CORRECT — ratify.  A rationale citing "[source: https://example.com/hal-order-book]" is INCORRECT (fabricated) — revise and strip the fake source.
+
+4. **Counterfactual** — What single piece of evidence, if reversed, would flip the decision? Keep to one sentence.
+
+5. **Risk**           — Is key_risks complete? Missing macro / liquidity / regime / compliance risks → False.
+
+6. **Verdict**        — RATIFY, REVISE (with revised_action/size/confidence), or ABSTAIN.
 
 Emit the CritiqueResponse now."""
 
@@ -343,8 +372,16 @@ class ReflectiveCritic:
 
     def _apply_revision(self, decision: PortfolioDecision, response: CritiqueResponse) -> PortfolioDecision:
         update: dict = {}
-        if response.revised_action and response.revised_action.upper() in ("OVERWEIGHT", "NEUTRAL", "UNDERWEIGHT"):
-            update["action"] = response.revised_action.upper()
+        if response.revised_action:
+            # Accept both the current 5-tier alphabet and the legacy triplet
+            # (older critic prompts / cached samples still emit
+            # OVERWEIGHT/NEUTRAL/UNDERWEIGHT).  ``normalise_action`` folds
+            # the legacy strings into the 5-tier space; anything else is
+            # rejected so a hallucinated tier can't silently overwrite
+            # the PM's original label.
+            canonical = normalise_action(response.revised_action)
+            if canonical in _VALID_ACTION_TIERS:
+                update["action"] = canonical
         if response.revised_size_pct is not None and 0.0 <= response.revised_size_pct <= 100.0:
             update["size_pct_of_book"] = float(response.revised_size_pct)
         if response.revised_confidence is not None and 0.0 <= response.revised_confidence <= 1.0:
@@ -365,7 +402,7 @@ class ReflectiveCritic:
         the audit trail explains *why* the LLM's verdict was overridden.
         """
         return decision.model_copy(update={
-            "action": "NEUTRAL",
+            "action": "HOLD",
             "size_pct_of_book": 0.0,
             "confidence": min(decision.confidence, 0.2),
             "expected_return_pct": 0.0,
@@ -411,8 +448,9 @@ def run_reflective_critic(
         consistency_samples=consistency_samples,
     )
     revised, records = critic.review(decision, ticker)
-    if revised.action != "NEUTRAL" or revised.size_pct_of_book > 0:
+    if revised.action != "HOLD" or revised.size_pct_of_book > 0:
         # Only run the (expensive) consistency vote on non-abstained proposals.
+        # ("HOLD" with size == 0 is the canonical abstain shape.)
         voted, vote_records = critic.consistency_vote(revised, ticker)
         records.extend(vote_records)
         revised = voted

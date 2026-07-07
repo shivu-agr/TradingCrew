@@ -35,7 +35,9 @@ from pydantic import BaseModel
 
 from trading_crew._patches import (
     DEGRADED_OUTPUT_MARKER,
+    DEGRADED_TIMEOUT_MARKER,
     _format_degraded_placeholder,
+    _format_timeout_placeholder,
     _looks_like_tool_call_obj,
 )
 
@@ -240,3 +242,252 @@ def test_patched_execute_task_marks_unknown_shapes_as_degraded(reinstalled_patch
     assert isinstance(out, str)
     assert out.startswith(DEGRADED_OUTPUT_MARKER)
     assert "weird" in out
+
+
+# ---------------------------------------------------------------------------
+# LLM-timeout patch (Phase 2G — Gemma-4 stall fix)
+# ---------------------------------------------------------------------------
+
+
+def test_timeout_placeholder_starts_with_timeout_marker():
+    """Timeouts must use a distinct marker so the operator can tell at a
+    glance whether a report is missing because the LLM emitted bogus
+    tool calls vs because it stalled past the configured timeout."""
+    placeholder = _format_timeout_placeholder(
+        task_name="bull_round",
+        role="Bullish Researcher",
+        exc=TimeoutError("read timed out after 120s"),
+    )
+    assert placeholder.startswith(DEGRADED_TIMEOUT_MARKER)
+    assert placeholder != ""
+    assert "Bullish Researcher" in placeholder
+    assert "bull_round" in placeholder
+    assert "TimeoutError" in placeholder
+    assert "read timed out" in placeholder
+    # Operator should see actionable mitigation hints.
+    assert "nvidia-smi" in placeholder
+    assert "LLM_TIMEOUT_SECONDS" in placeholder
+
+
+def test_timeout_placeholder_truncates_huge_exception_messages():
+    huge = "x" * 10_000
+    placeholder = _format_timeout_placeholder(
+        task_name="bull_round", role="Bullish Researcher",
+        exc=RuntimeError(huge),
+    )
+    # We cap the embedded message at 200 chars so a giant stack trace
+    # from litellm doesn't blow out the downstream prompt budget.
+    assert placeholder.count("x") <= 250
+
+
+def test_timeout_and_tool_call_markers_are_distinct():
+    """Distinct markers so the runner / UI / audit script can split them."""
+    assert DEGRADED_TIMEOUT_MARKER != DEGRADED_OUTPUT_MARKER
+    assert "TIMEOUT" in DEGRADED_TIMEOUT_MARKER
+    assert "TOOL_CALL" in DEGRADED_OUTPUT_MARKER
+
+
+class _FakeOpenAITimeout(Exception):
+    """Stand-in for litellm.Timeout / openai.APITimeoutError."""
+
+
+def test_patched_execute_task_catches_timeout_and_returns_placeholder(
+    reinstalled_patch, caplog,
+):
+    cagent, patches = reinstalled_patch
+
+    def inner(self, task, context=None, tools=None):
+        raise _FakeOpenAITimeout("Request timed out after 120.0 seconds")
+
+    wrapped = _install_with_inner(cagent, patches, inner)
+    fake_self = SimpleNamespace(role="Bullish Researcher")
+    with caplog.at_level("WARNING", logger="trading_crew._patches"):
+        out = wrapped(fake_self, task=SimpleNamespace(name="bull_round"))
+    assert isinstance(out, str)
+    assert out.startswith(DEGRADED_TIMEOUT_MARKER)
+    assert "Bullish Researcher" in out
+    assert "_FakeOpenAITimeout" in out
+    assert any("LLM timeout" in rec.getMessage() for rec in caplog.records)
+
+
+class _FakeAPIConnectionError(Exception):
+    """Stand-in for openai.APIConnectionError / litellm.APIConnectionError."""
+
+
+def test_patched_execute_task_catches_connection_error_as_timeout(reinstalled_patch):
+    """A dropped TCP connection should be treated like a timeout — same
+    "the model never gave us an answer" semantics — so the rest of the
+    workflow keeps moving instead of aborting mid-run."""
+    cagent, patches = reinstalled_patch
+
+    def inner(self, task, context=None, tools=None):
+        raise _FakeAPIConnectionError("connection reset by peer")
+
+    wrapped = _install_with_inner(cagent, patches, inner)
+    fake_self = SimpleNamespace(role="News Analyst")
+    out = wrapped(fake_self, task=SimpleNamespace(name="news_task"))
+    assert isinstance(out, str)
+    assert out.startswith(DEGRADED_TIMEOUT_MARKER)
+    assert "News Analyst" in out
+
+
+class _FakeBusinessLogicError(Exception):
+    """Unrelated error class — must NOT be swallowed by the timeout catch."""
+
+
+def test_patched_execute_task_propagates_non_timeout_exceptions(reinstalled_patch):
+    """Real bugs (e.g. schema validation, 4xx from the LLM, KeyError in
+    a tool) must keep propagating so they show up in the run-error
+    event — only timeout / connection failures should be converted to
+    degraded placeholders."""
+    cagent, patches = reinstalled_patch
+
+    def inner(self, task, context=None, tools=None):
+        raise _FakeBusinessLogicError("something is genuinely broken")
+
+    wrapped = _install_with_inner(cagent, patches, inner)
+    fake_self = SimpleNamespace(role="Market Analyst")
+    with pytest.raises(_FakeBusinessLogicError):
+        wrapped(fake_self, task=SimpleNamespace(name="market_task"))
+
+
+# ---------------------------------------------------------------------------
+# Upstream HTTP 5xx — observed live as ``openai.InternalServerError:
+# upstream request timeout`` on the hosted gpt-oss endpoint during the
+# Quality Reviewer step.  Functionally identical to a client-side
+# ``ReadTimeout`` (the model server failed to respond in time), so we
+# must convert these to a degraded placeholder rather than abort the
+# whole crew.
+# ---------------------------------------------------------------------------
+
+
+class _FakeInternalServerError(Exception):
+    """Stand-in for openai.InternalServerError (HTTP 5xx wrapper)."""
+
+
+class _FakeServiceUnavailableError(Exception):
+    """Stand-in for openai.ServiceUnavailableError / 503."""
+
+
+class _FakeRateLimitError(Exception):
+    """Stand-in for openai.RateLimitError / 429."""
+
+
+class _FakeBadGateway(Exception):
+    """Stand-in for an SDK-shaped 502 class."""
+
+
+def test_patched_execute_task_catches_upstream_internal_server_error(
+    reinstalled_patch, caplog,
+):
+    """The hosted ``gpt-oss`` endpoint returns ``InternalServerError:
+    upstream request timeout`` when the underlying model takes too long.
+    This must become a degraded placeholder, not an abort."""
+    cagent, patches = reinstalled_patch
+
+    def inner(self, task, context=None, tools=None):
+        raise _FakeInternalServerError("upstream request timeout")
+
+    wrapped = _install_with_inner(cagent, patches, inner)
+    fake_self = SimpleNamespace(role="Quality Reviewer")
+    with caplog.at_level("WARNING", logger="trading_crew._patches"):
+        out = wrapped(fake_self, task=SimpleNamespace(name="quality_review"))
+    assert isinstance(out, str)
+    assert out.startswith(DEGRADED_TIMEOUT_MARKER)
+    assert "Quality Reviewer" in out
+    assert "_FakeInternalServerError" in out
+    assert any("LLM timeout" in rec.getMessage() for rec in caplog.records)
+
+
+def test_patched_execute_task_catches_service_unavailable(reinstalled_patch):
+    """503 from the model server is also transient — degrade and continue."""
+    cagent, patches = reinstalled_patch
+
+    def inner(self, task, context=None, tools=None):
+        raise _FakeServiceUnavailableError("service temporarily unavailable")
+
+    wrapped = _install_with_inner(cagent, patches, inner)
+    fake_self = SimpleNamespace(role="News Analyst")
+    out = wrapped(fake_self, task=SimpleNamespace(name="news_task"))
+    assert isinstance(out, str)
+    assert out.startswith(DEGRADED_TIMEOUT_MARKER)
+
+
+def test_patched_execute_task_catches_rate_limit_error(reinstalled_patch):
+    """429 is transient — converting to a degraded placeholder lets the
+    remaining agents run rather than abort the whole crew."""
+    cagent, patches = reinstalled_patch
+
+    def inner(self, task, context=None, tools=None):
+        raise _FakeRateLimitError("rate limit exceeded")
+
+    wrapped = _install_with_inner(cagent, patches, inner)
+    fake_self = SimpleNamespace(role="Market Analyst")
+    out = wrapped(fake_self, task=SimpleNamespace(name="market_task"))
+    assert isinstance(out, str)
+    assert out.startswith(DEGRADED_TIMEOUT_MARKER)
+
+
+def test_patched_execute_task_catches_bad_gateway(reinstalled_patch):
+    """502 from any intermediate proxy is also transient."""
+    cagent, patches = reinstalled_patch
+
+    def inner(self, task, context=None, tools=None):
+        raise _FakeBadGateway("bad gateway")
+
+    wrapped = _install_with_inner(cagent, patches, inner)
+    fake_self = SimpleNamespace(role="Research Manager")
+    out = wrapped(fake_self, task=SimpleNamespace(name="research_synthesis"))
+    assert isinstance(out, str)
+    assert out.startswith(DEGRADED_TIMEOUT_MARKER)
+
+
+class _FakeGenericAPIError(Exception):
+    """Stand-in for a generic ``APIError`` that wraps a 504 in its message
+    rather than via its class name (some proxies do this)."""
+
+
+def test_patched_execute_task_catches_timeout_via_message_text(reinstalled_patch):
+    """When the class name doesn't match any of our patterns but the
+    exception message clearly says "upstream request timeout" / "gateway
+    timeout" / etc., we should still treat the failure as transient."""
+    cagent, patches = reinstalled_patch
+
+    def inner(self, task, context=None, tools=None):
+        raise _FakeGenericAPIError("upstream request timeout")
+
+    wrapped = _install_with_inner(cagent, patches, inner)
+    fake_self = SimpleNamespace(role="Quality Reviewer")
+    out = wrapped(fake_self, task=SimpleNamespace(name="quality_review"))
+    assert isinstance(out, str)
+    assert out.startswith(DEGRADED_TIMEOUT_MARKER)
+    assert "upstream request timeout" in out
+
+
+def test_patched_execute_task_message_text_match_is_case_insensitive(reinstalled_patch):
+    """Some servers shout in uppercase — we shouldn't miss them."""
+    cagent, patches = reinstalled_patch
+
+    def inner(self, task, context=None, tools=None):
+        raise _FakeGenericAPIError("UPSTREAM REQUEST TIMEOUT")
+
+    wrapped = _install_with_inner(cagent, patches, inner)
+    fake_self = SimpleNamespace(role="Quality Reviewer")
+    out = wrapped(fake_self, task=SimpleNamespace(name="quality_review"))
+    assert isinstance(out, str)
+    assert out.startswith(DEGRADED_TIMEOUT_MARKER)
+
+
+def test_patched_execute_task_still_propagates_unrelated_apierror(reinstalled_patch):
+    """A generic APIError with NO timeout-ish message (e.g. 4xx with a
+    'context length exceeded' body) must NOT be swallowed — that is a
+    real bug the operator needs to see and fix."""
+    cagent, patches = reinstalled_patch
+
+    def inner(self, task, context=None, tools=None):
+        raise _FakeGenericAPIError("context length exceeded")
+
+    wrapped = _install_with_inner(cagent, patches, inner)
+    fake_self = SimpleNamespace(role="Market Analyst")
+    with pytest.raises(_FakeGenericAPIError):
+        wrapped(fake_self, task=SimpleNamespace(name="market_task"))

@@ -102,7 +102,7 @@ Only visible on the \`/commodity\` dashboard. Three views:
     long: `
 Renders every CrewAI task output as the run progresses. Each card shows the agent role, the rendered markdown, and an inline source-attribution list. Every numeric claim in a report carries an inline \`[source: <identifier>]\` tag — the **Reflective Critic** validates these tags against the PM's \`sources\` list to distinguish real data from hallucinated numbers.
 
-The bottom of the tab shows the **final-decision card**: action (OVERWEIGHT / NEUTRAL / UNDERWEIGHT), size, confidence, key drivers, key risks, falsifiers, compliance status, and the deduplicated sources list.
+The bottom of the tab shows the **final-decision card**: action on the retail 5-tier scale (**STRONG_BUY / BUY / HOLD / SELL / STRONG_SELL**), size, confidence, key drivers, key risks, falsifiers, compliance status, and the deduplicated sources list.  Older runs may still show the legacy 3-tier action strings (OVERWEIGHT / NEUTRAL / UNDERWEIGHT) — the UI collapses them to BUY / HOLD / SELL for display.
 
 ### "Degraded" badge
 A report card tagged with an amber **DEGRADED** badge means the LLM emitted a *tool-call list* as its final answer for that task instead of synthesising the expected markdown. This is a known limitation of some open-source LLMs (the \`hosted-vllm-oss\` preset is the usual offender) on tool-heavy tasks like News, Macro, Social, and Geopolitical — the model fires a tool call and then fails to compose a closing assistant message, so the agent loop terminates with the tool-call objects in the final-answer slot. The defensive patch in \`trading_crew/_patches.py\` catches the failure, prints a clear placeholder showing which tool calls were attempted, and lets the rest of the crew run. Mitigations: switch to a closed-source LLM via the LLM picker, re-run the workflow (the failure is non-deterministic), or shorten that analyst's tool chain.
@@ -990,7 +990,7 @@ Risk analyst who weighs aggressive and conservative arguments and proposes a mid
     long: `
 Buy-side compliance. Vetoes trades that touch sanctions or restricted lists (e.g. chip-export-controlled entities), and downgrades trades with material ESG or conflict-of-interest concerns.
 
-Hard rule: if status is BLOCKED, the PM's action MUST be NEUTRAL and size 0. FLAGGED caps size at 1.0% of book.
+Hard rule: if status is BLOCKED, the PM's action MUST be HOLD and size 0. FLAGGED caps size at 1.0% of book.
 `.trim(),
     keywords: ["compliance", "sanctions", "ESG"],
   },
@@ -998,15 +998,67 @@ Hard rule: if status is BLOCKED, the PM's action MUST be NEUTRAL and size 0. FLA
   "agent.portfolio_manager": {
     section: "agents",
     title: "Portfolio Manager",
-    short: "Final decision maker. Emits typed PortfolioDecision (action, size, confidence, drivers, risks, sources).",
+    short: "Final decision maker. Emits typed PortfolioDecision (action, horizon tier, size, confidence, drivers, risks, sources).",
     long: `
-Final decision maker. Reads the trader's plan and the risk team's debate and commits to a single, sized position with a one-paragraph rationale.
+Final decision maker. Reads the trader's plan, the risk team's debate, and the fundamentals analyst's long-term thesis, then commits to a single sized position + horizon tier with a one-paragraph rationale.
 
-**Output**: typed \`PortfolioDecision\` JSON (gated by a confidence guardrail) with action (OVERWEIGHT / NEUTRAL / UNDERWEIGHT), size_pct_of_book, confidence ∈ [0,1], key_drivers, key_risks, falsifiers, compliance_status, geopolitical_flags, and the deduplicated \`sources\` list of provenance identifiers.
+**Output**: typed \`PortfolioDecision\` JSON (gated by a confidence guardrail) with:
+- **5-tier retail action** (STRONG_BUY / BUY / HOLD / SELL / STRONG_SELL). Older records persisted with the legacy 3-tier alphabet (OVERWEIGHT / NEUTRAL / UNDERWEIGHT) are coerced to BUY / HOLD / SELL when they're re-loaded.
+- **3-tier horizon** (SHORT ≤ 3 months / MEDIUM ≈ few months to 1 year / LONG = 1-10 year compounder / value thesis). The desk defaults to MEDIUM; escalation to LONG requires the fundamentals analyst's \`get_long_term_thesis\` tool output (revenue / EPS CAGR, ROCE trend, debt trajectory).
+- \`horizon_days\` — the numeric review window (SHORT: 10-60d; MEDIUM: 90-252d; LONG: 504-1260d representative windows, with the 5-10 year narrative in the \`long_term_view\` free-form field).
+- \`long_term_view\` — REQUIRED on every decision, not just LONG.  For LONG-tier calls it's the full 2-5 sentence multi-year narrative (CAGR + ROCE + debt + falsifier).  For SHORT / MEDIUM calls it's a 1-2 sentence "the multi-year thesis is intact / broken / N/A" line, so the LONG-panel context is never silently dropped from the final report.  Older records may carry this under the legacy field name \`long_term_thesis\`; the schema accepts either.
+- size_pct_of_book, confidence ∈ [0,1], key_drivers, key_risks, falsifiers, compliance_status, geopolitical_flags, and the deduplicated \`sources\` list of provenance identifiers.
 
-Hard rules: never claim >0.85 confidence on a single-name trade; if backtest hit-rate <40%, cap confidence at 0.6 and shrink size accordingly; if compliance is BLOCKED, action MUST be NEUTRAL.
+Hard rules:
+- Never claim >0.85 confidence on a single-name trade.
+- If backtest hit-rate <40% AND every horizon has expectancy ≤ 0%, cap confidence at 0.6 and shrink size accordingly.
+- If compliance is BLOCKED, action MUST be HOLD.
+- STRONG_BUY / STRONG_SELL are reserved for one-sided evidence across the chosen tier's row + the adjacent tier.
+- HOLD requires size_pct_of_book == 0; directional tiers require size_pct_of_book > 0.
+- \`horizon == LONG\` requires \`long_term_view\` to be a full 2-5 sentence narrative AND requires a \`get_long_term_thesis\` citation.  For SHORT / MEDIUM decisions, \`long_term_view\` still has to be a non-empty 1-2 sentence context line ("multi-year thesis is intact/broken/N/A") — the desk shows it in every final report so the LONG-panel evidence is always visible.
 `.trim(),
-    keywords: ["PM", "decision", "PortfolioDecision"],
+    keywords: ["PM", "decision", "PortfolioDecision", "horizon", "SHORT", "MEDIUM", "LONG"],
+  },
+
+  "concept.horizon_tiers": {
+    section: "glossary",
+    title: "Horizon tiers (SHORT / MEDIUM / LONG)",
+    short: "3-tier investment-horizon alphabet: SHORT (≤3 months), MEDIUM (~few months), LONG (1-10 year compounder / value thesis).",
+    long: `
+Every PortfolioDecision now carries an explicit **horizon tier** alongside \`horizon_days\`:
+
+- **SHORT** — ≤ 60 trading days (~3 months).  Catalyst / earnings plays, technical breakouts.  The exception.
+- **MEDIUM** — 61-252 days (~few months to a year).  The desk's DEFAULT.  Ind-AS quarterly-print theses, multi-quarter earnings trends, mid-term relative-strength setups.
+- **LONG** — 253+ days (1-10 years).  A genuine compounder / value thesis anchored on multi-year revenue / EPS CAGR + stable-or-improving ROCE.  Requires the fundamentals analyst's \`get_long_term_thesis\` tool to have run (revenue / EPS CAGR, debt trajectory, shareholding stability) and requires the backtest_setup 5y / 10y row to show positive expectancy.
+
+The backtest_setup tool surfaces all three tiers in one panel (with rows tagged [SHORT] / [MEDIUM] / [LONG] and human-readable windows like "1260d ≈ 5y"), plus a **Per-tier best expectancy** summary the PM anchors on.
+
+Because outcome resolution can't wait a decade, LONG-tier decisions have their **accounting horizon** clamped to 5 years (1260d) — the *narrative* 5-10 year thesis lives in the \`long_term_view\` free-form field (accepted under the legacy name \`long_term_thesis\` too).  The RLMF training loop uses the 5y realised return as the reward proxy for LONG-tier calls.
+`.trim(),
+    keywords: ["horizon", "SHORT", "MEDIUM", "LONG", "5-year", "10-year", "compounder"],
+  },
+
+  "concept.rlmf": {
+    section: "glossary",
+    title: "RLMF — Reinforcement Learning from Market Feedback",
+    short: "FinGPT-inspired training loop where the reward is realised return over the decision's horizon, not human preference.",
+    long: `
+The FinGPT project (AI4Finance-Foundation) adapted the RLHF framework used to align ChatGPT: replace **human feedback** with **market feedback** — the realised return of a decision over its stated horizon.  Our RLMF module implements this in two paths:
+
+**Prompt-only (default, runs every workflow when \`TRADINGCREW_RLMF_ENABLED=1\`)**
+- Walks resolved episodes and computes \`reward = alpha_return × conviction_weight × horizon_weight\`.
+- Ranks the case-book; picks the top-K wins ("TO EMULATE") and bottom-K losses ("TO AVOID").
+- Injects them as a few-shot PREFIX on the Portfolio Manager task, before the regular prompt.  The PM now sees "here are the past prompts that turned into positive alpha — emulate their shape; here are the ones that turned into losses — avoid their shape".
+- Needs no GPU, no LoRA training, no dataset export.
+
+**LoRA fine-tune (offline)**
+- \`python -m trading_crew.agentic.rlmf --export\` writes a FinGPT-Forecaster-compatible JSONL (\`~/.trading_crew/rlmf/dataset.jsonl\`).
+- Point the standard FinGPT LoRA notebook at the file; it fine-tunes the base LLM on \`(state, action) → reward\` pairs.
+- Merge the LoRA adapter back into the vLLM-served base model to close the loop.
+
+The prompt-only path is what runs in production — the LoRA path is the one users adopt after they've accumulated a few hundred resolved decisions.
+`.trim(),
+    keywords: ["RLMF", "RLHF", "FinGPT", "training", "reward", "few-shot", "LoRA"],
   },
 
   /* ================================================ GLOSSARY TERMS === */

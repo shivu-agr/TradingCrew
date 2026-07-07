@@ -41,9 +41,9 @@ from crewai.events.types.tool_usage_events import (
 )
 from trading_crew import TradingCrew
 from trading_crew._common import get_llm
-from trading_crew._patches import DEGRADED_OUTPUT_MARKER
+from trading_crew._patches import DEGRADED_OUTPUT_MARKER, DEGRADED_TIMEOUT_MARKER
 from trading_crew.critic import run_reflective_critic, records_to_payload
-from trading_crew.tools import ALL_TOOLS, DEFAULT_AGENT_TOOLS
+from trading_crew.tools import ALL_TOOLS, DEFAULT_AGENT_TOOLS, sanitize_citations
 
 # Agentic-trading roadmap (M1-M7) — deterministic post-LLM pipeline.
 from trading_crew.agentic.bridge import portfolio_decision_to_action_proposal
@@ -127,6 +127,12 @@ class AnalysisRunner:
         self._cancel_event = threading.Event()
         # State driving the streaming-gap fix.
         self._expected_role_order: List[str] = []
+        # Parallel array: round number for each slot in
+        # ``_expected_role_order``.  1-based; single-round roles get 1.
+        # Populated alongside ``_expected_role_order`` in ``_run_blocking``.
+        self._role_round_per_slot: List[int] = []
+        # Map role → total number of rounds that role will fire.
+        self._role_total_rounds: Dict[str, int] = {}
         # Parallel array of ``async_execution`` flags per slot.  Async
         # batches dispatch in parallel, so when we announce the first
         # async slot we also pre-announce every contiguous async sibling
@@ -158,6 +164,41 @@ class AnalysisRunner:
         # Tool-call ledger so tool_result can be attributed back to its tool_call.
         self._tool_call_seq: int = 0
         self._open_tool_calls: Dict[str, Dict[str, Any]] = {}
+        # CrewAI 1.14+ dispatches sync event handlers through a
+        # ``ThreadPoolExecutor`` (see
+        # ``crewai/events/event_bus.py::CrewAIEventsBus.emit``).  When a
+        # tool call is fast (e.g. cache hit → 0 ms elapsed) or when the
+        # experimental agent-executor runs several tool calls in
+        # parallel via its own ``ThreadPoolExecutor`` (see
+        # ``crewai/experimental/agent_executor.py::_execute_native_tool_calls``),
+        # our ``_on_tool_started`` and ``_on_tool_finished`` handlers
+        # for the *same call* race — and the "finished" one can win.
+        # The result was a UI where each ``tool_result`` card rendered
+        # *before* its own ``tool_call`` card.
+        #
+        # ``_tool_lock`` + ``_tool_cv`` serialise our access to
+        # ``_open_tool_calls`` AND let a Finished handler block briefly
+        # until its matching Started has actually registered the call.
+        # The Started handler always emits the UI event while holding
+        # the lock, so the sync queue receives ``tool_call`` before
+        # ``tool_result`` for every pair.
+        self._tool_lock: threading.Lock = threading.Lock()
+        self._tool_cv: threading.Condition = threading.Condition(self._tool_lock)
+        # Concurrency-safety filter.  CrewAI's event bus is a *process
+        # singleton* (see crewai.events.event_bus.CrewAIEventsBus) so
+        # when the SessionManager runs two kickoffs in parallel, our
+        # ``_on_tool_started`` / _on_tool_finished handlers fire for
+        # *every* crew's tool events — a run for BAJAJ-AUTO.NS would
+        # see tool_call cards from a concurrent RELIANCE.NS run and
+        # attribute them to the wrong session.
+        #
+        # ``ToolUsageEvent.agent_id`` is a per-Agent UUID assigned at
+        # construction time, so populating this set from
+        # ``crew.agents`` at run-start and rejecting events whose
+        # ``agent_id`` isn't in it gives us clean per-session isolation
+        # without patching the singleton bus.  Populated in
+        # ``_run_blocking`` immediately after ``tc.crew()`` returns.
+        self._own_agent_ids: set[str] = set()
         # Phase E — run persistence. Populated by _emit's snapshotter
         # and flushed to disk on run_completed / error.
         self._run_record: Optional[RunRecord] = None
@@ -223,7 +264,17 @@ class AnalysisRunner:
             elif t == "node_completed":
                 role = event.get("node") or event.get("role")
                 if role:
-                    rec.reports[role] = (event.get("output") or "")[:8000]
+                    output = (event.get("output") or "")[:8000]
+                    rec.reports[role] = output
+                    # Full per-round audit so the Reports tab can render
+                    # round 1 / round 2 side-by-side instead of only the
+                    # last round (which is what ``rec.reports`` keeps).
+                    rec.reports_by_round.setdefault(role, []).append({
+                        "round": int(event.get("round") or 1),
+                        "total_rounds": int(event.get("total_rounds") or 1),
+                        "output": output,
+                        "degraded": bool(event.get("degraded")),
+                    })
                     if event.get("degraded"):
                         rec.degraded_roles.append(role)
             elif t == "final_decision":
@@ -271,9 +322,24 @@ class AnalysisRunner:
         if not role or role in self._running_roles:
             return
         self._running_roles.add(role)
+        # Look up the round number this announcement corresponds to:
+        # the first un-completed slot whose role matches.  Lets the UI
+        # render "Bullish Researcher — round 2 of 2" on the diagram
+        # subtitle without having to re-derive round_num from the
+        # completion counter on the frontend.
+        round_num = 1
+        total_rounds = self._role_total_rounds.get(role, 1)
+        for i, expected in enumerate(self._expected_role_order):
+            if i in self._completed_slot_indices:
+                continue
+            if expected == role and i < len(self._role_round_per_slot):
+                round_num = self._role_round_per_slot[i]
+                break
         self._emit(make_event(
             "node_started",
             node=role, role=role, kind=NODE_KIND.get(role, "node"),
+            round=round_num,
+            total_rounds=total_rounds,
         ))
 
     # ---- callbacks (run on CrewAI thread) ----------------------------------
@@ -305,16 +371,10 @@ class AnalysisRunner:
     def _on_tool_started(self, _source: Any, event: ToolUsageStartedEvent) -> None:
         if self._cancel_event.is_set():
             return
+        if not self._is_own_event(event):
+            return
         role = event.agent_role or "Agent"
         self._announce(role)
-        self._tool_call_seq += 1
-        call_id = f"{role}-{event.tool_name}-{self._tool_call_seq}"
-        self._open_tool_calls[call_id] = {
-            "tool": event.tool_name, "node": role, "started_at": time.time(),
-        }
-        # Map this tool's started_at -> call_id so finished/error can match.
-        # CrewAI's ToolUsageStartedEvent doesn't carry a call_id of its own;
-        # we collapse on (role, tool_name) for the most-recent open call.
         args = event.tool_args
         if isinstance(args, str):
             args_text = args[:600]
@@ -323,25 +383,46 @@ class AnalysisRunner:
                 args_text = json.dumps(args, default=str)[:600]
             except Exception:
                 args_text = str(args)[:600]
-        self._emit(make_event(
-            "tool_call",
-            node=role, tool=event.tool_name,
-            call_id=call_id,
-            args=args_text,
-        ))
+        # Register the open call AND emit the ``tool_call`` UI event
+        # atomically while holding the lock.  Any concurrent Finished
+        # handler for the same (role, tool) blocked in ``_on_tool_finished``
+        # is woken via ``_tool_cv.notify_all()`` so it can pop the call
+        # and emit ``tool_result`` immediately after us — guaranteeing
+        # the sync queue sees ``tool_call`` before ``tool_result``.
+        with self._tool_cv:
+            self._tool_call_seq += 1
+            call_id = f"{role}-{event.tool_name}-{self._tool_call_seq}"
+            self._open_tool_calls[call_id] = {
+                "tool": event.tool_name, "node": role, "started_at": time.time(),
+            }
+            self._emit(make_event(
+                "tool_call",
+                node=role, tool=event.tool_name,
+                call_id=call_id,
+                args=args_text,
+            ))
+            self._tool_cv.notify_all()
 
     def _on_tool_finished(self, _source: Any, event: ToolUsageFinishedEvent) -> None:
         if self._cancel_event.is_set():
             return
+        if not self._is_own_event(event):
+            return
         role = event.agent_role or "Agent"
-        # Match the most recent open call from this (role, tool).
-        call_id = self._pop_matching_call(role, event.tool_name)
         elapsed_ms = 0
         try:
             if event.started_at and event.finished_at:
                 elapsed_ms = int((event.finished_at - event.started_at).total_seconds() * 1000)
         except Exception:
             pass
+        # Wait up to ~5 s for the matching Started to register the
+        # open call.  Fast (cached) tools + CrewAI's threaded event
+        # dispatch mean the Finished handler often reaches us first;
+        # blocking here keeps the emitted order ``tool_call`` →
+        # ``tool_result`` regardless of scheduling.  If nothing ever
+        # arrives we still emit with ``call_id=None`` so the UI can
+        # render an orphan result instead of dropping data.
+        call_id = self._wait_for_matching_call(role, event.tool_name)
         self._emit(make_event(
             "tool_result",
             node=role, tool=event.tool_name, call_id=call_id,
@@ -352,8 +433,10 @@ class AnalysisRunner:
     def _on_tool_error(self, _source: Any, event: ToolUsageErrorEvent) -> None:
         if self._cancel_event.is_set():
             return
+        if not self._is_own_event(event):
+            return
         role = event.agent_role or "Agent"
-        call_id = self._pop_matching_call(role, event.tool_name)
+        call_id = self._wait_for_matching_call(role, event.tool_name)
         self._emit(make_event(
             "tool_result",
             node=role, tool=event.tool_name, call_id=call_id,
@@ -362,7 +445,28 @@ class AnalysisRunner:
             elapsed_ms=0,
         ))
 
+    def _is_own_event(self, event: Any) -> bool:
+        """Filter for the CrewAI singleton event bus.
+
+        When multiple ``AnalysisRunner``s are alive concurrently (see
+        ``session_manager.py``), each one's handler fires for *every*
+        crew's tool events — the bus is process-global.  If we haven't
+        recorded our own agent-id set yet (init race, or a run that
+        never called ``_run_blocking``) we conservatively accept the
+        event so single-run behaviour is unchanged.
+        """
+        if not self._own_agent_ids:
+            return True
+        agent_id = getattr(event, "agent_id", None)
+        if agent_id is None:
+            return True
+        return str(agent_id) in self._own_agent_ids
+
     def _pop_matching_call(self, role: str, tool_name: str) -> Optional[str]:
+        """Pop the most recent open call for ``(role, tool_name)``.
+
+        Caller must hold ``_tool_cv`` / ``_tool_lock``.
+        """
         for cid in list(self._open_tool_calls.keys())[::-1]:
             meta = self._open_tool_calls[cid]
             if meta["node"] == role and meta["tool"] == tool_name:
@@ -370,15 +474,35 @@ class AnalysisRunner:
                 return cid
         return None
 
+    def _wait_for_matching_call(
+        self, role: str, tool_name: str, *, timeout: float = 5.0,
+    ) -> Optional[str]:
+        """Return the ``call_id`` of a matching open call, waiting if needed.
+
+        Blocks up to ``timeout`` seconds for a Started handler running
+        concurrently in CrewAI's thread pool to register the open call.
+        Returns ``None`` on timeout (orphan Finished) so the UI still
+        renders the tool_result instead of silently dropping it.
+        """
+        deadline = time.monotonic() + timeout
+        with self._tool_cv:
+            while True:
+                cid = self._pop_matching_call(role, tool_name)
+                if cid is not None:
+                    return cid
+                if self._cancel_event.is_set():
+                    return None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._tool_cv.wait(timeout=remaining)
+
+    # Post-consolidation: 4 merged analyst desks (was 8).
     _ANALYST_ROLE_TO_TASK_ID = {
         "Market Analyst": "market_task",
-        "Social Analyst": "social_task",
         "News Analyst": "news_task",
         "Fundamentals Analyst": "fundamentals_task",
         "Macro Analyst": "macro_task",
-        "Geopolitical Analyst": "geopolitical_task",
-        "Sector Analyst": "sector_task",
-        "Quant Analyst": "quant_task",
     }
 
     def _on_task(self, task_output: Any) -> None:
@@ -393,24 +517,49 @@ class AnalysisRunner:
         # debate rounds, risk personas) get assigned to successive
         # un-completed slots — so "first un-completed slot whose role
         # matches" is unambiguous.
+        completed_slot: Optional[int] = None
         for i, expected in enumerate(self._expected_role_order):
             if i in self._completed_slot_indices:
                 continue
             if expected == role:
                 self._completed_slot_indices.add(i)
+                completed_slot = i
                 break
+        # Look up the round number for this completion so the UI / saved
+        # run record can keep round 1 and round 2 outputs side-by-side
+        # instead of overwriting round 1 with round 2 on the same role
+        # key (the cause of the "multi-turn discussion shows no change"
+        # bug — the Bullish Researcher always rendered its last round
+        # only because every prior round was clobbered by role-keyed
+        # persistence).
+        round_num = 1
+        total_rounds = 1
+        if completed_slot is not None and completed_slot < len(self._role_round_per_slot):
+            round_num = self._role_round_per_slot[completed_slot]
+            total_rounds = self._role_total_rounds.get(role, 1)
         # Allow the agent to be re-announced if it runs again later (debate
         # rounds re-use the same agent). We only remove from the running set
         # after we've emitted node_completed.
         self._running_roles.discard(role)
         raw_text = _safe_text(task_output, limit=8000)
+        # Deterministically relabel any fabricated ``[source: example.com/…]``
+        # citation the LLM invented in its own prose to an honest
+        # ``[analyst judgement]`` tag BEFORE the text is shown, persisted,
+        # or fed to the PM / critic.  This fixes the root cause of sound
+        # theses being downgraded for a model-invented URL (the tool
+        # layer already rejects fake URLs, but the model can still type
+        # one into free text).
+        raw_text = sanitize_citations(raw_text)
         # When the OSS-LLM tool-call-as-final-answer patch fires (see
         # ``trading_crew/_patches.py``) it prefixes the per-task output
-        # with ``DEGRADED_OUTPUT_MARKER``.  Detect it so the UI can flag
-        # the affected report as degraded instead of rendering an empty
-        # / nonsense body, and so the saved run record persists the
-        # signal for audit.
-        degraded = raw_text.startswith(DEGRADED_OUTPUT_MARKER)
+        # with ``DEGRADED_OUTPUT_MARKER``.  The companion LLM-timeout
+        # patch uses ``DEGRADED_TIMEOUT_MARKER``.  Detect either so the
+        # UI can flag the affected report as degraded instead of
+        # rendering an empty / nonsense body, and so the saved run
+        # record persists the signal for audit.
+        degraded = raw_text.startswith(DEGRADED_OUTPUT_MARKER) or raw_text.startswith(
+            DEGRADED_TIMEOUT_MARKER
+        )
         if degraded:
             self._degraded_roles.add(role)
         self._emit(make_event(
@@ -418,6 +567,8 @@ class AnalysisRunner:
             node=role, role=role, kind=NODE_KIND.get(role, "node"),
             output=raw_text,
             degraded=degraded,
+            round=round_num,
+            total_rounds=total_rounds,
         ))
 
         # Phase 2E — populate the analyst output cache.  We only cache
@@ -539,7 +690,7 @@ class AnalysisRunner:
         """
         from trading_crew.schemas import PortfolioDecision
         return PortfolioDecision(
-            action="NEUTRAL",
+            action="HOLD",
             confidence=0.0,
             size_pct_of_book=0.0,
             entry_price=0.0,
@@ -786,7 +937,10 @@ class AnalysisRunner:
                 "debate_rounds": ui_cfg.get("debate_rounds"),
                 "risk_rounds": ui_cfg.get("risk_rounds"),
                 "memory": ui_cfg.get("memory"),
+                "quality_review": ui_cfg.get("quality_review"),
+                "compliance": ui_cfg.get("compliance"),
                 "tools_enabled": ui_cfg.get("tools_enabled"),
+                "critic_enabled": ui_cfg.get("critic_enabled"),
                 "critic_iterations": ui_cfg.get("critic_iterations"),
                 "critic_samples": ui_cfg.get("critic_samples"),
                 "llm_preset": ui_cfg.get("llm_preset"),
@@ -796,8 +950,14 @@ class AnalysisRunner:
         try:
             debate_rounds = int(ui_cfg.get("debate_rounds", 2))
             risk_rounds = int(ui_cfg.get("risk_rounds", 1))
-            use_memory = bool(ui_cfg.get("memory", True))
+            # Memory defaults OFF now — CrewAI's per-task analyze passes were
+            # the single biggest source of LLM calls (~80/run).  The toggle
+            # is still exposed in the UI so a user can opt back in.
+            use_memory = bool(ui_cfg.get("memory", False))
             tools_enabled = ui_cfg.get("tools_enabled") or {}
+            # Optional advisory reviewers — default OFF for a lean run.
+            quality_review_enabled = bool(ui_cfg.get("quality_review", False))
+            compliance_enabled = bool(ui_cfg.get("compliance", False))
             asset_class = (ui_cfg.get("asset_class") or "stock").lower()
             self._asset_class = asset_class
             book = (ui_cfg.get("book") or "paper").strip().lower()
@@ -835,8 +995,21 @@ class AnalysisRunner:
                     task_callback=self._on_task,
                     memory=use_memory,
                     tools_enabled=tools_enabled,
+                    quality_review_enabled=quality_review_enabled,
+                    compliance_enabled=compliance_enabled,
                 )
             crew = tc.crew()
+            # Record our own agent ids so ``_on_tool_*`` can reject
+            # events from a *sibling* run sharing the CrewAI singleton
+            # event bus.  Agents get a UUID at construction time so
+            # even two runs on the same ticker have disjoint sets.
+            try:
+                self._own_agent_ids = {
+                    str(getattr(a, "id", None) or getattr(a, "_id", None) or id(a))
+                    for a in getattr(crew, "agents", []) or []
+                }
+            except Exception:
+                self._own_agent_ids = set()
             if self._run_record is not None:
                 self._run_record.config["asset_class"] = asset_class
 
@@ -851,6 +1024,24 @@ class AnalysisRunner:
             self._expected_async_flags = [
                 bool(getattr(t, "async_execution", False)) for t in crew.tasks
             ]
+            # Pre-compute the round number AND total-rounds for every
+            # task slot so ``node_started`` / ``node_completed`` events
+            # can carry ``round`` / ``total_rounds`` fields.  For roles
+            # that fire once (analysts, manager, trader, compliance,
+            # PM) round=1, total_rounds=1.  For multi-round roles
+            # (Bullish / Bearish researcher, the three Risk personas)
+            # the slot's position among same-role siblings becomes
+            # round_num, and ``total_rounds`` is just how many times
+            # the role appears in expected_role_order.
+            role_seen_count: Dict[str, int] = {}
+            self._role_round_per_slot: List[int] = []
+            for r in self._expected_role_order:
+                role_seen_count[r] = role_seen_count.get(r, 0) + 1
+                self._role_round_per_slot.append(role_seen_count[r])
+            self._role_total_rounds: Dict[str, int] = {
+                r: self._expected_role_order.count(r)
+                for r in set(self._expected_role_order)
+            }
             # Reset per-run slot tracking (in case the runner instance is
             # reused across analyses on the same WS session).
             self._completed_slot_indices = set()
@@ -862,6 +1053,7 @@ class AnalysisRunner:
             self._emit(make_event(
                 "run_started",
                 ticker=ticker,
+                trade_date=self._cache_meta.get("trade_date"),
                 debate_rounds=debate_rounds,
                 risk_rounds=risk_rounds,
                 agent_count=len(crew.agents),
@@ -967,11 +1159,18 @@ class AnalysisRunner:
                     try:
                         if short_circuited:
                             raise RuntimeError("skip critic on cascade override")
+                        # Critic is on by default but SINGLE-PASS now: the
+                        # 3-temperature consistency vote defaulted to 3
+                        # extra LLM calls per run for marginal benefit, so
+                        # ``critic_samples`` defaults to 1.  A user can
+                        # disable the critic entirely via ``critic_enabled``.
+                        if not bool(ui_cfg.get("critic_enabled", True)):
+                            raise RuntimeError("critic disabled by config")
                         critic_llm = get_llm(temperature=0.0)
                         critiqued, reflection_records = run_reflective_critic(
                             pm_decision, ticker=ticker, llm=critic_llm,
                             max_iterations=int(ui_cfg.get("critic_iterations", 2)),
-                            consistency_samples=int(ui_cfg.get("critic_samples", 3)),
+                            consistency_samples=int(ui_cfg.get("critic_samples", 1)),
                         )
                         if reflection_records:
                             self._emit(make_event(
@@ -998,7 +1197,13 @@ class AnalysisRunner:
                             ))
                         pm_decision = critiqued
                     except Exception as critic_exc:
-                        if not short_circuited:
+                        # Intentional skips (cascade override, critic
+                        # disabled) pass the PM decision through untouched
+                        # without a scary traceback in the logs.
+                        msg = str(critic_exc)
+                        if short_circuited or "critic disabled" in msg:
+                            logger.info("Reflective critic skipped: %s", msg)
+                        else:
                             logger.exception("Reflective critic failed; using PM decision unchanged")
 
                     proposal = portfolio_decision_to_action_proposal(
@@ -1103,13 +1308,9 @@ def get_agent_catalog() -> List[Dict[str, Any]]:
     """Agent layout for the workflow diagram + tool checkboxes."""
     layout = [
         ("market_analyst", "Market Analyst", "analyst"),
-        ("social_analyst", "Social Analyst", "analyst"),
         ("news_analyst", "News Analyst", "analyst"),
         ("fundamentals_analyst", "Fundamentals Analyst", "analyst"),
         ("macro_analyst", "Macro Analyst", "analyst"),
-        ("geopolitical_analyst", "Geopolitical Analyst", "analyst"),
-        ("sector_analyst", "Sector / Peer Analyst", "analyst"),
-        ("quant_analyst", "Quant / Options Analyst", "analyst"),
         ("bull_researcher", "Bullish Researcher", "bull"),
         ("bear_researcher", "Bearish Researcher", "bear"),
         ("research_manager", "Research Manager", "manager"),

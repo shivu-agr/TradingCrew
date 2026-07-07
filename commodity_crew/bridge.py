@@ -26,10 +26,20 @@ from trading_crew.schemas import PortfolioDecision
 from .schemas import FuturesDecision
 
 
+# FuturesDecision uses the futures-idiomatic ``LONG`` / ``NEUTRAL`` /
+# ``SHORT`` action alphabet.  PortfolioDecision (the shared schema) now
+# uses the retail 5-tier ``STRONG_BUY`` / ``BUY`` / ``HOLD`` / ``SELL`` /
+# ``STRONG_SELL``.  We collapse LONG→BUY and SHORT→SELL (not to the
+# STRONG_* tiers, since the FuturesDecision doesn't carry a separate
+# conviction bit — it only exposes ``confidence``, which the equity
+# schema already carries).  Downstream code that wants the higher tier
+# for a very confident futures bet can promote the label post-hoc based
+# on ``confidence`` + ``size_pct_of_book``, but by default we keep it
+# conservative to avoid over-signalling to the UI.
 _ACTION_MAP: Dict[str, str] = {
-    "LONG": "OVERWEIGHT",
-    "NEUTRAL": "NEUTRAL",
-    "SHORT": "UNDERWEIGHT",
+    "LONG": "BUY",
+    "NEUTRAL": "HOLD",
+    "SHORT": "SELL",
 }
 
 
@@ -38,7 +48,7 @@ def futures_decision_to_portfolio_decision(fd: FuturesDecision) -> PortfolioDeci
     either in the typed PortfolioDecision schema or embedded into the
     rationale + key_drivers/key_risks so nothing is silently dropped.
     """
-    action = _ACTION_MAP.get(fd.action, "NEUTRAL")
+    action = _ACTION_MAP.get(fd.action, "HOLD")
     futures_context = (
         f"Contract: {fd.contract_month} ({fd.contract_size:.0f}/contract). "
         f"Curve: {fd.curve_view} (annualised roll {fd.roll_yield_pct_annualised:+.2f}%)."

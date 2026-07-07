@@ -229,6 +229,85 @@
                     x-text="tavily ? 'configured' : 'missing'"></span>.
             </p>
 
+            <!-- ============ Serve a local model (base / RLMF LoRA) ============ -->
+            <!-- Launch a local vLLM server with or without the RLMF LoRA
+                 adapter, straight from the sidebar.  On success the served
+                 endpoint(s) register as presets in the "Active model"
+                 dropdown above (marked "Served · …"), so the base and the
+                 fine-tuned model are both selectable for runs. -->
+            <div class="mt-4 pt-3 border-t border-ink-800">
+              <div class="flex items-center justify-between mb-1">
+                <label class="cfg-l mb-0">Serve a local model</label>
+                <button @click="refreshRlmfServe(); loadRlmfAdapters()"
+                        class="text-[10px] text-slate-500 hover:text-slate-300">refresh</button>
+              </div>
+              <p class="text-[10px] text-slate-500 mb-2 leading-snug">
+                Runs <code>vllm_serve.sh</code> and registers the model above so you can select it for a run
+                (base or RLMF-LoRA-tuned). One managed server at a time.
+                <span class="text-amber-300/80">Single GPU: this spins up a <em>second</em> vLLM, so it needs free VRAM —
+                serve a small model (lower <em>gpu mem util</em> / <em>max seqs</em>) or stop the primary model first.</span>
+              </p>
+              <div class="space-y-1.5">
+                <select x-model="rlmfServe.mode"
+                        class="w-full bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] text-slate-200">
+                  <option value="with_lora">Base + RLMF LoRA (tuned)</option>
+                  <option value="base">Base only</option>
+                </select>
+                <input list="rlmfBaseModelList" type="text" x-model="rlmfServe.base_model"
+                       placeholder="Base model HF id (e.g. Qwen/Qwen3-32B)"
+                       class="w-full bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] text-slate-200 font-mono" />
+                <div class="grid grid-cols-2 gap-1.5">
+                  <input type="number" x-model.number="rlmfServe.port" placeholder="port (8091)"
+                         class="w-full bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] text-slate-200" />
+                  <input type="number" x-model.number="rlmfServe.max_model_len" placeholder="max len (opt.)"
+                         class="w-full bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] text-slate-200" />
+                  <input type="number" step="0.01" min="0.01" max="0.99" x-model.number="rlmfServe.gpu_mem_util" placeholder="gpu mem util (0.90)"
+                         class="w-full bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] text-slate-200" />
+                  <input type="number" min="1" x-model.number="rlmfServe.max_num_seqs" placeholder="max seqs (opt.)"
+                         class="w-full bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] text-slate-200" />
+                </div>
+                <input type="text" x-model="rlmfServe.adapter_dir"
+                       x-show="rlmfServe.mode === 'with_lora'"
+                       :placeholder="rlmfAdapters?.adapter_dir ? ('adapter dir (default: ' + rlmfAdapters.adapter_dir + ')') : 'adapter dir (optional)'"
+                       class="w-full bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] text-slate-200 font-mono" />
+              </div>
+
+              <!-- Adapter readiness — the #1 reason "load LoRA" fails is that
+                   no adapter has been trained yet. -->
+              <p x-show="rlmfServe.mode === 'with_lora' && rlmfAdapters && !rlmfAdapters.ready"
+                 class="text-[10px] text-amber-300 mt-1.5 leading-snug">
+                ⚠ No trained adapter at <code x-text="rlmfAdapters?.adapter_dir || '(default)'"></code>.
+                Fine-tune one in the <strong>RL Training</strong> tab first, or switch to “Base only”.
+              </p>
+              <p x-show="rlmfServe.mode === 'with_lora' && rlmfAdapters && rlmfAdapters.ready"
+                 class="text-[10px] text-emerald-300/80 mt-1.5 leading-snug">
+                ✓ Adapter ready<span x-show="rlmfAdapters?.base_model"> (trained on <code x-text="rlmfAdapters?.base_model"></code>)</span>.
+              </p>
+
+              <div class="flex items-center gap-2 mt-2">
+                <button @click="startRlmfServe()"
+                        :disabled="rlmfLoading.serveStart || (rlmfServeStatus && rlmfServeStatus.running)"
+                        class="flex-1 rounded px-2 py-1.5 text-[12px] font-medium bg-emerald-500/20 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-500/30 disabled:opacity-50">
+                  <span x-show="!rlmfLoading.serveStart && !(rlmfServeStatus && rlmfServeStatus.running)">Load model</span>
+                  <span x-show="rlmfLoading.serveStart">Launching…</span>
+                  <span x-show="rlmfServeStatus && rlmfServeStatus.running && !rlmfLoading.serveStart">Serving</span>
+                </button>
+                <button x-show="rlmfServeStatus && rlmfServeStatus.running" @click="stopRlmfServe()"
+                        class="rounded px-2 py-1.5 text-[12px] bg-rose-500/15 border border-rose-500/40 text-rose-200 hover:bg-rose-500/25">Stop</button>
+              </div>
+
+              <div x-show="rlmfServeStatus && rlmfServeStatus.running" class="mt-1.5 text-[10px]">
+                <span :class="rlmfServeStatus?.ready ? 'text-emerald-300' : 'text-amber-300'"
+                      x-text="rlmfServeStatus?.ready ? '● ready' : '● starting…'"></span>
+                <span class="text-slate-500 font-mono" x-text="rlmfServeStatus?.base_url"></span>
+              </div>
+              <div x-show="rlmfServeStatus && !rlmfServeStatus.running && rlmfServeStatus.log_tail" class="mt-1.5">
+                <div class="text-[10px] uppercase text-rose-400 mb-0.5">Server exited — log tail</div>
+                <pre class="bg-ink-950/70 border border-rose-500/30 rounded p-2 font-mono text-[10px] text-rose-200 max-h-32 overflow-auto whitespace-pre-wrap" x-text="rlmfServeStatus?.log_tail"></pre>
+              </div>
+              <div x-show="rlmfError" class="mt-1.5 text-[10px] text-rose-300" x-text="rlmfError"></div>
+            </div>
+
             <!-- ============ Embedding model picker ============ -->
             <div class="mt-4 pt-3 border-t border-ink-800"
                  :class="{ 'opacity-50': !form.memory }">
@@ -301,6 +380,68 @@
           </div>
         </div>
 
+        <!-- =========== Active sessions (in-flight + recent background runs) =========== -->
+        <div class="section" :class="{ 'is-open': openSections.sessions !== false }">
+          <button class="section-header" @click="openSections.sessions = !(openSections.sessions !== false)">
+            <span class="flex items-center gap-2">
+              <span class="section-title">Sessions</span>
+              <span class="text-[10px] text-slate-500 normal-case font-mono"
+                    x-text="sessions?.filter(s => s.status === 'running').length
+                              ? `${sessions.filter(s=>s.status==='running').length} running · ${sessions.length} total`
+                              : `${sessions?.length || 0} total`"></span>
+            </span>
+            <svg class="chev size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+            </svg>
+          </button>
+          <div class="section-body">
+            <p class="text-[10.5px] text-slate-500 leading-snug mb-2">
+              Each "Run analysis" click queues a background session. Runs keep
+              executing even if you refresh the page, close the tab, or start
+              another ticker — click a session below to view its live diagram.
+            </p>
+            <div class="space-y-1 max-h-72 overflow-y-auto">
+              <template x-for="s in sessions" :key="s.run_id">
+                <div class="rounded-md border px-2.5 py-1.5 transition"
+                     :class="s.run_id === activeRunId
+                              ? 'border-blue-500 bg-blue-500/10'
+                              : 'border-ink-700 bg-ink-900/50 hover:bg-ink-900'">
+                  <button @click="attachToSession(s.run_id)"
+                          class="w-full text-left">
+                    <div class="flex items-center justify-between gap-2 text-[11px] font-mono">
+                      <span class="text-slate-200 font-semibold" x-text="s.ticker"></span>
+                      <span class="text-[10px] px-1.5 py-0.5 rounded font-semibold uppercase tracking-wider"
+                            :class="sessionStatusClass(s.status)"
+                            x-text="s.status"></span>
+                    </div>
+                    <div class="text-[10px] text-slate-500 mt-0.5 font-mono flex items-center justify-between">
+                      <span x-text="(s.started_at || '').slice(11, 19)"></span>
+                      <span x-show="s.final_action"
+                            class="text-emerald-300 uppercase"
+                            x-text="displayAction(s.final_action)"></span>
+                    </div>
+                    <div class="text-[10px] text-rose-400 mt-0.5 truncate" x-show="s.error" x-text="s.error"></div>
+                  </button>
+                  <div class="flex items-center justify-between mt-1 text-[10px]">
+                    <span class="text-slate-600 font-mono" x-text="`#${s.run_id.slice(0, 12)}`"></span>
+                    <div class="flex items-center gap-2">
+                      <button x-show="s.status === 'running' || s.status === 'queued'"
+                              @click.stop="cancelSpecificRun(s.run_id)"
+                              class="text-amber-400/80 hover:text-amber-300">Cancel</button>
+                      <button x-show="s.status !== 'running' && s.status !== 'queued'"
+                              @click.stop="removeSession(s.run_id)"
+                              class="text-rose-400/80 hover:text-rose-300">Remove</button>
+                    </div>
+                  </div>
+                </div>
+              </template>
+              <div x-show="!sessions?.length" class="text-[11px] text-slate-500 italic py-3 text-center">
+                No background sessions. Hit "Run analysis" to start one.
+              </div>
+            </div>
+          </div>
+        </div>
+
         <!-- =========== Recent runs (Phase E) =========== -->
         <div class="section" :class="{ 'is-open': openSections.runs }">
           <button class="section-header" @click="toggle('runs'); if (openSections.runs) loadRecentRuns()">
@@ -321,13 +462,15 @@
                         class="w-full text-left rounded-md border border-ink-700 bg-ink-900/50 hover:bg-ink-900 px-2.5 py-1.5 transition">
                   <div class="flex items-center justify-between gap-2 text-[11px] font-mono">
                     <span class="text-slate-200 font-semibold" x-text="r.ticker"></span>
-                    <span class="text-[10px] px-1.5 py-0.5 rounded"
+                    <span class="text-[10px] px-1.5 py-0.5 rounded font-semibold"
                           :class="{
-                            'bg-emerald-500/20 text-emerald-300': r.final_action === 'OVERWEIGHT',
-                            'bg-rose-500/20 text-rose-300': r.final_action === 'UNDERWEIGHT',
-                            'bg-slate-500/20 text-slate-300': r.final_action === 'NEUTRAL' || !r.final_action,
+                            'bg-emerald-500/30 text-emerald-200': r.final_action === 'STRONG_BUY',
+                            'bg-emerald-500/20 text-emerald-300': r.final_action === 'BUY' || r.final_action === 'OVERWEIGHT',
+                            'bg-slate-500/20 text-slate-300': r.final_action === 'HOLD' || r.final_action === 'NEUTRAL' || !r.final_action,
+                            'bg-rose-500/20 text-rose-300': r.final_action === 'SELL' || r.final_action === 'UNDERWEIGHT',
+                            'bg-rose-500/30 text-rose-200': r.final_action === 'STRONG_SELL',
                           }"
-                          x-text="r.final_action || '?'"></span>
+                          x-text="displayAction(r.final_action) || '?'"></span>
                   </div>
                   <div class="text-[10px] text-slate-500 mt-0.5 font-mono" x-text="(r.started_at || '').slice(0, 16).replace('T', ' ')"></div>
                   <div class="text-[10px] mt-0.5"
@@ -417,6 +560,40 @@
                     </div>
                   </span>
                 </label>
+
+                <!-- Optional advisory reviewers + critic (default off/lean) -->
+                <label class="checkbox mt-3 flex items-start gap-2">
+                  <input type="checkbox" x-model="form.quality_review" class="mt-1" />
+                  <span class="flex-1">
+                    <span>Quality Review (advisory)</span>
+                    <div class="cfg-hint mt-1">
+                      Audits the thesis for evidence-grounding. Runs async
+                      and advises the PM (right-sizes, never forces HOLD).
+                      Off by default.
+                    </div>
+                  </span>
+                </label>
+                <label class="checkbox mt-3 flex items-start gap-2">
+                  <input type="checkbox" x-model="form.compliance" class="mt-1" />
+                  <span class="flex-1">
+                    <span>Compliance review (advisory)</span>
+                    <div class="cfg-hint mt-1">
+                      Sanctions / restricted-list / ESG gate. Runs async
+                      alongside Quality Review; advisory to the PM. Off by
+                      default.
+                    </div>
+                  </span>
+                </label>
+                <label class="checkbox mt-3 flex items-start gap-2">
+                  <input type="checkbox" x-model="form.critic_enabled" class="mt-1" />
+                  <span class="flex-1">
+                    <span>Reflective critic</span>
+                    <div class="cfg-hint mt-1">
+                      Single-pass self-audit of the final decision
+                      (fabricated-source + intent checks). On by default.
+                    </div>
+                  </span>
+                </label>
               </div>
             </div>
 
@@ -475,22 +652,31 @@
 
       <!-- =========== Sticky Run button at bottom =========== -->
       <div class="p-4 sticky bottom-0 bg-ink-800/95 backdrop-blur border-t border-ink-700">
+        <!-- Run is ALWAYS enabled (except during the POST round-trip) so a
+             new background session can be queued while others are still
+             running — the concurrency cap + queue live on the server. -->
         <button type="button"
                 @click="startRun()"
-                :disabled="isRunning"
-                class="w-full rounded-md py-2 text-sm font-semibold transition disabled:opacity-50 disabled:cursor-not-allowed"
-                :class="isRunning ? 'bg-ink-700 text-slate-400' : 'bg-blue-600 hover:bg-blue-500 text-white shadow shadow-blue-600/20'">
-          <span x-show="!isRunning">▶ Run analysis</span>
-          <span x-show="isRunning" class="inline-flex items-center gap-2 justify-center">
+                :disabled="starting"
+                class="w-full rounded-md py-2 text-sm font-semibold transition disabled:opacity-50 disabled:cursor-not-allowed bg-blue-600 hover:bg-blue-500 text-white shadow shadow-blue-600/20">
+          <span x-show="!starting">
+            <span x-show="activeSessionCount === 0">▶ Run analysis</span>
+            <span x-show="activeSessionCount > 0"
+                  x-text="`▶ Run another (${activeSessionCount} active)`"></span>
+          </span>
+          <span x-show="starting" class="inline-flex items-center gap-2 justify-center">
             <span class="size-1.5 rounded-full bg-white animate-pulse"></span>
-            Running…
+            Queuing…
           </span>
         </button>
-        <button x-show="isRunning"
-                @click="cancelRun()"
-                class="w-full mt-1.5 text-[11px] text-slate-500 hover:text-slate-300 py-1">
-          ■ Cancel
-        </button>
+        <!-- Live status of the session this tab is attached to. -->
+        <div x-show="isRunning" x-cloak class="mt-1.5 flex items-center justify-between text-[11px]">
+          <span class="inline-flex items-center gap-1.5 text-blue-200">
+            <span class="size-1.5 rounded-full bg-blue-300 animate-pulse"></span>
+            <span x-text="currentNode ? `Running · ${currentNode}` : 'Running…'"></span>
+          </span>
+          <button @click="cancelRun()" class="text-slate-500 hover:text-slate-300">■ Cancel</button>
+        </div>
       </div>
     </aside>
 
@@ -525,11 +711,11 @@
               <div class="text-[10px] uppercase tracking-wider text-slate-500">Final decision</div>
               <div class="text-xl font-bold tracking-tight"
                    :class="{
-                     'text-accent-bull': finalDecision === 'OVERWEIGHT',
-                     'text-accent-bear': finalDecision === 'UNDERWEIGHT',
-                     'text-accent-neutral': finalDecision === 'NEUTRAL',
+                     'text-accent-bull': finalDecision === 'STRONG_BUY' || finalDecision === 'BUY' || finalDecision === 'OVERWEIGHT',
+                     'text-accent-bear': finalDecision === 'STRONG_SELL' || finalDecision === 'SELL' || finalDecision === 'UNDERWEIGHT',
+                     'text-accent-neutral': finalDecision === 'HOLD' || finalDecision === 'NEUTRAL',
                    }"
-                   x-text="finalDecision"></div>
+                   x-text="displayAction(finalDecision)"></div>
             </div>
           </div>
         </div>
@@ -627,14 +813,17 @@
             </h2>
             <span class="text-[10px] font-bold uppercase px-2 py-0.5 rounded"
                   :class="{
-                    'bg-emerald-500/20 text-emerald-300': reflectionRecords?.final_action === 'OVERWEIGHT' || reflectionRecords?.final_action === 'NEUTRAL' && !reflectionRecords?.revised,
-                    'bg-rose-500/20 text-rose-300': reflectionRecords?.final_action === 'UNDERWEIGHT',
+                    'bg-emerald-500/30 text-emerald-200': reflectionRecords?.final_action === 'STRONG_BUY' && !reflectionRecords?.revised,
+                    'bg-emerald-500/20 text-emerald-300': (reflectionRecords?.final_action === 'BUY' || reflectionRecords?.final_action === 'OVERWEIGHT') && !reflectionRecords?.revised,
+                    'bg-slate-500/20 text-slate-300': (reflectionRecords?.final_action === 'HOLD' || reflectionRecords?.final_action === 'NEUTRAL') && !reflectionRecords?.revised,
+                    'bg-rose-500/20 text-rose-300': (reflectionRecords?.final_action === 'SELL' || reflectionRecords?.final_action === 'UNDERWEIGHT') && !reflectionRecords?.revised,
+                    'bg-rose-500/30 text-rose-200': reflectionRecords?.final_action === 'STRONG_SELL' && !reflectionRecords?.revised,
                     'bg-amber-500/20 text-amber-300': reflectionRecords?.revised,
                   }"
-                  x-text="reflectionRecords?.revised ? 'REVISED' : reflectionRecords?.final_action"></span>
+                  x-text="reflectionRecords?.revised ? 'REVISED' : displayAction(reflectionRecords?.final_action)"></span>
           </div>
           <p class="text-[11px] text-slate-500 mb-3" x-show="reflectionRecords?.revised">
-            The critic amended the Portfolio Manager's decision. Final action: <span class="text-amber-300 font-mono" x-text="reflectionRecords?.final_action"></span>, size: <span class="text-amber-300 font-mono" x-text="(reflectionRecords?.final_size_pct || 0).toFixed(2) + '%'"></span>.
+            The critic amended the Portfolio Manager's decision. Final action: <span class="text-amber-300 font-mono" x-text="displayAction(reflectionRecords?.final_action)"></span>, size: <span class="text-amber-300 font-mono" x-text="(reflectionRecords?.final_size_pct || 0).toFixed(2) + '%'"></span>.
           </p>
           <div class="space-y-2">
             <template x-for="(r, i) in reflectionRecords?.records || []" :key="i">
@@ -963,7 +1152,7 @@
       </section>
 
       <section x-show="activeTab === 'reports'" class="p-6 space-y-6">
-        <template x-for="r in reportList" :key="r.role">
+        <template x-for="r in reportList" :key="`${r.role}__round${r.round}`">
           <div class="rounded-xl border p-5"
                :class="r.degraded
                  ? 'border-amber-500/40 bg-amber-500/5'
@@ -971,6 +1160,10 @@
             <div class="flex items-center gap-2 mb-3">
               <span class="size-2 rounded-full" :style="`background:${r.color}`"></span>
               <h3 class="text-[11px] font-semibold uppercase tracking-wider text-slate-400" x-text="r.title"></h3>
+              <span x-show="r.totalRounds > 1"
+                    class="ml-1 inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider bg-sky-500/15 text-sky-300 border border-sky-500/30"
+                    :title="`Debate / risk round ${r.round} of ${r.totalRounds}. Each round is shown separately so you can see how the argument evolved.`"
+                    x-text="`R${r.round}/${r.totalRounds}`"></span>
               <span x-show="r.degraded"
                     class="ml-2 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider bg-amber-500/15 text-amber-300 border border-amber-500/30"
                     :title="'The LLM emitted a tool-call list as its final answer instead of a synthesized report. See body for details.'">
@@ -992,11 +1185,11 @@
               <div class="flex items-center gap-3">
                 <span class="text-2xl font-bold tracking-tight"
                       :class="{
-                        'text-accent-bull': decisionPayload.action === 'OVERWEIGHT',
-                        'text-accent-bear': decisionPayload.action === 'UNDERWEIGHT',
-                        'text-accent-neutral': decisionPayload.action === 'NEUTRAL',
+                        'text-accent-bull': decisionPayload.action === 'STRONG_BUY' || decisionPayload.action === 'BUY' || decisionPayload.action === 'OVERWEIGHT',
+                        'text-accent-bear': decisionPayload.action === 'STRONG_SELL' || decisionPayload.action === 'SELL' || decisionPayload.action === 'UNDERWEIGHT',
+                        'text-accent-neutral': decisionPayload.action === 'HOLD' || decisionPayload.action === 'NEUTRAL',
                       }"
-                      x-text="decisionPayload.action"></span>
+                      x-text="displayAction(decisionPayload.action)"></span>
                 <span class="px-2 py-0.5 rounded text-[10px] font-bold tracking-wider uppercase"
                       :class="{
                         'bg-emerald-500/15 text-emerald-300': decisionPayload.compliance_status === 'CLEAR',
@@ -1014,10 +1207,30 @@
               <div class="kv"><div class="k">Entry</div><div class="v" x-text="decisionPayload.entry_price"></div></div>
               <div class="kv"><div class="k">Stop</div><div class="v" x-text="decisionPayload.stop_loss"></div></div>
               <div class="kv"><div class="k">Target</div><div class="v" x-text="decisionPayload.target_price"></div></div>
-              <div class="kv"><div class="k">Horizon</div><div class="v" x-text="decisionPayload.horizon_days + 'd'"></div></div>
+              <div class="kv">
+                <div class="k">Horizon</div>
+                <div class="v" :title="horizonHumanLabel(decisionPayload.horizon || horizonFromDays(decisionPayload.horizon_days))">
+                  <span x-text="decisionPayload.horizon_days + 'd'"></span>
+                  <span class="ml-1 px-1.5 py-0.5 text-[10px] rounded"
+                        :class="{
+                          'bg-sky-500/25 text-sky-200': (decisionPayload.horizon || horizonFromDays(decisionPayload.horizon_days)) === 'SHORT',
+                          'bg-violet-500/25 text-violet-200': (decisionPayload.horizon || horizonFromDays(decisionPayload.horizon_days)) === 'MEDIUM',
+                          'bg-amber-500/25 text-amber-200': (decisionPayload.horizon || horizonFromDays(decisionPayload.horizon_days)) === 'LONG',
+                        }"
+                        x-text="decisionPayload.horizon || horizonFromDays(decisionPayload.horizon_days)"></span>
+                </div>
+              </div>
               <div class="kv"><div class="k">Exp. ret</div><div class="v" x-text="decisionPayload.expected_return_pct.toFixed(1) + '%'"></div></div>
             </div>
             <div class="mt-4 text-[13px] text-slate-300 leading-relaxed pm-rationale" x-text="decisionPayload.rationale"></div>
+            <div class="mt-3">
+              <div class="text-[10px] uppercase text-slate-500 mb-1"
+                   x-text="((decisionPayload.horizon || horizonFromDays(decisionPayload.horizon_days)) === 'LONG')
+                     ? 'Long-term thesis (5–10 year)'
+                     : 'Long-term view (context for this decision)'"></div>
+              <div class="text-[12px] text-amber-200/90 leading-relaxed p-2 rounded bg-amber-500/5 border border-amber-500/20"
+                   x-text="(decisionPayload.long_term_view || decisionPayload.long_term_thesis) || 'No long-term view was captured for this decision.'"></div>
+            </div>
             <div class="mt-3 grid lg:grid-cols-2 gap-3 text-[12px]">
               <div>
                 <div class="text-[10px] uppercase text-slate-500 mb-1">Key drivers</div>
@@ -1640,7 +1853,7 @@
       </section>
 
       <!-- L4: Reinforcement Learning Training Tab -->
-      <section x-show="activeTab === 'training'" x-init="loadRlRuns()" class="p-6 space-y-6">
+      <section x-show="activeTab === 'training'" x-init="loadRlRuns(); initRlmf()" class="p-6 space-y-6">
         <!-- Header / config / run controls -->
         <div class="rounded-xl border border-ink-700 bg-ink-800/30 p-5">
           <div class="flex items-start justify-between mb-4 gap-4">
@@ -1956,6 +2169,300 @@
               </tbody>
             </table>
           </div>
+        </div>
+
+        <!-- ============================================================= -->
+        <!-- RLMF — LLM fine-tune from market feedback (offline LoRA leg)   -->
+        <!-- ============================================================= -->
+        <div class="rounded-xl border border-indigo-500/30 bg-indigo-500/[0.04] p-5">
+          <div class="flex items-start justify-between mb-3 gap-4">
+            <div>
+              <h2 class="text-[11px] font-semibold uppercase tracking-wider text-indigo-300">
+                RLMF — LLM fine-tune from market feedback
+              </h2>
+              <p class="text-[11px] text-slate-500 mt-1 max-w-3xl">
+                Distils the desk's own realised-market feedback back into the LLM. Each resolved episode
+                becomes a <code class="text-slate-400">(state → decision)</code> row weighted by a market-alignment
+                reward (alpha × conviction × horizon). Training is <strong>reward-weighted LoRA SFT</strong>
+                (instruction distillation, FinGPT-Forecaster recipe) — <strong>not</strong> PPO/GRPO on the LLM.
+                The prompt-only few-shot surrogate already runs inside every workflow; this is the offline
+                adapter leg you can trigger on demand.
+              </p>
+            </div>
+            <button @click="loadRlmfDataset()" :disabled="rlmfLoading.dataset"
+                    class="text-[11px] text-slate-400 hover:text-slate-200 shrink-0">
+              <span x-show="!rlmfLoading.dataset">Refresh dataset</span>
+              <span x-show="rlmfLoading.dataset">…</span>
+            </button>
+          </div>
+
+          <!-- Dataset summary -->
+          <div class="grid grid-cols-2 md:grid-cols-4 gap-2 mb-4 text-[11px]">
+            <div class="bg-ink-900/50 border border-ink-700 rounded px-3 py-2">
+              <div class="text-slate-500 uppercase text-[10px]">Resolved rows</div>
+              <div class="text-slate-100 text-lg font-mono" x-text="rlmfSummary?.n_resolved ?? '—'"></div>
+            </div>
+            <template x-for="tier in ['SHORT','MEDIUM','LONG']" :key="tier">
+              <div class="bg-ink-900/50 border border-ink-700 rounded px-3 py-2">
+                <div class="text-slate-500 uppercase text-[10px]" x-text="tier + ' μ-reward'"></div>
+                <div class="text-slate-200 font-mono"
+                     x-text="rlmfSummary?.by_tier?.[tier] ? `${rlmfSummary.by_tier[tier].n} · ${rlmfSummary.by_tier[tier].mean_reward.toFixed(3)}` : '—'"></div>
+              </div>
+            </template>
+          </div>
+
+          <!-- Fine-tune config -->
+          <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
+            <div class="col-span-2">
+              <label class="text-[10px] uppercase text-slate-500 block">Base model (HF id)</label>
+              <input list="rlmfBaseModelList" type="text" x-model="rlmfLora.base_model"
+                     placeholder="Qwen/Qwen3-32B"
+                     class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] w-full text-slate-200 font-mono" />
+              <datalist id="rlmfBaseModelList">
+                <template x-for="m in rlmfBaseModels" :key="m"><option :value="m"></option></template>
+              </datalist>
+            </div>
+            <div>
+              <label class="text-[10px] uppercase text-slate-500 block">Symbol filter (opt.)</label>
+              <input type="text" x-model="rlmfLora.symbol" placeholder="all"
+                     class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] w-full text-slate-200 font-mono" />
+            </div>
+            <div>
+              <label class="text-[10px] uppercase text-slate-500 block">Epochs</label>
+              <input type="number" x-model.number="rlmfLora.epochs" min="1" max="10"
+                     class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] w-full text-slate-200" />
+            </div>
+            <div>
+              <label class="text-[10px] uppercase text-slate-500 block">Learning rate</label>
+              <input type="number" x-model.number="rlmfLora.learning_rate" step="0.0001"
+                     class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] w-full text-slate-200" />
+            </div>
+            <div>
+              <label class="text-[10px] uppercase text-slate-500 block">LoRA rank (r)</label>
+              <input type="number" x-model.number="rlmfLora.lora_r" min="1" max="128"
+                     class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] w-full text-slate-200" />
+            </div>
+            <div>
+              <label class="text-[10px] uppercase text-slate-500 block">LoRA alpha</label>
+              <input type="number" x-model.number="rlmfLora.lora_alpha" min="1" max="256"
+                     class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] w-full text-slate-200" />
+            </div>
+            <div>
+              <label class="text-[10px] uppercase text-slate-500 block">Max seq len</label>
+              <input type="number" x-model.number="rlmfLora.max_seq_len" min="256" max="8192" step="256"
+                     class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[12px] w-full text-slate-200" />
+            </div>
+          </div>
+
+          <div class="flex items-center gap-3 flex-wrap">
+            <button @click="exportRlmfDataset()" :disabled="rlmfLoading.export"
+                    class="px-3 py-1.5 bg-slate-500/15 border border-slate-500/40 text-slate-200 rounded text-[12px] hover:bg-slate-500/25 disabled:opacity-50">
+              <span x-show="!rlmfLoading.export">Export dataset JSONL</span>
+              <span x-show="rlmfLoading.export">Exporting…</span>
+            </button>
+            <button @click="startRlmfLora()"
+                    :disabled="rlmfLoading.loraStart || (rlmfLoraStatus && rlmfLoraStatus.active) || !rlmfLora.base_model"
+                    class="px-3 py-1.5 bg-indigo-500/20 border border-indigo-500/40 text-indigo-200 rounded text-[12px] hover:bg-indigo-500/30 disabled:opacity-50">
+              <span x-show="!rlmfLoading.loraStart && !(rlmfLoraStatus && rlmfLoraStatus.active)">Start fine-tune</span>
+              <span x-show="rlmfLoading.loraStart">Launching…</span>
+              <span x-show="rlmfLoraStatus && rlmfLoraStatus.active && !rlmfLoading.loraStart">Training…</span>
+            </button>
+            <button @click="stopRlmfLora()" :disabled="!(rlmfLoraStatus && rlmfLoraStatus.active)"
+                    class="px-3 py-1.5 bg-rose-500/15 border border-rose-500/40 text-rose-200 rounded text-[12px] hover:bg-rose-500/25 disabled:opacity-40">Stop</button>
+            <div class="ml-auto text-[11px] text-slate-500" x-show="rlmfLoraStatus && rlmfLoraStatus.job_id">
+              Job <code class="text-slate-300" x-text="rlmfLoraStatus?.job_id"></code> ·
+              <span x-text="rlmfLoraStatus?.status"></span> ·
+              <span x-text="`${Math.round(rlmfLoraStatus?.elapsed_sec || 0)}s`"></span>
+            </div>
+          </div>
+
+          <div x-show="rlmfError" class="mt-3 rounded-md bg-rose-500/10 border border-rose-500/30 p-3 text-[12px] text-rose-200" x-text="rlmfError"></div>
+          <div x-show="rlmfLoraStatus && rlmfLoraStatus.status === 'failed' && rlmfLoraStatus.error"
+               class="mt-3 rounded-md bg-rose-500/10 border border-rose-500/30 p-3 text-[11px] text-rose-200">
+            <div class="uppercase text-[10px] text-rose-400 mb-1">Fine-tune failed</div>
+            <pre class="whitespace-pre-wrap font-mono text-[10.5px] max-h-48 overflow-auto" x-text="rlmfLoraStatus?.error"></pre>
+          </div>
+          <div x-show="rlmfLoraStatus && rlmfLoraStatus.adapter_dir" class="mt-3 text-[11px] text-emerald-300">
+            Adapter saved: <code x-text="rlmfLoraStatus?.adapter_dir"></code>
+          </div>
+
+          <!-- Live training log tail -->
+          <div x-show="rlmfLoraStatus && (rlmfLoraStatus.logs || []).length" class="mt-3">
+            <div class="text-[10px] uppercase text-slate-500 mb-1">Training log</div>
+            <div class="bg-ink-950/70 border border-ink-700 rounded p-2 font-mono text-[10px] text-slate-400 max-h-40 overflow-y-auto">
+              <template x-for="(l, i) in (rlmfLoraStatus?.logs || []).slice(-40)" :key="i">
+                <div x-text="`step ${l.step ?? '?'}/${l.max_steps ?? '?'} · loss=${(l.loss ?? l.train_loss ?? '—')} · lr=${l.learning_rate ?? '—'}`"></div>
+              </template>
+            </div>
+          </div>
+        </div>
+
+        <!-- ============================================================= -->
+        <!-- Serve model for inference — configured from the sidebar        -->
+        <!-- ============================================================= -->
+        <div class="rounded-xl border border-emerald-500/30 bg-emerald-500/[0.04] p-5">
+          <div class="flex items-start justify-between gap-4">
+            <div>
+              <h2 class="text-[11px] font-semibold uppercase tracking-wider text-emerald-300">
+                Serve model for inference (base / base + LoRA)
+              </h2>
+              <p class="text-[11px] text-slate-500 mt-1 max-w-3xl">
+                Loading the base or the RLMF-LoRA-tuned model for inference now lives in the
+                <strong>left sidebar → LLM → “Serve a local model”</strong> panel, right next to the model
+                picker. Once healthy, the served endpoint(s) appear in the <strong>Active model</strong>
+                dropdown as <em>Served · … (base)</em> / <em>Served · … + RLMF LoRA</em>.
+              </p>
+            </div>
+            <button @click="refreshRlmfServe()" class="text-[11px] text-slate-400 hover:text-slate-200 shrink-0">Refresh</button>
+          </div>
+          <div class="mt-3 text-[11px]" x-show="rlmfServeStatus && rlmfServeStatus.running">
+            <span class="text-slate-500">Currently serving:</span>
+            <code class="text-slate-300" x-text="rlmfServeStatus?.base_model"></code>
+            <span class="mx-1 text-slate-600">·</span>
+            <span :class="rlmfServeStatus?.ready ? 'text-emerald-300' : 'text-amber-300'"
+                  x-text="rlmfServeStatus?.ready ? 'ready' : 'starting…'"></span>
+            <span class="text-slate-500 font-mono" x-text="` · ${rlmfServeStatus?.base_url || ''}`"></span>
+            <span x-show="rlmfServeStatus?.served_models" class="block mt-1 text-slate-400">
+              models: <code x-text="(rlmfServeStatus?.served_models || []).join(', ')"></code>
+            </span>
+          </div>
+          <div class="mt-3 text-[11px] text-slate-500" x-show="!(rlmfServeStatus && rlmfServeStatus.running)">
+            No model is being served right now.
+          </div>
+          <div x-show="rlmfServeStatus && !rlmfServeStatus.running && rlmfServeStatus.log_tail" class="mt-2">
+            <div class="text-[10px] uppercase text-rose-400 mb-1">Last server exited — log tail</div>
+            <pre class="bg-ink-950/70 border border-rose-500/30 rounded p-2 font-mono text-[10px] text-rose-200 max-h-40 overflow-auto whitespace-pre-wrap" x-text="rlmfServeStatus?.log_tail"></pre>
+          </div>
+        </div>
+
+        <!-- ============================================================= -->
+        <!-- Training data — episodes                                      -->
+        <!-- ============================================================= -->
+        <div class="rounded-xl border border-ink-700 bg-ink-800/30 p-5">
+          <div class="flex items-center justify-between mb-3 gap-3 flex-wrap">
+            <div class="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+              Training data — episodes
+              <span class="text-slate-500 normal-case font-normal ml-2"
+                    x-show="rlmfEpisodeData"
+                    x-text="`(${rlmfEpisodeData?.counts?.RESOLVED || 0} resolved · ${rlmfEpisodeData?.counts?.PENDING || 0} pending · ${rlmfEpisodeData?.total || 0} total)`"></span>
+            </div>
+            <div class="flex items-center gap-2 flex-wrap">
+              <button @click="seedRlmfSample()" :disabled="rlmfLoading.sample"
+                      class="px-2 py-1 text-[11px] bg-indigo-500/15 border border-indigo-500/40 text-indigo-200 rounded hover:bg-indigo-500/25 disabled:opacity-50">
+                <span x-show="!rlmfLoading.sample">Load sample data</span>
+                <span x-show="rlmfLoading.sample">…</span>
+              </button>
+              <button x-show="rlmfEpisodeData && rlmfEpisodeData.sample_count > 0"
+                      @click="clearRlmfSample()" :disabled="rlmfLoading.sample"
+                      class="px-2 py-1 text-[11px] bg-rose-500/10 border border-rose-500/30 text-rose-200 rounded hover:bg-rose-500/20 disabled:opacity-50"
+                      x-text="`Clear sample (${rlmfEpisodeData?.sample_count})`"></button>
+              <input type="text" x-model="rlmfEpisodeFilter.symbol" @keydown.enter="loadRlmfEpisodes()" placeholder="symbol"
+                     class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[11px] text-slate-200 font-mono w-28" />
+              <select x-model="rlmfEpisodeFilter.status" @change="loadRlmfEpisodes()"
+                      class="bg-ink-900 border border-ink-700 rounded px-2 py-1 text-[11px] text-slate-200">
+                <option value="">all status</option>
+                <option value="RESOLVED">resolved</option>
+                <option value="PENDING">pending</option>
+                <option value="ABANDONED">abandoned</option>
+              </select>
+              <button @click="loadRlmfEpisodes()" :disabled="rlmfLoading.episodes" class="text-[11px] text-slate-400 hover:text-slate-200">
+                <span x-show="!rlmfLoading.episodes">Refresh</span>
+                <span x-show="rlmfLoading.episodes">…</span>
+              </button>
+            </div>
+          </div>
+          <p x-show="rlmfEpisodeData && rlmfEpisodeData.sample_count > 0" class="text-[11px] text-indigo-300/80 mb-2">
+            <span x-text="`${rlmfEpisodeData?.sample_count} SAMPLE episodes present`"></span> — synthetic rows for testing the RLMF loop. Clear them before training on real data only.
+          </p>
+          <div x-show="!(rlmfEpisodeData && rlmfEpisodeData.episodes.length)" class="text-[12px] text-slate-500">
+            No episodes recorded yet — run analyses (each decision writes a PENDING episode). Once their
+            outcome window elapses, resolve them (Memory tab → Resolve outcomes) to make them RLMF training rows.
+          </div>
+
+          <!-- Kaggle-style column summary over the loaded rows. -->
+          <div x-show="rlmfEpisodeData && rlmfEpisodeData.episodes.length"
+               class="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3 text-[11px]">
+            <div class="bg-ink-900/50 border border-ink-700 rounded px-3 py-2">
+              <div class="text-slate-500 uppercase text-[10px] mb-1">Outcome status (all)</div>
+              <template x-for="kv in [['resolved', rlmfEpisodeData?.counts?.RESOLVED||0],['pending', rlmfEpisodeData?.counts?.PENDING||0],['abandoned', rlmfEpisodeData?.counts?.ABANDONED||0]]" :key="kv[0]">
+                <div class="flex items-center justify-between"><span class="text-slate-400" x-text="kv[0]"></span><span class="text-slate-200 font-mono" x-text="kv[1]"></span></div>
+              </template>
+            </div>
+            <div class="bg-ink-900/50 border border-ink-700 rounded px-3 py-2">
+              <div class="text-slate-500 uppercase text-[10px] mb-1">Action (shown)</div>
+              <template x-for="kv in Object.entries(rlmfEpisodeStats.actions)" :key="kv[0]">
+                <div class="flex items-center justify-between"><span class="text-slate-400" x-text="kv[0]"></span><span class="text-slate-200 font-mono" x-text="kv[1]"></span></div>
+              </template>
+            </div>
+            <div class="bg-ink-900/50 border border-ink-700 rounded px-3 py-2">
+              <div class="text-slate-500 uppercase text-[10px] mb-1">Regime (shown)</div>
+              <template x-for="kv in Object.entries(rlmfEpisodeStats.regimes)" :key="kv[0]">
+                <div class="flex items-center justify-between"><span class="text-slate-400" x-text="kv[0]"></span><span class="text-slate-200 font-mono" x-text="kv[1]"></span></div>
+              </template>
+            </div>
+            <div class="bg-ink-900/50 border border-ink-700 rounded px-3 py-2">
+              <div class="text-slate-500 uppercase text-[10px] mb-1">Realised return (resolved)</div>
+              <template x-if="rlmfEpisodeStats.resolved.n">
+                <div>
+                  <div class="flex items-center justify-between"><span class="text-slate-400">mean</span><span class="font-mono" :class="rlmfEpisodeStats.resolved.mean >= 0 ? 'text-emerald-300':'text-rose-300'" x-text="rlmfPct(rlmfEpisodeStats.resolved.mean)"></span></div>
+                  <div class="flex items-center justify-between"><span class="text-slate-400">min / max</span><span class="text-slate-300 font-mono" x-text="rlmfPct(rlmfEpisodeStats.resolved.min)+' / '+rlmfPct(rlmfEpisodeStats.resolved.max)"></span></div>
+                  <div class="flex items-center justify-between"><span class="text-slate-400">avg conv.</span><span class="text-slate-300 font-mono" x-text="rlmfEpisodeStats.convictionAvg==null?'—':rlmfEpisodeStats.convictionAvg.toFixed(2)"></span></div>
+                </div>
+              </template>
+              <div x-show="!rlmfEpisodeStats.resolved.n" class="text-slate-600">no resolved rows</div>
+            </div>
+          </div>
+
+          <!-- Scrollable table (Kaggle-style): sticky header, capped height,
+               so the whole page doesn't grow with hundreds of episodes. -->
+          <div x-show="rlmfEpisodeData && rlmfEpisodeData.episodes.length"
+               class="overflow-auto max-h-[440px] rounded border border-ink-800">
+            <table class="text-[11px] w-full font-mono">
+              <thead class="text-slate-500 uppercase border-b border-ink-700 sticky top-0 bg-ink-900 z-10">
+                <tr>
+                  <th class="text-left py-1.5 pr-3">Symbol</th>
+                  <th class="text-left py-1.5 pr-3">Decision</th>
+                  <th class="text-left py-1.5 pr-3">Status</th>
+                  <th class="text-left py-1.5 pr-3">Action</th>
+                  <th class="text-right py-1.5 pr-3">Conv.</th>
+                  <th class="text-right py-1.5 pr-3">Horizon</th>
+                  <th class="text-right py-1.5 pr-3">Realised</th>
+                  <th class="text-right py-1.5 pr-3">Alpha</th>
+                  <th class="text-left py-1.5">Regime</th>
+                </tr>
+              </thead>
+              <tbody>
+                <template x-for="ep in (rlmfEpisodeData?.episodes || [])" :key="ep.episode_id">
+                  <tr class="border-b border-ink-800 hover:bg-ink-800/40 cursor-pointer" @click="rlmfExpanded = (rlmfExpanded === ep.episode_id ? null : ep.episode_id)">
+                    <td class="py-1.5 pr-3 text-slate-300" x-text="ep.symbol"></td>
+                    <td class="py-1.5 pr-3 text-slate-400" x-text="(ep.decision_ts || '').slice(0,10)"></td>
+                    <td class="py-1.5 pr-3">
+                      <span class="px-1.5 py-0.5 rounded text-[10px] uppercase"
+                            :class="{
+                              'bg-emerald-500/20 text-emerald-200': ep.outcome_status === 'RESOLVED',
+                              'bg-amber-500/20 text-amber-200': ep.outcome_status === 'PENDING',
+                              'bg-slate-500/20 text-slate-300': ep.outcome_status === 'ABANDONED',
+                            }" x-text="ep.outcome_status"></span>
+                    </td>
+                    <td class="py-1.5 pr-3 text-slate-300" x-text="ep.action || '—'"></td>
+                    <td class="py-1.5 pr-3 text-right text-slate-400" x-text="ep.conviction_score != null ? Number(ep.conviction_score).toFixed(2) : '—'"></td>
+                    <td class="py-1.5 pr-3 text-right text-slate-400" x-text="ep.horizon_days != null ? ep.horizon_days + 'd' : '—'"></td>
+                    <td class="py-1.5 pr-3 text-right"
+                        :class="ep.realised_return == null ? 'text-slate-600' : (ep.realised_return >= 0 ? 'text-emerald-300' : 'text-rose-300')"
+                        x-text="ep.realised_return == null ? '—' : (ep.realised_return * 100).toFixed(2) + '%'"></td>
+                    <td class="py-1.5 pr-3 text-right"
+                        :class="ep.alpha_return == null ? 'text-slate-600' : (ep.alpha_return >= 0 ? 'text-emerald-300' : 'text-rose-300')"
+                        x-text="ep.alpha_return == null ? '—' : (ep.alpha_return * 100).toFixed(2) + '%'"></td>
+                    <td class="py-1.5 text-slate-500" x-text="ep.regime"></td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+          <template x-if="rlmfExpanded">
+            <div class="mt-3 bg-ink-900/50 border border-ink-700 rounded p-3 text-[11px] text-slate-400 whitespace-pre-wrap"
+                 x-text="(rlmfEpisodeData.episodes.find(e => e.episode_id === rlmfExpanded) || {}).state_summary || ''"></div>
+          </template>
         </div>
       </section>
 

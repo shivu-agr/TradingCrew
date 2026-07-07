@@ -155,7 +155,15 @@ def test_backtest_setup_is_ticker_agnostic() -> None:
     """
     src = _read(ROOT / "trading_crew" / "tools.py")
     # Extract the function body (until the next @tool or top-level def).
-    m = re.search(r"@tool\(\"backtest_setup\"\)\ndef backtest_setup.*?(?=\n@tool|\n# ---)", src, re.S)
+    # The decorator stack may include other inner decorators between
+    # the ``@tool("backtest_setup")`` line and the ``def backtest_setup``
+    # signature (e.g. ``@_memoize_tool`` added for per-process result
+    # dedup) — match any line of decorators in between.
+    m = re.search(
+        r"@tool\(\"backtest_setup\"\)\n(?:@[^\n]+\n)*def backtest_setup.*?(?=\n@tool|\n# ---)",
+        src,
+        re.S,
+    )
     assert m, "backtest_setup not found"
     body = m.group(0)
     forbidden = [

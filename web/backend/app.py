@@ -13,9 +13,10 @@ import asyncio
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, AsyncIterator, Dict, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
@@ -29,6 +30,12 @@ load_dotenv(PROJECT_ROOT / ".env")
 from .charts import SUPPORTED_INDICATORS, build_chart_payload  # noqa: E402
 from .logging_setup import configure_logging  # noqa: E402
 from .runner import AnalysisRunner, get_agent_catalog, get_tool_catalog  # noqa: E402
+from .session_manager import (  # noqa: E402
+    _EOF,
+    RunStatus,
+    get_session_manager,
+    init_session_manager,
+)
 
 # Install stdout + rotating-file logging before any module-level
 # logger calls happen.  See ``logging_setup.py`` for the env knobs.
@@ -40,12 +47,46 @@ BACKEND_DIR = Path(__file__).resolve().parent
 FRONTEND_DIR = BACKEND_DIR.parent / "frontend"
 
 
-app = FastAPI(title="TradingCrew UI", version="0.2.0")
+@asynccontextmanager
+async def _lifespan(app_: FastAPI) -> AsyncIterator[None]:
+    """FastAPI lifespan hook.
+
+    Binds the ``SessionManager`` singleton to the running event loop
+    at startup so every subsequent ``/api/sessions/*`` and
+    ``/ws/session/*`` handler can resolve it via
+    ``get_session_manager()``.  Yields immediately (no async teardown
+    on shutdown — sessions in memory are simply discarded).
+    """
+    init_session_manager(asyncio.get_running_loop())
+    logger.info("SessionManager initialised on the FastAPI event loop.")
+    yield
+
+
+app = FastAPI(title="TradingCrew UI", version="0.2.0", lifespan=_lifespan)
+
+
+class _NoCacheStaticFiles(StaticFiles):
+    """StaticFiles that tells the browser to always revalidate.
+
+    The default ``StaticFiles`` lets the browser cache ``app.js`` /
+    ``style.css`` aggressively (heuristic + ETag), so a soft page
+    reload after a deploy can keep running the *old* JS while the
+    no-cache ``index.html`` already renders the new template — a
+    confusing mismatch (e.g. the Run button behaves like the previous
+    build).  Serving assets ``no-cache`` forces a conditional GET; the
+    304 path keeps it cheap while guaranteeing freshness.
+    """
+
+    async def get_response(self, path: str, scope):  # type: ignore[override]
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return response
+
 
 if FRONTEND_DIR.exists():
     app.mount(
         "/static",
-        StaticFiles(directory=str(FRONTEND_DIR), html=False),
+        _NoCacheStaticFiles(directory=str(FRONTEND_DIR), html=False),
         name="static",
     )
 
@@ -1162,6 +1203,153 @@ async def rl_recommend(payload: Dict[str, Any]) -> JSONResponse:
     return JSONResponse({"ticker": ticker, "available": True, "recommendation": rec.to_dict()})
 
 
+# ---------------------------------------------------------------------------
+# RLMF — training data (episodes), dataset export, LoRA fine-tune, serving.
+# See web/backend/rlmf_runner.py for the controller.  The prompt-only RLMF
+# surrogate runs inside the workflow; these endpoints drive the *offline*
+# LoRA leg + let the operator serve the trained model (with/without LoRA)
+# for inference — all from the RL-Training tab.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/training/rlmf/episodes")
+async def rlmf_episodes(
+    symbol: Optional[str] = Query(None),
+    status: Optional[str] = Query(None, description="PENDING / RESOLVED / ABANDONED"),
+    limit: int = Query(200, ge=1, le=1000),
+) -> JSONResponse:
+    """Raw episode store — the source data RLMF trains on."""
+    from .rlmf_runner import list_episodes
+    return JSONResponse(await asyncio.to_thread(list_episodes, symbol=symbol, status=status, limit=limit))
+
+
+@app.get("/api/training/rlmf/dataset")
+async def rlmf_dataset(symbol: Optional[str] = Query(None)) -> JSONResponse:
+    """RLMF dataset rows (resolved episodes) + aggregate reward summary."""
+    from .rlmf_runner import dataset_summary
+    return JSONResponse(await asyncio.to_thread(dataset_summary, symbol=symbol))
+
+
+@app.post("/api/training/rlmf/export")
+async def rlmf_export(payload: Dict[str, Any]) -> JSONResponse:
+    """Write the FinGPT-Forecaster-compatible dataset JSONL to disk."""
+    from .rlmf_runner import export_dataset
+    symbol = (payload.get("symbol") or "").strip() or None
+    return JSONResponse(await asyncio.to_thread(export_dataset, symbol=symbol))
+
+
+@app.post("/api/training/rlmf/sample/seed")
+async def rlmf_sample_seed(payload: Dict[str, Any]) -> JSONResponse:
+    """Seed synthetic *resolved* episodes so RLMF can be tested without
+    waiting for real decisions to resolve.  Tagged ``SAMPLE-…`` and
+    removable via the clear endpoint."""
+    from .rlmf_runner import seed_sample_episodes
+    return JSONResponse(await asyncio.to_thread(
+        seed_sample_episodes,
+        count=int(payload.get("count") or 12),
+        symbol=(payload.get("symbol") or "SAMPLE.NS").strip() or "SAMPLE.NS",
+    ))
+
+
+@app.post("/api/training/rlmf/sample/clear")
+async def rlmf_sample_clear() -> JSONResponse:
+    """Remove every seeded ``SAMPLE-…`` episode (real data untouched)."""
+    from .rlmf_runner import clear_sample_episodes
+    return JSONResponse(await asyncio.to_thread(clear_sample_episodes))
+
+
+@app.get("/api/training/rlmf/adapters")
+async def rlmf_adapters() -> JSONResponse:
+    """Discover the trained LoRA adapter on disk (if any)."""
+    from .rlmf_runner import list_adapters
+    return JSONResponse(await asyncio.to_thread(list_adapters))
+
+
+@app.post("/api/training/rlmf/lora/start")
+async def rlmf_lora_start(payload: Dict[str, Any]) -> JSONResponse:
+    """Kick off a background LoRA fine-tune against the chosen base model.
+
+    Body::
+
+        {"base_model": "Qwen/Qwen3-32B", "symbol": null, "epochs": 1,
+         "learning_rate": 2e-4, "lora_r": 16, "lora_alpha": 32,
+         "lora_dropout": 0.05, "max_seq_len": 2048, "output_dir": null}
+    """
+    from .rlmf_runner import start_lora_training
+    try:
+        snap = await asyncio.to_thread(
+            start_lora_training,
+            base_model=(payload.get("base_model") or "").strip(),
+            symbol=(payload.get("symbol") or "").strip() or None,
+            epochs=int(payload.get("epochs") or 1),
+            learning_rate=float(payload.get("learning_rate") or 2e-4),
+            lora_r=int(payload.get("lora_r") or 16),
+            lora_alpha=int(payload.get("lora_alpha") or 32),
+            lora_dropout=float(payload.get("lora_dropout") or 0.05),
+            max_seq_len=int(payload.get("max_seq_len") or 2048),
+            output_dir=(payload.get("output_dir") or "").strip() or None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(snap)
+
+
+@app.post("/api/training/rlmf/lora/stop")
+async def rlmf_lora_stop() -> JSONResponse:
+    from .rlmf_runner import stop_lora_training
+    return JSONResponse(await asyncio.to_thread(stop_lora_training))
+
+
+@app.get("/api/training/rlmf/lora/status")
+async def rlmf_lora_status() -> JSONResponse:
+    from .rlmf_runner import get_lora_status
+    return JSONResponse(await asyncio.to_thread(get_lora_status))
+
+
+@app.post("/api/training/rlmf/serve/start")
+async def rlmf_serve_start(payload: Dict[str, Any]) -> JSONResponse:
+    """Serve a model (with/without the RLMF LoRA) for inference.
+
+    Body: ``{"mode": "with_lora"|"base", "base_model": "...",
+    "adapter_dir": null, "port": 8091, "max_model_len": null,
+    "gpu_mem_util": null, "max_num_seqs": null}``.  Port defaults to
+    8091 to avoid colliding with a primary vLLM on 8081.
+
+    Registers the served endpoint(s) as runtime LLM presets so the
+    model is selectable in the run-config dropdown.
+    """
+    from .rlmf_runner import start_server
+    try:
+        snap = await asyncio.to_thread(
+            start_server,
+            mode=(payload.get("mode") or "with_lora"),
+            base_model=(payload.get("base_model") or "").strip() or None,
+            adapter_dir=(payload.get("adapter_dir") or "").strip() or None,
+            port=int(payload.get("port") or 8091),
+            lora_name=(payload.get("lora_name") or "rlmf").strip(),
+            max_model_len=int(payload["max_model_len"]) if payload.get("max_model_len") else None,
+            gpu_mem_util=float(payload["gpu_mem_util"]) if payload.get("gpu_mem_util") else None,
+            max_num_seqs=int(payload["max_num_seqs"]) if payload.get("max_num_seqs") else None,
+            reasoning_parser=(payload.get("reasoning_parser") or "").strip() or None,
+            tool_parser=(payload.get("tool_parser") or "").strip() or None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(snap)
+
+
+@app.post("/api/training/rlmf/serve/stop")
+async def rlmf_serve_stop() -> JSONResponse:
+    from .rlmf_runner import stop_server
+    return JSONResponse(await asyncio.to_thread(stop_server))
+
+
+@app.get("/api/training/rlmf/serve/status")
+async def rlmf_serve_status() -> JSONResponse:
+    from .rlmf_runner import get_server_status
+    return JSONResponse(await asyncio.to_thread(get_server_status))
+
+
 @app.get("/api/backtest")
 async def backtest(
     ticker: str = Query(..., min_length=1),
@@ -1287,48 +1475,169 @@ async def backtest(
     })
 
 
+# ---------------------------------------------------------------------------
+# Session-aware run API
+# ---------------------------------------------------------------------------
+# The endpoints below decouple "the run" from "the viewer".  A run is
+# owned by the process-wide ``SessionManager`` and lives on until it
+# terminates (or is evicted after cap); WebSocket connections attach
+# and detach freely without ever cancelling the underlying kickoff.
+#
+# The paths are namespaced under ``/api/sessions`` (and ``/ws/session``)
+# to avoid any resolution ambiguity with the pre-existing on-disk
+# ``/api/runs/{ticker}/{run_id}`` GET route that reads persisted
+# RunRecords — a session id passed to that path would otherwise
+# accidentally match ``{ticker}=<id>, {run_id}=cancel``.
+#
+# Flow (new client):
+#   1. POST /api/sessions            {ticker, ...cfg}       -> {run_id}
+#   2. WS   /ws/session/{run_id}                             -> replay + tail
+#   3. POST /api/sessions/{run_id}/cancel                    -> stop mid-run
+#   4. GET  /api/sessions                                    -> resume after refresh
+#
+# The legacy ``/ws/analyze`` endpoint still works but is now a thin
+# shim over the same manager (starts a session, subscribes the caller,
+# then intentionally *does not* cancel on client disconnect).
+
+@app.post("/api/sessions")
+async def api_sessions_start(payload: Dict[str, Any]) -> JSONResponse:
+    """Kick off a new analysis in the background.
+
+    Returns immediately with a ``run_id`` the client can subscribe to
+    over ``/ws/run/{run_id}``.  Sessions beyond the configured
+    concurrency cap sit in QUEUED and promote automatically when a
+    running slot frees up.
+    """
+    ticker = (payload.get("ticker") or "").strip()
+    if not ticker:
+        raise HTTPException(status_code=400, detail="ticker is required")
+    sm = get_session_manager()
+    session = await sm.start(ticker, payload)
+    return JSONResponse({
+        "run_id": session.run_id,
+        "status": session.status.value,
+        "ticker": session.ticker,
+        "started_at": session.started_at.isoformat(),
+    })
+
+
+@app.get("/api/sessions")
+async def api_sessions_list() -> JSONResponse:
+    """List every in-memory run (queued / running / recently terminated)
+    so a reloaded page can rebuild the sidebar without losing state."""
+    sm = get_session_manager()
+    return JSONResponse({"runs": sm.list()})
+
+
+@app.post("/api/sessions/{run_id}/cancel")
+async def api_sessions_cancel(run_id: str) -> JSONResponse:
+    sm = get_session_manager()
+    ok = await sm.cancel(run_id)
+    if not ok:
+        # 404 covers both "no such run" and "already terminated" — the
+        # frontend just refetches /api/sessions to reconcile.
+        raise HTTPException(status_code=404, detail="No cancellable run with that id")
+    return JSONResponse({"ok": True, "run_id": run_id})
+
+
+@app.delete("/api/sessions/{run_id}")
+async def api_sessions_delete(run_id: str) -> JSONResponse:
+    """Evict a *terminal* session from the manager's memory."""
+    sm = get_session_manager()
+    session = sm.get(run_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="No such run")
+    if not sm.remove(run_id):
+        raise HTTPException(
+            status_code=409,
+            detail="Session is still active — cancel it before deleting",
+        )
+    return JSONResponse({"ok": True, "run_id": run_id})
+
+
+async def _pipe_session_to_ws(ws: WebSocket, run_id: str) -> None:
+    """Attach a WebSocket to a live session.
+
+    Sends every buffered event first (so a page reload rebuilds state
+    from scratch), then tails the subscriber queue until the run
+    terminates OR the WebSocket disconnects.  Disconnect is *not*
+    treated as cancel — the underlying kickoff keeps running.
+    """
+    sm = get_session_manager()
+    session, replay, q = sm.subscribe(run_id)
+    if session is None or q is None:
+        await ws.send_text(json.dumps({"type": "error", "message": f"unknown run_id {run_id}"}))
+        return
+    try:
+        for ev in replay:
+            await ws.send_text(json.dumps(ev, default=str))
+        while True:
+            ev = await q.get()
+            if ev is _EOF:
+                return
+            await ws.send_text(json.dumps(ev, default=str))
+    except WebSocketDisconnect:
+        # Client walked away — the manager keeps the run going for
+        # anyone else who's subscribed and for future reconnects.
+        logger.info("WebSocket detached from %s (run continues)", run_id)
+    finally:
+        sm.unsubscribe(session, q)
+
+
+@app.websocket("/ws/session/{run_id}")
+async def ws_session(ws: WebSocket, run_id: str) -> None:
+    """Preferred WebSocket endpoint for the new session-aware UI."""
+    await ws.accept()
+    try:
+        await _pipe_session_to_ws(ws, run_id)
+    except Exception:
+        logger.exception("ws_run failed for %s", run_id)
+        try:
+            await ws.send_text(
+                json.dumps({"type": "error", "message": "Internal server error"})
+            )
+        except Exception:
+            pass
+    finally:
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
 @app.websocket("/ws/analyze")
 async def analyze_ws(ws: WebSocket) -> None:
-    await ws.accept()
-    loop = asyncio.get_event_loop()
-    runner = AnalysisRunner(loop)
+    """Legacy compat: start a run *and* subscribe on the same socket.
 
+    Behavioural change vs. pre-session versions: closing this
+    WebSocket no longer cancels the run.  The client must issue
+    ``POST /api/runs/{run_id}/cancel`` explicitly.  This is a
+    deliberate migration path — old bookmarks and integrations keep
+    working, but they get the new "refresh-safe" semantics for free.
+    """
+    await ws.accept()
     try:
         raw = await ws.receive_text()
         try:
             cfg: Dict[str, Any] = json.loads(raw)
         except json.JSONDecodeError:
             await ws.send_text(json.dumps({"type": "error", "message": "Invalid JSON"}))
-            await ws.close()
             return
 
-        ticker = cfg.get("ticker")
+        ticker = (cfg.get("ticker") or "").strip()
         if not ticker:
             await ws.send_text(json.dumps({"type": "error", "message": "ticker is required"}))
-            await ws.close()
             return
 
-        async def consumer() -> None:
-            while True:
-                event = await runner.events.get()
-                try:
-                    await ws.send_text(json.dumps(event, default=str))
-                except WebSocketDisconnect:
-                    runner.cancel()
-                    return
-                if event.get("type") in ("run_completed", "error"):
-                    return
-
-        consumer_task = asyncio.create_task(consumer())
-        run_task = asyncio.create_task(runner.run(ticker, cfg))
-
-        await asyncio.gather(consumer_task, run_task)
-
+        sm = get_session_manager()
+        session = await sm.start(ticker, cfg)
+        # Announce the id so clients that care can reconnect later.
+        await ws.send_text(json.dumps({"type": "session_started", "run_id": session.run_id}))
+        await _pipe_session_to_ws(ws, session.run_id)
     except WebSocketDisconnect:
-        runner.cancel()
-        logger.info("Client disconnected mid-run")
+        logger.info("analyze_ws client disconnected (run continues in session manager)")
     except Exception:
-        logger.exception("WebSocket session failed")
+        logger.exception("analyze_ws failed")
         try:
             await ws.send_text(
                 json.dumps({"type": "error", "message": "Internal server error"})

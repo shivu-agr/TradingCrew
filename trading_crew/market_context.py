@@ -334,12 +334,21 @@ _INDUSTRY_SEEDS: Dict[str, List[str]] = {
         "ASML EUV equipment",
         "GPU AI accelerator demand",
         "Taiwan strait risk",
+        # AI capex / hyperscaler investment cycle — the demand side that
+        # drives semis in the current regime (the NVDA "cyclic US
+        # investment" breadth gap).  Industry-keyed, no ticker hardcoding.
+        "hyperscaler AI capex data center spending",
+        "cloud provider capital expenditure guidance",
+        "AI data center buildout power demand",
+        "chip supply agreement backlog bookings",
     ],
     # Software (NTNX, MSFT, ORCL)
     "software": [
         "enterprise IT spending",
         "cloud capex hyperscaler",
         "AI software demand",
+        "data center capital expenditure cycle",
+        "AI infrastructure investment",
     ],
     # Oil & gas (XOM, RELIANCE, BP)
     "oil & gas": [

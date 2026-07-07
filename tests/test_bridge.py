@@ -14,7 +14,7 @@ from trading_crew.schemas import PortfolioDecision
 
 def _decision(**overrides) -> PortfolioDecision:
     base = dict(
-        action="OVERWEIGHT",
+        action="BUY",
         confidence=0.75,
         size_pct_of_book=5.0,
         entry_price=150.0,
@@ -33,16 +33,25 @@ def _decision(**overrides) -> PortfolioDecision:
     return PortfolioDecision(**base)
 
 
-def test_overweight_with_size_maps_to_buy():
+def test_buy_with_size_maps_to_buy():
     proposal = portfolio_decision_to_action_proposal(_decision(), symbol="AAPL")
     assert proposal.side == ActionSide.BUY
     assert proposal.target_weight == pytest.approx(0.05)
     assert proposal.symbol == "AAPL"
 
 
-def test_underweight_with_size_maps_to_sell_with_negative_weight():
+def test_strong_buy_maps_to_buy_side():
+    """STRONG_BUY collapses to ``ActionSide.BUY`` (the conviction tier
+    is preserved separately in ``conviction_score`` / ``target_weight``)."""
     proposal = portfolio_decision_to_action_proposal(
-        _decision(action="UNDERWEIGHT", size_pct_of_book=3.0),
+        _decision(action="STRONG_BUY"), symbol="AAPL",
+    )
+    assert proposal.side == ActionSide.BUY
+
+
+def test_sell_with_size_maps_to_sell_with_negative_weight():
+    proposal = portfolio_decision_to_action_proposal(
+        _decision(action="SELL", size_pct_of_book=3.0),
         symbol="msft",
     )
     assert proposal.side == ActionSide.SELL
@@ -50,19 +59,40 @@ def test_underweight_with_size_maps_to_sell_with_negative_weight():
     assert proposal.symbol == "MSFT"  # uppercased
 
 
-def test_neutral_maps_to_hold_with_zero_weight():
+def test_strong_sell_maps_to_sell_side():
     proposal = portfolio_decision_to_action_proposal(
-        _decision(action="NEUTRAL", size_pct_of_book=0.0, expected_return_pct=0.0),
+        _decision(action="STRONG_SELL", size_pct_of_book=3.0),
+        symbol="AAPL",
+    )
+    assert proposal.side == ActionSide.SELL
+    assert proposal.target_weight == pytest.approx(-0.03)
+
+
+def test_hold_maps_to_hold_with_zero_weight():
+    proposal = portfolio_decision_to_action_proposal(
+        _decision(action="HOLD", size_pct_of_book=0.0, expected_return_pct=0.0),
         symbol="AAPL",
     )
     assert proposal.side == ActionSide.HOLD
     assert proposal.target_weight == 0.0
 
 
-def test_overweight_with_zero_size_falls_back_to_abstain():
-    """A contradictory decision (OVERWEIGHT but size=0) should not pretend to be a buy."""
+def test_legacy_neutral_action_still_maps_to_hold():
+    """Legacy runs persisted the flat tier as ``NEUTRAL``; the schema's
+    coercion validator normalises it to ``HOLD`` at load time, so the
+    bridge sees HOLD and maps it accordingly.  This test guards the
+    end-to-end round-trip (validator + bridge)."""
     proposal = portfolio_decision_to_action_proposal(
-        _decision(action="OVERWEIGHT", size_pct_of_book=0.0),
+        _decision(action="NEUTRAL", size_pct_of_book=0.0, expected_return_pct=0.0),
+        symbol="AAPL",
+    )
+    assert proposal.side == ActionSide.HOLD
+
+
+def test_buy_with_zero_size_falls_back_to_abstain():
+    """A contradictory decision (BUY but size=0) should not pretend to be a buy."""
+    proposal = portfolio_decision_to_action_proposal(
+        _decision(action="BUY", size_pct_of_book=0.0),
         symbol="AAPL",
     )
     assert proposal.side == ActionSide.ABSTAIN

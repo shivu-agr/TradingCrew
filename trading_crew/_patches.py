@@ -23,6 +23,13 @@ _APPLIED_FLAG = "_tc_runtime_patches_applied"
 # can decide whether to retry, switch LLM, or shorten the tool chain.
 DEGRADED_OUTPUT_MARKER = "[[DEGRADED_TOOL_CALL_OUTPUT]]"
 
+# Separate marker for "LLM stalled and we gave up after the configured
+# timeout".  Same downstream semantics as ``DEGRADED_OUTPUT_MARKER`` —
+# the runner's UI / persistence layer treats anything starting with
+# either marker as a degraded report — but we keep them distinct so
+# operators can tell at a glance which failure mode they hit.
+DEGRADED_TIMEOUT_MARKER = "[[DEGRADED_LLM_TIMEOUT]]"
+
 
 def _looks_like_tool_call_obj(item: Any) -> bool:
     """Heuristic — does ``item`` look like an OpenAI/LiteLLM tool-call dataclass?
@@ -68,6 +75,39 @@ def _extract_tool_call_summary(items: Iterable[Any]) -> List[Tuple[str, str]]:
         )
         summary.append((name or "<unknown>", pretty or ""))
     return summary
+
+
+def _format_timeout_placeholder(
+    *,
+    task_name: str,
+    role: str,
+    exc: BaseException,
+) -> str:
+    """Build a placeholder for an LLM-timeout / connection-error failure.
+
+    The runner / UI recognises the :data:`DEGRADED_TIMEOUT_MARKER`
+    prefix and flags the per-role report as degraded so downstream
+    debate / research-manager prompts can see "this analyst is missing"
+    instead of staring at an empty string.
+    """
+    exc_type = type(exc).__name__
+    exc_msg = str(exc) or "(no message)"
+    return (
+        f"{DEGRADED_TIMEOUT_MARKER}\n"
+        f"**Analyst report missing — LLM timed out.**\n\n"
+        f"The model serving `{role}` on task `{task_name}` did not "
+        f"return a complete answer within the configured timeout.\n\n"
+        f"Failure: `{exc_type}: {exc_msg[:200]}`\n\n"
+        f"Common causes:\n"
+        f"  - GPU is saturated by another workload (check `nvidia-smi`).\n"
+        f"  - vLLM is queued behind earlier concurrent requests.\n"
+        f"  - The prompt is unusually long for this model's window.\n\n"
+        f"Suggested mitigations:\n"
+        f"  - Re-run the workflow on a less loaded endpoint.\n"
+        f"  - Pick a different LLM from the sidebar dropdown.\n"
+        f"  - Raise `LLM_TIMEOUT_SECONDS` in `.env` if the model is\n"
+        f"    genuinely slow but eventually correct."
+    )
 
 
 def _format_degraded_placeholder(
@@ -151,8 +191,78 @@ def _coerce_task_output_raw_to_str() -> None:
 
     _orig_execute_task = _cagent.Agent.execute_task
 
+    # Exception classes that mean "the LLM took too long, could not be
+    # reached, OR the upstream model server failed to respond" — we want
+    # to convert these into a degraded placeholder so the rest of the
+    # workflow keeps moving instead of hanging or aborting.
+    # ``litellm`` raises a chain of openai-shaped exceptions; we duck-type
+    # on the class name to stay version-agnostic.
+    _TIMEOUT_NAME_PATTERNS = (
+        # ---- Pure client-side timeouts ------------------------------
+        "Timeout",          # litellm.Timeout, openai.APITimeoutError, etc.
+        "TimeoutError",     # asyncio / httpx
+        "ReadTimeout",      # httpx.ReadTimeout
+        "ConnectTimeout",   # httpx.ConnectTimeout
+        # ---- Connection-layer failures ------------------------------
+        "APIConnectionError",  # openai.APIConnectionError, litellm.APIConnectionError
+        "ConnectionError",     # generic
+        # ---- Upstream HTTP 5xx and rate-limit failures --------------
+        # The hosted ``gpt-oss`` endpoint surfaces a slow LLM generation
+        # as ``openai.InternalServerError: upstream request timeout``
+        # (an HTTP 504 wrapped in the SDK's 500-class).  Functionally
+        # identical to a ``ReadTimeout`` from our side — the model
+        # server failed to respond in time — so we treat it as a
+        # transient failure that should degrade the per-role report
+        # rather than abort the whole crew.  Observed live on a
+        # BAJAJ-AUTO.NS run at the Quality Reviewer step.
+        "InternalServerError",       # openai.InternalServerError (HTTP 5xx)
+        "ServiceUnavailableError",   # openai / litellm 503
+        "BadGateway",                # 502 (sometimes a separate class)
+        "GatewayTimeout",            # 504
+        "RateLimitError",            # 429 — transient; retry doesn't help us
+    )
+
+    # Message fragments that prove an exception is a transient upstream
+    # failure even if its class name doesn't match — e.g. some proxies
+    # wrap a 504 as a generic ``APIError`` with the gateway message in
+    # the body.  Kept lowercase + matched case-insensitively.
+    _TIMEOUT_MESSAGE_FRAGMENTS = (
+        "upstream request timeout",
+        "upstream connect error",
+        "upstream timeout",
+        "service unavailable",
+        "gateway timeout",
+        "request timed out",
+        "read timed out",
+    )
+
+    def _looks_like_timeout(exc: BaseException) -> bool:
+        for cls in type(exc).__mro__:
+            if any(p in cls.__name__ for p in _TIMEOUT_NAME_PATTERNS):
+                return True
+        msg = (str(exc) or "").lower()
+        return any(f in msg for f in _TIMEOUT_MESSAGE_FRAGMENTS)
+
     def _safe_execute_task(self, task, context=None, tools=None):  # type: ignore[no-redef]
-        result = _orig_execute_task(self, task=task, context=context, tools=tools)
+        try:
+            result = _orig_execute_task(self, task=task, context=context, tools=tools)
+        except BaseException as exc:  # noqa: BLE001 — we re-raise non-timeout errors
+            task_name = getattr(task, "name", None) or getattr(task, "description", "<task>")
+            role = getattr(self, "role", "<agent>")
+            if _looks_like_timeout(exc):
+                logger.warning(
+                    "LLM timeout on task %r (agent=%r): %s — substituting "
+                    "timeout placeholder so the run can continue.",
+                    str(task_name)[:120], str(role)[:80], type(exc).__name__,
+                )
+                return _format_timeout_placeholder(
+                    task_name=str(task_name)[:120],
+                    role=str(role)[:80],
+                    exc=exc,
+                )
+            # Anything else (model returned 4xx, schema validation, etc.)
+            # is a real bug we want surfaced — preserve the original raise.
+            raise
         # str  -> agent's plain-text final answer (the common case).
         # BaseModel -> task uses output_pydantic / output_json; CrewAI's
         #              Task._execute_core handles BaseModel natively, so we

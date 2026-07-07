@@ -44,7 +44,17 @@ function tradingCrewApp() {
       trade_date: new Date().toISOString().slice(0, 10),
       max_debate_rounds: 2,
       max_risk_rounds: 1,
-      memory: true,
+      // Memory defaults OFF — its per-task LLM analyze passes were the
+      // biggest single source of calls.  The toggle stays in the UI so
+      // it can be opted back in.
+      memory: false,
+      // Optional advisory reviewers (async, feed the PM).  Default OFF
+      // for a lean run.
+      quality_review: false,
+      compliance: false,
+      // Reflective critic — on by default but single-pass (the 3-temp
+      // consistency vote is skipped unless critic_samples is raised).
+      critic_enabled: true,
       tools_enabled: {},   // agent_key -> [tool_name, ...]
       // Phase 2B.3 — partition the on-disk portfolio between a
       // sandboxed "paper" book and a live "prod" book.  Defaults to
@@ -59,6 +69,7 @@ function tradingCrewApp() {
       ticker: true,
       date: false,
       llm: false,
+      sessions: true,
       runs: false,
       dialogue: true,
       tools: true,
@@ -78,6 +89,11 @@ function tradingCrewApp() {
 
     /* ---------------------------------------------------------- run state */
     isRunning: false,
+    // Transient guard for the /api/sessions POST round-trip so a
+    // double-click doesn't queue the same run twice.  Distinct from
+    // ``isRunning`` (which tracks the *attached* session): a new run
+    // can always be started even while another session is running.
+    starting: false,
     status: "idle",
     currentNode: "",
     finalDecision: "",
@@ -112,7 +128,14 @@ function tradingCrewApp() {
     diagramScale: 1,        // effective scale = fitScale * userZoom; powers the toolbar %
     selectedNode: null,
     nodeActivities: {},
-    reports: {},          // role -> output text
+    reports: {},          // role -> output text (latest round only — back-compat)
+    // role -> [{round, total_rounds, output, degraded}] in chronological order.
+    // Single-round roles (analysts, manager, trader, compliance, PM) hold
+    // exactly one entry.  Multi-round roles (Bullish / Bearish Researcher,
+    // the three Risk personas) hold one entry per round.  This is the new
+    // source of truth for the Reports tab so the user can see how round 1
+    // differs from round 2 instead of only the last round.
+    reportsByRound: {},
     // Roles whose final answer was the degraded placeholder from
     // _patches.py — used by the Reports tab and the workflow diagram
     // to flag the affected analyst with a "degraded" badge instead of
@@ -202,6 +225,40 @@ function tradingCrewApp() {
     rlActionChart: null,
     rlPollTimer: null,
 
+    // ---- RLMF (LLM fine-tune from market feedback) --------------------
+    rlmfBaseModels: [
+      "Qwen/Qwen3-32B",
+      "Qwen/Qwen2.5-7B-Instruct",
+      "Qwen/Qwen2.5-1.5B-Instruct",
+      "meta-llama/Llama-3.1-8B-Instruct",
+      "google/gemma-2-9b-it",
+      "mistralai/Mistral-7B-Instruct-v0.3",
+    ],
+    rlmfLora: {
+      base_model: "Qwen/Qwen2.5-1.5B-Instruct",
+      symbol: "",
+      epochs: 1,
+      learning_rate: 0.0002,
+      lora_r: 16,
+      lora_alpha: 32,
+      max_seq_len: 2048,
+    },
+    rlmfLoraStatus: null,
+    rlmfSummary: null,
+    // Default serve port is 8091 (NOT 8081) so it doesn't collide with a
+    // primary vLLM already serving the run-config model on 8081.  gpu_mem_util
+    // / max_num_seqs are exposed so a small served model can be squeezed into
+    // whatever VRAM a primary tenant leaves free (else vLLM OOMs on warmup).
+    rlmfServe: { mode: "with_lora", base_model: "Qwen/Qwen3-32B", port: 8091, adapter_dir: "", max_model_len: null, gpu_mem_util: null, max_num_seqs: null },
+    rlmfServeStatus: null,
+    rlmfAdapters: null,
+    rlmfEpisodeData: null,
+    rlmfEpisodeFilter: { symbol: "", status: "" },
+    rlmfExpanded: null,
+    rlmfLoading: { dataset: false, export: false, loraStart: false, episodes: false, serveStart: false, sample: false },
+    rlmfError: "",
+    rlmfPollTimer: null,
+
     logs: [],
     pendingLogCount: 0,
     autoScroll: true,
@@ -217,6 +274,61 @@ function tradingCrewApp() {
 
     ws: null,
     _logSeq: 0,
+
+    // -------------------------------------------------------------------
+    // Session manager (multi-run background execution)
+    // -------------------------------------------------------------------
+    // The backend now hosts every run inside a process-wide session
+    // manager keyed by ``run_id``.  The frontend keeps a shallow copy
+    // of those sessions here so:
+    //   * the user can queue multiple stocks and switch between them
+    //     without cancelling anything mid-flight (was: closing the WS
+    //     killed the kickoff),
+    //   * a browser reload resumes tailing whichever session was
+    //     active — the buffered events replay from the server so we
+    //     rebuild the diagram + reports from scratch,
+    //   * completed runs stay visible in the sidebar for review even
+    //     after a refresh.
+    // ``activeRunId`` names the session we're currently viewing.  It
+    // may or may not equal one whose kickoff is still in-flight; a
+    // completed run is still "attached" as long as we're rendering it.
+    sessions: [],                  // [{ run_id, ticker, status, started_at, completed_at, final_action, error, event_count, subscribers, cfg }]
+    activeRunId: null,
+    sessionsPollTimer: null,
+
+    /* ---------------------------------------------------------- display helpers */
+    // Human-friendly rendering of the 5-tier PortfolioDecision.action field.
+    // We keep legacy 3-tier records readable by collapsing OVERWEIGHT/
+    // UNDERWEIGHT/NEUTRAL to the equivalent BUY/SELL/HOLD label; every
+    // colour class in index.html already gates on both the new and the
+    // legacy string so no cross-referenced code needs to inspect the raw
+    // value directly.
+    displayAction(a) {
+      if (a === null || a === undefined || a === "") return "";
+      const s = String(a).toUpperCase();
+      const legacy = { OVERWEIGHT: "BUY", UNDERWEIGHT: "SELL", NEUTRAL: "HOLD" };
+      const canonical = legacy[s] || s;
+      // Render underscores as spaces so "STRONG_BUY" shows as "STRONG BUY".
+      return canonical.replace(/_/g, " ");
+    },
+
+    /* ---------- Horizon helpers ---------- */
+    // Bucket a horizon_days number into SHORT / MEDIUM / LONG.  Mirrors
+    // the Python ``horizon_days_to_horizon`` in trading_crew/horizons.py
+    // so the UI can render the tier badge for legacy runs that don't
+    // carry the explicit ``horizon`` field.
+    horizonFromDays(days) {
+      const d = Number(days) || 0;
+      if (d <= 0) return "MEDIUM";
+      if (d <= 60) return "SHORT";
+      if (d <= 252) return "MEDIUM";
+      return "LONG";
+    },
+    horizonHumanLabel(tier) {
+      if (tier === "SHORT") return "Short term (up to 3 months)";
+      if (tier === "LONG") return "Long term (1-10 years)";
+      return "Medium term (3-12 months)";
+    },
 
     /* ---------------------------------------------------------- boot */
     async init() {
@@ -265,11 +377,32 @@ function tradingCrewApp() {
         });
       };
       this.$watch("reports", annotate, { deep: true });
+      this.$watch("reportsByRound", annotate, { deep: true });
       this.$watch("decisionPayload", annotate);
       this.$watch("activeTab", (v) => { if (v === "reports") annotate(); });
 
       this.loadChart();
       this.loadRecentRuns();
+
+      // Session manager bootstrap — grab the list of live/recent
+      // background runs and re-attach to whichever one the tab was
+      // watching before the reload (persisted in localStorage).
+      await this.refreshSessions();
+      const savedActive = (typeof localStorage !== "undefined"
+        ? localStorage.getItem("tc.activeRunId")
+        : null);
+      if (savedActive && this.sessions.some((s) => s.run_id === savedActive)) {
+        this.attachToSession(savedActive);
+      }
+      // Poll the sessions list so the sidebar reflects promotion
+      // (queued -> running) and completion without a manual refresh.
+      // Cheap: single JSON round-trip returning at most ~20 rows.
+      this.sessionsPollTimer = setInterval(() => this.refreshSessions(), 3000);
+
+      // Sidebar "Serve a local model" panel is always visible, so hydrate
+      // its state on boot (which model is being served + adapter readiness).
+      this.refreshRlmfServe();
+      this.loadRlmfAdapters();
 
       // First-run guided tour (Phase 1E).  Fires on a fresh browser
       // (`localStorage.tcTourCompleted` unset) after the diagram has
@@ -465,17 +598,17 @@ function tradingCrewApp() {
      */
     estimateMemoryLlmCalls() {
       const isCommodity = this.assetClass === "commodity";
-      // Analyst grid: 8 (stock) / 7 (commodity) with ~2 tasks each.
-      const numAnalysts = isCommodity ? 7 : 8;
-      const analystTasks = numAnalysts * 2;
+      // Analyst grid: 4 merged desks (stock) / 6 (commodity), one task each.
+      const numAnalysts = isCommodity ? 6 : 4;
+      const analystTasks = numAnalysts;
       // Debate: bull + bear per round.
       const debateTasks = 2 * (this.form.max_debate_rounds || 1);
-      // Sequential mid stages: research mgr, quality reviewer, trader.
-      const midTasks = 3;
+      // Sequential mid stages: research mgr + trader (+ optional QR).
+      const midTasks = 2 + (this.form.quality_review ? 1 : 0);
       // Risk team: 3 personas per round.
       const riskTasks = 3 * (this.form.max_risk_rounds || 1);
-      // Final stages: compliance + portfolio manager.
-      const finalTasks = 2;
+      // Final stages: portfolio manager (+ optional compliance).
+      const finalTasks = 1 + (this.form.compliance ? 1 : 0);
       const numTasks = analystTasks + debateTasks + midTasks + riskTasks + finalTasks;
 
       // Per-task analyze calls: 1 extract + ~2 save (avg 2 extracted
@@ -502,6 +635,11 @@ function tradingCrewApp() {
       try {
         const url = `/api/chart?ticker=${encodeURIComponent(ticker)}&trade_date=${encodeURIComponent(this.form.trade_date)}`;
         const res = await fetch(url).then((r) => r.json());
+        // Guard against a stale response: on page-reload we fire a default
+        // loadChart() and then another for the reattached session's ticker.
+        // If the ticker changed while this request was in flight, drop it so
+        // the chart doesn't flip back to the wrong (e.g. default) symbol.
+        if ((this.form.ticker || "").trim().toUpperCase() !== ticker) return;
         this.chartData = res;
         if (res.error) this.chartError = res.error;
       } catch (err) {
@@ -524,13 +662,115 @@ function tradingCrewApp() {
     },
 
     /* ---------------------------------------------------------- run */
-    startRun() {
-      if (this.isRunning) return;
-      this.diagram.reset();
-      this.diagram.setActiveTools(this.form.tools_enabled);
+    // ``startRun()`` kicks off a *background* session on the server
+    // and then attaches this tab to its event stream.  A single tab
+    // renders one session at a time (the "active" one), but the
+    // backend keeps every session alive independently — so refreshing
+    // the page just re-attaches, and pushing "Run" again while an
+    // earlier session is still going queues a second one that will
+    // start as soon as the concurrency cap allows.
+    async startRun() {
+      // Allow queuing a new session even while another is running
+      // (true multi-session), but guard the POST round-trip against a
+      // double-click.
+      if (this.starting) return;
+      this.starting = true;
+      const f = this.form;
+      const payload = {
+        asset_class: this.assetClass,
+        ticker: (f.ticker || "").trim().toUpperCase(),
+        debate_rounds: f.max_debate_rounds,
+        risk_rounds: f.max_risk_rounds,
+        memory: f.memory,
+        quality_review: f.quality_review,
+        compliance: f.compliance,
+        critic_enabled: f.critic_enabled,
+        tools_enabled: f.tools_enabled,
+        book: this.form.book || "paper",
+        llm_preset: this.selectedLlmPreset || "",
+        embedding_preset: this.selectedEmbeddingPreset || "",
+      };
+      if (!payload.ticker) {
+        this.appendLog("error", "client", "Ticker is required.");
+        this.starting = false;
+        return;
+      }
+
+      try {
+        const res = await fetch("/api/sessions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!res.ok) {
+          const errText = await res.text();
+          this.appendLog("error", "client", `Start failed: ${errText}`);
+          return;
+        }
+        const body = await res.json();
+        this.appendLog("info", "client",
+          `Queued ${payload.ticker} (run_id=${body.run_id.slice(0, 16)}) debate=${payload.debate_rounds} risk=${payload.risk_rounds}`);
+        await this.refreshSessions();
+        this.attachToSession(body.run_id);
+      } catch (err) {
+        this.appendLog("error", "client", `Start failed: ${String(err)}`);
+      } finally {
+        this.starting = false;
+      }
+    },
+
+    // Number of sessions currently queued or running — surfaced on the
+    // Run button so the user can see the background fan-out at a glance.
+    get activeSessionCount() {
+      return (this.sessions || []).filter(
+        (s) => s.status === "running" || s.status === "queued"
+      ).length;
+    },
+
+    // Kaggle-style column summary over the currently-loaded episode rows:
+    // action / regime distributions + realised-return + conviction stats.
+    // (Outcome-status counts come from the backend and cover ALL rows.)
+    get rlmfEpisodeStats() {
+      const eps = (this.rlmfEpisodeData && this.rlmfEpisodeData.episodes) || [];
+      const s = {
+        count: eps.length,
+        actions: {}, regimes: {},
+        resolved: { n: 0, min: null, max: null, sum: 0 },
+        convictionSum: 0, convictionN: 0,
+      };
+      for (const e of eps) {
+        const a = e.action || "—"; s.actions[a] = (s.actions[a] || 0) + 1;
+        const r = e.regime || "—"; s.regimes[r] = (s.regimes[r] || 0) + 1;
+        if (e.conviction_score != null) { s.convictionSum += Number(e.conviction_score); s.convictionN++; }
+        if (e.realised_return != null) {
+          const v = Number(e.realised_return);
+          s.resolved.n++; s.resolved.sum += v;
+          s.resolved.min = s.resolved.min == null ? v : Math.min(s.resolved.min, v);
+          s.resolved.max = s.resolved.max == null ? v : Math.max(s.resolved.max, v);
+        }
+      }
+      s.convictionAvg = s.convictionN ? s.convictionSum / s.convictionN : null;
+      s.resolved.mean = s.resolved.n ? s.resolved.sum / s.resolved.n : null;
+      return s;
+    },
+
+    // Percent formatter used by the episode summary cards.
+    rlmfPct(v) {
+      return v == null ? "—" : (v * 100).toFixed(1) + "%";
+    },
+
+    // Reset every per-run render field so switching between sessions
+    // doesn't leak state from the previous view.  Called by
+    // attachToSession before we replay the target session's buffer.
+    resetRunState() {
+      if (this.diagram) {
+        this.diagram.reset();
+        this.diagram.setActiveTools(this.form.tools_enabled);
+      }
       this.logs = [];
       this.pendingLogCount = 0;
       this.reports = {};
+      this.reportsByRound = {};
       this.degradedRoles = {};
       this.finalDecision = "";
       this.cascadeStatus = null;
@@ -542,62 +782,172 @@ function tradingCrewApp() {
       this.decisionPayload = null;
       this.nodeActivities = {};
       this.selectedNode = null;
-      this.status = "running";
-      this.isRunning = true;
       this.currentNode = "";
+    },
 
-      const f = this.form;
-      const payload = {
-        asset_class: this.assetClass,
-        ticker: (f.ticker || "").trim().toUpperCase(),
-        debate_rounds: f.max_debate_rounds,
-        risk_rounds: f.max_risk_rounds,
-        memory: f.memory,
-        tools_enabled: f.tools_enabled,
-        // Phase 2B.3 — paper/prod book partition.  The runner uses this
-        // as the PortfolioState portfolio_id so paper experiments don't
-        // pollute the prod book's audit trail.
-        book: this.form.book || "paper",
-        // Phase 2F — UI-selectable LLM. The runner applies this as a
-        // thread-local override that ``get_llm()`` consults BEFORE the
-        // env chain, so each WS session can use a different model
-        // (e.g. one closed-source PM, the rest open-source).
-        llm_preset: this.selectedLlmPreset || "",
-        embedding_preset: this.selectedEmbeddingPreset || "",
-      };
+    // Attach the current tab to ``runId``'s live event stream.  Closes
+    // any existing viewer socket first (attach is exclusive per tab)
+    // so we don't double-render events into the wrong panels.  The
+    // server sends a full buffer replay before it starts tailing, so
+    // the diagram + reports come back to their exact state as of the
+    // last event — regardless of when we joined.
+    attachToSession(runId) {
+      if (!runId) return;
+      if (this.ws) {
+        try { this.ws.close(); } catch (_) {}
+        this.ws = null;
+      }
+      this.resetRunState();
+      this.activeRunId = runId;
+      try {
+        if (typeof localStorage !== "undefined") {
+          localStorage.setItem("tc.activeRunId", runId);
+        }
+      } catch (_) {}
+      // A session that's already terminated is still valid to attach
+      // to — we just replay history and immediately hit EOF.  Keep
+      // isRunning false so the sticky Run button doesn't spin.
+      const s = this.sessions.find((x) => x.run_id === runId);
+      this.isRunning = s && (s.status === "queued" || s.status === "running");
+      this.status = s ? s.status : "running";
 
-      this.appendLog("info", "client", `Starting ${payload.ticker} debate=${payload.debate_rounds} risk=${payload.risk_rounds}`);
+      // Sync the visible ticker / date / asset-class to the session this
+      // tab is now attached to.  Without this a page reload (which resets
+      // ``form`` to defaults, e.g. NTNX) would leave the header + Charts
+      // tab showing the default ticker while the run was actually for a
+      // different symbol.  We reload the chart so Charts reflects THIS run.
+      if (s) {
+        if (s.ticker) this.form.ticker = s.ticker;
+        const cfg = s.cfg || {};
+        if (cfg.trade_date || cfg.decision_ts) {
+          this.form.trade_date = String(cfg.trade_date || cfg.decision_ts).slice(0, 10);
+        }
+        // NB: we deliberately do NOT flip ``assetClass`` here.  Sessions
+        // are process-global across the /stock and /commodity dashboards;
+        // switching asset mode mid-page (without reloading /api/options)
+        // would leave stale tickers/tools.  Ticker + date sync is enough
+        // to keep the header + Charts correct on either dashboard.
+        this.loadChart();
+      }
 
       const proto = location.protocol === "https:" ? "wss" : "ws";
-      const ws = new WebSocket(`${proto}://${location.host}/ws/analyze`);
+      const ws = new WebSocket(`${proto}://${location.host}/ws/session/${encodeURIComponent(runId)}`);
       this.ws = ws;
-      ws.addEventListener("open", () => ws.send(JSON.stringify(payload)));
       ws.addEventListener("message", (e) => {
         try { this.handleEvent(JSON.parse(e.data)); }
         catch (err) { this.appendLog("error", "parse", String(err)); }
       });
-      ws.addEventListener("close", () => this.finishRun());
+      ws.addEventListener("close", () => {
+        // The server closes only when the session terminates OR the
+        // browser tore the socket down (refresh / navigation).  In
+        // both cases we release the "running" spinner; on refresh the
+        // next init() call will reattach from localStorage.
+        this.isRunning = false;
+        this.currentNode = "";
+      });
       ws.addEventListener("error", () => {
-        this.appendLog("error", "ws", "WebSocket error");
-        this.status = "error";
+        this.appendLog("error", "ws", `WebSocket error on run ${runId}`);
       });
     },
-    cancelRun() {
-      if (this.ws && this.ws.readyState === 1) {
-        try { this.ws.close(); } catch (_) {}
+
+    async cancelRun() {
+      if (!this.activeRunId) {
+        // No active session — just release the local spinner.
+        this.isRunning = false;
+        this.status = "idle";
+        return;
       }
-      this.finishRun();
-      this.status = "idle";
+      await this.cancelSpecificRun(this.activeRunId);
     },
-    finishRun() {
-      this.isRunning = false;
-      this.currentNode = "";
+
+    // Cancel *a specific* background run — used by the per-row Cancel
+    // button in the Sessions panel, and by cancelRun() for the tab's
+    // currently-attached session.  Kept separate so a user can cancel
+    // a *different* queued run without first having to attach to it.
+    async cancelSpecificRun(runId) {
+      if (!runId) return;
+      try {
+        const res = await fetch(
+          `/api/sessions/${encodeURIComponent(runId)}/cancel`,
+          { method: "POST" },
+        );
+        if (!res.ok) {
+          this.appendLog("warn", "client", `Cancel returned ${res.status}`);
+        } else {
+          this.appendLog("info", "client", `Cancel requested for ${runId.slice(0,16)}`);
+        }
+      } catch (err) {
+        this.appendLog("error", "client", `Cancel failed: ${String(err)}`);
+      }
+      await this.refreshSessions();
+    },
+
+    async refreshSessions() {
+      try {
+        const res = await fetch("/api/sessions").then((r) => r.json());
+        this.sessions = (res.runs || []);
+        // If the active run finished, drop the sticky "running" state.
+        if (this.activeRunId) {
+          const s = this.sessions.find((x) => x.run_id === this.activeRunId);
+          if (s && s.status !== "queued" && s.status !== "running") {
+            this.isRunning = false;
+            this.status = s.status;
+          }
+        }
+      } catch (err) {
+        // Non-fatal — the poller will retry.  Don't flood the log.
+        console.warn("refreshSessions failed", err);
+      }
+    },
+
+    async removeSession(runId) {
+      if (!runId) return;
+      // Only ask for confirmation on active runs; terminal ones are cheap.
+      const s = this.sessions.find((x) => x.run_id === runId);
+      if (s && (s.status === "running" || s.status === "queued")) {
+        if (!window.confirm(`Session ${runId.slice(0,16)} is still active. Cancel it first?`)) return;
+        await fetch(`/api/sessions/${encodeURIComponent(runId)}/cancel`, { method: "POST" });
+        // Give the server a moment to transition to CANCELLED before deleting.
+        await new Promise((r) => setTimeout(r, 300));
+      }
+      try {
+        await fetch(`/api/sessions/${encodeURIComponent(runId)}`, { method: "DELETE" });
+      } catch (err) {
+        console.warn("removeSession failed", err);
+      }
+      if (this.activeRunId === runId) {
+        this.activeRunId = null;
+        try { if (this.ws) this.ws.close(); } catch (_) {}
+        try { localStorage.removeItem("tc.activeRunId"); } catch (_) {}
+      }
+      await this.refreshSessions();
+    },
+
+    // -------------------------------------------------------------------
+    // Session-status helpers used by the sidebar template
+    // -------------------------------------------------------------------
+    sessionStatusClass(s) {
+      switch ((s || "").toLowerCase()) {
+        case "running":   return "bg-blue-500/20 text-blue-200";
+        case "queued":    return "bg-amber-500/20 text-amber-200";
+        case "completed": return "bg-emerald-500/20 text-emerald-200";
+        case "error":     return "bg-rose-500/20 text-rose-200";
+        case "cancelled": return "bg-slate-500/20 text-slate-300";
+        default:          return "bg-slate-500/20 text-slate-300";
+      }
     },
 
     /* ---------------------------------------------------------- events */
     handleEvent(event) {
       switch (event.type) {
         case "run_started":
+          // Keep the header + Charts locked to the run we're viewing,
+          // even after a reload where ``form`` was reset to defaults.
+          if (event.ticker && event.ticker !== this.form.ticker) {
+            this.form.ticker = event.ticker;
+            this.loadChart();
+          }
+          if (event.trade_date) this.form.trade_date = String(event.trade_date).slice(0, 10);
           this.appendLog("info", "run",
             `${event.ticker} · ${event.agent_count} agents · ${event.task_count} tasks`);
           return;
@@ -608,21 +958,36 @@ function tradingCrewApp() {
           this.appendLog("node", event.node, "▶ started");
           return;
 
-        case "node_completed":
+        case "node_completed": {
           this.diagram.setState(event.node, event.degraded ? "degraded" : "done");
-          this.reports[event.node] = event.output || "";
+          const output = event.output || "";
+          this.reports[event.node] = output;
+          // Append to the per-round history so multi-turn debates render
+          // every round in the Reports tab.  Reactivity: re-create the
+          // role's array AND the top-level object so Alpine's shallow
+          // watchers fire on Alpine.js.
+          const round = Number.isFinite(event.round) ? event.round : 1;
+          const totalRounds = Number.isFinite(event.total_rounds) ? event.total_rounds : 1;
+          const prior = this.reportsByRound[event.node] || [];
+          const nextRoundList = prior.concat([{
+            round, total_rounds: totalRounds, output, degraded: !!event.degraded,
+          }]);
+          this.reportsByRound = { ...this.reportsByRound, [event.node]: nextRoundList };
           if (event.degraded) {
             this.degradedRoles = { ...this.degradedRoles, [event.node]: true };
             this.appendLog("warn", event.node, "⚠ degraded: LLM emitted tool-call list as final answer");
           }
+          const roundLabel = totalRounds > 1 ? ` · round ${round}/${totalRounds}` : "";
           this.pushActivity(event.node, {
-            label: event.degraded ? "report (degraded)" : "report",
+            label: event.degraded ? `report (degraded)${roundLabel}` : `report${roundLabel}`,
             color: event.degraded ? "warn" : "llm",
-            subtitle: `${(event.output || "").length} chars`,
-            body: event.output || "", markdown: true,
+            subtitle: `${output.length} chars`,
+            body: output, markdown: true,
           });
-          this.appendLog("node", event.node, event.degraded ? "⚠ completed (degraded)" : "✓ completed");
+          this.appendLog("node", event.node,
+            event.degraded ? `⚠ completed (degraded)${roundLabel}` : `✓ completed${roundLabel}`);
           return;
+        }
 
         case "agent_step": {
           const text = (event.content || "").trim();
@@ -712,15 +1077,31 @@ function tradingCrewApp() {
         case "run_completed":
           this.status = "completed";
           this.appendLog("info", "run", "completed");
-          this.finishRun();
-          // Phase E — the new record is on disk; refresh the sidebar list.
+          this.isRunning = false;
+          this.currentNode = "";
+          // Refresh both the on-disk audit list AND the in-memory
+          // session sidebar so the completion badge flips right away
+          // without waiting for the 3 s poll tick.
           this.loadRecentRuns();
+          this.refreshSessions();
+          return;
+
+        case "session_started":
+          // Legacy /ws/analyze clients only — the new path knows the
+          // run_id up front from POST /api/sessions.  We still handle
+          // this so old bookmarks keep working.
+          if (event.run_id && !this.activeRunId) {
+            this.activeRunId = event.run_id;
+            try { localStorage.setItem("tc.activeRunId", event.run_id); } catch (_) {}
+          }
           return;
 
         case "error":
           this.status = "error";
           this.appendLog("error", "error", event.message);
-          this.finishRun();
+          this.isRunning = false;
+          this.currentNode = "";
+          this.refreshSessions();
           return;
       }
     },
@@ -793,13 +1174,9 @@ function tradingCrewApp() {
       };
       const KIND_BY_ROLE = {
         "Market Analyst": "analyst",
-        "Social Analyst": "analyst",
         "News Analyst": "analyst",
         "Fundamentals Analyst": "analyst",
         "Macro Analyst": "analyst",
-        "Geopolitical Analyst": "analyst",
-        "Sector / Peer Analyst": "analyst",
-        "Quant / Options Analyst": "analyst",
         "Bullish Researcher": "bull",
         "Bearish Researcher": "bear",
         "Research Manager": "manager",
@@ -817,8 +1194,8 @@ function tradingCrewApp() {
       // Detect that shape too so saved runs produced before this build
       // still get the amber badge instead of showing raw repr text.
       const LEGACY_REPR_PREFIX = "[ChatCompletionMessageFunctionToolCall";
-      return Object.entries(this.reports).map(([role, body]) => {
-        const flagged = !!this.degradedRoles[role];
+      const renderOne = (role, round, totalRounds, body, perRoundDegraded) => {
+        const flagged = !!this.degradedRoles[role] || !!perRoundDegraded;
         const trimmed = typeof body === "string" ? body.trimStart() : "";
         const markerHit = trimmed.startsWith(DEGRADED_MARKER);
         const legacyHit = trimmed.startsWith(LEGACY_REPR_PREFIX);
@@ -837,14 +1214,46 @@ function tradingCrewApp() {
             "captured at the time of the run:\n\n" +
             "```\n" + body.trim() + "\n```";
         }
+        const title = totalRounds > 1
+          ? `${role} — round ${round}/${totalRounds}`
+          : role;
         return {
           role,
-          title: role,
+          round,
+          totalRounds,
+          title,
           color: colors[KIND_BY_ROLE[role]] || "#94a3b8",
           html: this.renderMarkdown(cleanBody),
           degraded,
         };
-      });
+      };
+
+      const byRound = this.reportsByRound || {};
+      if (Object.keys(byRound).length) {
+        // Preserve the order roles first appeared (matches the workflow
+        // pipeline order: analysts → debate rounds → manager → trader …).
+        // Within a role, rounds are already in chronological order from
+        // the runner.
+        const out = [];
+        for (const [role, entries] of Object.entries(byRound)) {
+          for (const entry of entries) {
+            out.push(renderOne(
+              role,
+              entry.round || 1,
+              entry.total_rounds || 1,
+              entry.output || "",
+              !!entry.degraded,
+            ));
+          }
+        }
+        return out;
+      }
+
+      // Legacy fall-back: pre-rounds runs and the in-flight prefix
+      // before the first node_completed event arrives.
+      return Object.entries(this.reports).map(([role, body]) =>
+        renderOne(role, 1, 1, body, false)
+      );
     },
 
     renderMarkdown(raw) {
@@ -992,6 +1401,20 @@ function tradingCrewApp() {
           return;
         }
         this.loadedRunId = runId;
+        // Lock the header + Charts (and every other ticker-scoped tab:
+        // Memory, Backtest, Portfolio, Futures) to the run being viewed.
+        // loadRun repaints the report panels from disk but historically
+        // left ``form.ticker`` at its default (NTNX), so the title and the
+        // Charts tab showed the wrong symbol for a historical run.  The
+        // form.ticker / form.trade_date $watchers reload the chart; the
+        // other tabs read form.ticker at click time.
+        if (ticker) this.form.ticker = String(ticker).toUpperCase();
+        const runDate = res.config?.trade_date || res.config?.decision_ts;
+        if (runDate) {
+          this.form.trade_date = String(runDate).slice(0, 10);
+        } else if (res.started_at) {
+          this.form.trade_date = String(res.started_at).slice(0, 10);
+        }
         // Repaint all the post-LLM panels from the saved record.
         this.cascadeStatus = res.cascade_status || null;
         this.actionProposal = res.action_proposal || null;
@@ -1003,6 +1426,21 @@ function tradingCrewApp() {
         this.finalDecision = res.final_decision?.action || "";
         // Repaint the per-agent reports (Workflow tab + Reports tab).
         this.reports = { ...(res.reports || {}) };
+        // ``reports_by_round`` is the new per-round source of truth for
+        // the Reports tab.  Old run records pre-date the field, so fall
+        // back to wrapping the legacy single-round ``reports`` dict into
+        // one synthetic round so the UI keeps rendering them.
+        const rawByRound = res.reports_by_round || null;
+        if (rawByRound && Object.keys(rawByRound).length) {
+          this.reportsByRound = JSON.parse(JSON.stringify(rawByRound));
+        } else {
+          this.reportsByRound = Object.fromEntries(
+            Object.entries(res.reports || {}).map(([role, body]) => [
+              role,
+              [{ round: 1, total_rounds: 1, output: body, degraded: false }],
+            ])
+          );
+        }
         // Rehydrate the degraded-roles set so the Reports tab badges
         // and the diagram colouring match the persisted state of the
         // run (the saved record carries one entry per analyst whose
@@ -1456,6 +1894,236 @@ function tradingCrewApp() {
       } finally {
         this.rlLoading.recommend = false;
       }
+    },
+
+    // ==================================================================
+    // RLMF — LLM fine-tune from market feedback (dataset / LoRA / serving)
+    // ==================================================================
+    async initRlmf() {
+      await Promise.all([
+        this.loadRlmfDataset(),
+        this.loadRlmfEpisodes(),
+        this.pollRlmfLora(),
+        this.refreshRlmfServe(),
+        this.loadRlmfAdapters(),
+      ]);
+    },
+
+    async loadRlmfDataset() {
+      this.rlmfLoading.dataset = true;
+      try {
+        const q = this.rlmfLora.symbol ? `?symbol=${encodeURIComponent(this.rlmfLora.symbol.trim().toUpperCase())}` : "";
+        const res = await fetch(`/api/training/rlmf/dataset${q}`).then(r => r.json());
+        this.rlmfSummary = res.summary || null;
+      } catch (err) {
+        console.warn("loadRlmfDataset failed", err);
+      } finally {
+        this.rlmfLoading.dataset = false;
+      }
+    },
+
+    async loadRlmfEpisodes() {
+      this.rlmfLoading.episodes = true;
+      try {
+        const params = new URLSearchParams();
+        if (this.rlmfEpisodeFilter.symbol) params.set("symbol", this.rlmfEpisodeFilter.symbol.trim().toUpperCase());
+        if (this.rlmfEpisodeFilter.status) params.set("status", this.rlmfEpisodeFilter.status);
+        const qs = params.toString();
+        this.rlmfEpisodeData = await fetch(`/api/training/rlmf/episodes${qs ? "?" + qs : ""}`).then(r => r.json());
+      } catch (err) {
+        console.error("loadRlmfEpisodes failed", err);
+      } finally {
+        this.rlmfLoading.episodes = false;
+      }
+    },
+
+    async loadRlmfAdapters() {
+      try {
+        this.rlmfAdapters = await fetch("/api/training/rlmf/adapters").then(r => r.json());
+      } catch (err) {
+        console.warn("loadRlmfAdapters failed", err);
+      }
+    },
+
+    async seedRlmfSample() {
+      this.rlmfLoading.sample = true;
+      this.rlmfError = "";
+      try {
+        const res = await fetch("/api/training/rlmf/sample/seed", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ count: 12 }),
+        }).then(r => r.json());
+        this.appendLog("info", "rlmf", `Seeded ${res.seeded} sample episodes (${res.symbol})`);
+        await Promise.all([this.loadRlmfEpisodes(), this.loadRlmfDataset()]);
+      } catch (err) {
+        this.rlmfError = String(err.message || err);
+      } finally {
+        this.rlmfLoading.sample = false;
+      }
+    },
+
+    async clearRlmfSample() {
+      this.rlmfLoading.sample = true;
+      this.rlmfError = "";
+      try {
+        const res = await fetch("/api/training/rlmf/sample/clear", { method: "POST" }).then(r => r.json());
+        this.appendLog("info", "rlmf", `Removed ${res.removed} sample episodes`);
+        await Promise.all([this.loadRlmfEpisodes(), this.loadRlmfDataset()]);
+      } catch (err) {
+        this.rlmfError = String(err.message || err);
+      } finally {
+        this.rlmfLoading.sample = false;
+      }
+    },
+
+    async exportRlmfDataset() {
+      this.rlmfLoading.export = true;
+      this.rlmfError = "";
+      try {
+        const symbol = this.rlmfLora.symbol ? this.rlmfLora.symbol.trim().toUpperCase() : null;
+        const res = await fetch("/api/training/rlmf/export", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ symbol }),
+        }).then(r => r.json());
+        this.appendLog("info", "rlmf", `Exported ${res.rows} rows to ${res.path}`);
+        await this.loadRlmfDataset();
+      } catch (err) {
+        this.rlmfError = String(err.message || err);
+      } finally {
+        this.rlmfLoading.export = false;
+      }
+    },
+
+    async startRlmfLora() {
+      this.rlmfLoading.loraStart = true;
+      this.rlmfError = "";
+      try {
+        const payload = {
+          base_model: (this.rlmfLora.base_model || "").trim(),
+          symbol: this.rlmfLora.symbol ? this.rlmfLora.symbol.trim().toUpperCase() : null,
+          epochs: this.rlmfLora.epochs,
+          learning_rate: this.rlmfLora.learning_rate,
+          lora_r: this.rlmfLora.lora_r,
+          lora_alpha: this.rlmfLora.lora_alpha,
+          max_seq_len: this.rlmfLora.max_seq_len,
+        };
+        const res = await fetch("/api/training/rlmf/lora/start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!res.ok) {
+          const detail = await res.json().catch(() => ({ detail: res.statusText }));
+          throw new Error(detail.detail || res.statusText);
+        }
+        this.rlmfLoraStatus = await res.json();
+        this._startRlmfLoraPolling();
+      } catch (err) {
+        this.rlmfError = String(err.message || err);
+      } finally {
+        this.rlmfLoading.loraStart = false;
+      }
+    },
+
+    async stopRlmfLora() {
+      try {
+        await fetch("/api/training/rlmf/lora/stop", { method: "POST" });
+        await this.pollRlmfLora();
+      } catch (err) {
+        this.rlmfError = String(err.message || err);
+      }
+    },
+
+    async pollRlmfLora() {
+      try {
+        this.rlmfLoraStatus = await fetch("/api/training/rlmf/lora/status").then(r => r.json());
+      } catch (err) {
+        console.warn("pollRlmfLora failed", err);
+      }
+    },
+
+    _startRlmfLoraPolling() {
+      if (this.rlmfPollTimer) clearInterval(this.rlmfPollTimer);
+      this.rlmfPollTimer = setInterval(async () => {
+        await this.pollRlmfLora();
+        if (!(this.rlmfLoraStatus && this.rlmfLoraStatus.active)) {
+          clearInterval(this.rlmfPollTimer);
+          this.rlmfPollTimer = null;
+          await Promise.all([this.loadRlmfAdapters(), this.loadRlmfDataset()]);
+        }
+      }, 2500);
+    },
+
+    // ---- serving (inference with/without LoRA) ------------------------
+    async startRlmfServe() {
+      this.rlmfLoading.serveStart = true;
+      this.rlmfError = "";
+      try {
+        const payload = {
+          mode: this.rlmfServe.mode,
+          base_model: (this.rlmfServe.base_model || "").trim(),
+          adapter_dir: (this.rlmfServe.adapter_dir || "").trim() || null,
+          port: this.rlmfServe.port,
+          max_model_len: this.rlmfServe.max_model_len || null,
+          gpu_mem_util: this.rlmfServe.gpu_mem_util || null,
+          max_num_seqs: this.rlmfServe.max_num_seqs || null,
+        };
+        const res = await fetch("/api/training/rlmf/serve/start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!res.ok) {
+          const detail = await res.json().catch(() => ({ detail: res.statusText }));
+          throw new Error(detail.detail || res.statusText);
+        }
+        this.rlmfServeStatus = await res.json();
+        this._startRlmfServePolling();
+        // Refresh the LLM preset dropdown so the served model is selectable…
+        await this.loadOptions?.();
+        // …and auto-select it, so "load from the left pane" is one click:
+        // the LoRA endpoint when serving with the adapter, else the base.
+        const wantId = this.rlmfServe.mode === "with_lora" ? "served-lora" : "served-base";
+        if ((this.llmPresets || []).some((p) => p.id === wantId)) {
+          this.selectedLlmPreset = wantId;
+          this.onLlmPresetChange();
+        }
+      } catch (err) {
+        this.rlmfError = String(err.message || err);
+      } finally {
+        this.rlmfLoading.serveStart = false;
+      }
+    },
+
+    async stopRlmfServe() {
+      try {
+        await fetch("/api/training/rlmf/serve/stop", { method: "POST" });
+        await this.refreshRlmfServe();
+        await this.loadOptions?.();
+      } catch (err) {
+        this.rlmfError = String(err.message || err);
+      }
+    },
+
+    async refreshRlmfServe() {
+      try {
+        this.rlmfServeStatus = await fetch("/api/training/rlmf/serve/status").then(r => r.json());
+      } catch (err) {
+        console.warn("refreshRlmfServe failed", err);
+      }
+    },
+
+    _startRlmfServePolling() {
+      const timer = setInterval(async () => {
+        await this.refreshRlmfServe();
+        // Stop polling once the server is confirmed ready or has exited.
+        if (!this.rlmfServeStatus || !this.rlmfServeStatus.running || this.rlmfServeStatus.ready) {
+          clearInterval(timer);
+          if (this.rlmfServeStatus && this.rlmfServeStatus.ready) await this.loadOptions?.();
+        }
+      }, 4000);
     },
 
     renderRlChart() {

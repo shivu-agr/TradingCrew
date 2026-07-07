@@ -133,6 +133,82 @@ def get_llm(temperature: float = 0.3, agent_key: str | None = None, **overrides)
         api_key=api_key,
         temperature=temperature,
     )
+
+    # ------------------------------------------------------------------
+    # Robustness knobs (Phase 2G — Gemma-4 stall fix).
+    #
+    # ``timeout`` ----------------------------------------------------
+    # Without an explicit ``timeout`` CrewAI's underlying OpenAI client
+    # falls back to its 600s read timeout *plus* up to two implicit
+    # retries — so a single stalled call on a saturated vLLM can quietly
+    # burn 20+ minutes before either succeeding or failing the run.  We
+    # instead set a long-but-bounded ceiling so a true hang is
+    # recoverable, while leaving plenty of headroom for legit slow
+    # generations on a busy box (Gemma-4 / OSS-120B routinely take 8-12
+    # minutes per debate round when the GPU is contended).
+    #
+    # ``max_retries`` ------------------------------------------------
+    # The OpenAI SDK defaults to ``max_retries=2`` and retries on any
+    # 5xx / connection / read-timeout failure by opening a *new* HTTP
+    # connection — but vLLM never learns the previous request was
+    # abandoned, so it keeps generating tokens for the orphaned call
+    # as a "zombie request".  Verified live with ``vllm:num_requests
+    # _running=3`` while only 2 client sockets were ESTAB on our
+    # runner — i.e. one zombie per stuck Bullish Researcher call.
+    # Zombies consume GPU decode slots and slow down the live request
+    # the client *is* waiting on, which makes the stall worse.
+    #
+    # We default to ``max_retries=0`` so a failed call surfaces as the
+    # ``[[DEGRADED_LLM_TIMEOUT]]`` placeholder (and the run continues)
+    # instead of piling up zombies that the OpenAI client thinks were
+    # retried successfully.  Operators on flaky transports can bump it
+    # back via ``LLM_MAX_RETRIES`` in .env.
+    #
+    # ``max_tokens`` — OPT-IN safety net, not a default performance lever.
+    # ---------------------------------------------------------------------
+    # Capping ``max_tokens`` is a foot-gun in the general case:
+    #   1. For non-thinking models (Gemma-4, OSS-120B, Qwen2.5-Instruct,
+    #      Llama-Chat) any cap risks truncating a legitimately long
+    #      analyst report below the prompted length budget.
+    #   2. For thinking models (Qwen3-Thinking) a cap that fires
+    #      *inside* the ``<think>`` block returns a response starting
+    #      with a raw, unclosed ``<think>...`` prefix — the reasoning
+    #      parser can't split it (needs both start + end tokens) so
+    #      the raw monologue leaks into ``content`` and CrewAI accepts
+    #      the truncated garbage as the final analyst answer.
+    #
+    # Verified live during a COCHINSHIP.NS + Qwen3-32B run: a single
+    # debate turn emitted 24 k tokens in 10 minutes with no exit
+    # condition.  Capping bounds worst-case latency but at real
+    # quality cost.  The better lever for throughput is to run
+    # multiple analyses concurrently (see the session-manager path
+    # in ``web/backend/session_manager.py``) so vLLM's decode batch
+    # size actually grows past 1 — a 4-way batch on 1×H100 with
+    # Qwen3-32B triples aggregate tokens/sec on the workflow.
+    #
+    # We therefore leave ``max_tokens`` UNCAPPED by default (vLLM's
+    # server-side ``max_model_len - prompt_tokens`` remains the
+    # ceiling).  An operator who wants runaway-insurance on top can
+    # opt in by setting ``LLM_MAX_TOKENS`` in the env — the value is
+    # applied to *both* thinking and non-thinking models on the
+    # explicit understanding that it may truncate.  ``0`` (default) or
+    # a negative value disables the cap entirely.
+    try:
+        params["timeout"] = float(os.environ.get("LLM_TIMEOUT_SECONDS", "720"))
+    except ValueError:
+        params["timeout"] = 720.0
+    try:
+        params["max_retries"] = int(os.environ.get("LLM_MAX_RETRIES", "0"))
+    except ValueError:
+        params["max_retries"] = 0
+
+    try:
+        max_tokens_cap = int(os.environ.get("LLM_MAX_TOKENS", "0"))
+    except ValueError:
+        max_tokens_cap = 0
+    if max_tokens_cap > 0:
+        params["max_tokens"] = max_tokens_cap
+
     # Direct kwargs win last.
     params.update(overrides)
     # base_url=None confuses some LiteLLM providers — drop it for the
@@ -140,6 +216,87 @@ def get_llm(temperature: float = 0.3, agent_key: str | None = None, **overrides)
     if params.get("base_url") is None:
         params.pop("base_url", None)
     return LLM(**params)
+
+
+# ---------------------------------------------------------------------------
+# Memory-side LLM — thinking disabled for background utility calls.
+# ---------------------------------------------------------------------------
+#
+# CrewAI's memory subsystem (unified_memory.Memory) calls four LLM
+# helpers on every ``remember()`` and ``search_memory()``:
+#
+#   * ``crewai.memory.analyze.extract_memories_from_content``
+#   * ``crewai.memory.analyze.analyze_query``
+#   * ``crewai.memory.analyze.analyze_for_save``
+#   * ``crewai.memory.analyze.analyze_for_consolidation``
+#
+# The prompts are small-schema classifiers ("pick a scope path, list
+# 3-5 categories, importance 0-1") — the analyst-quality trade-off
+# you'd worry about for a real reasoning task simply does not apply.
+# But with Qwen3-Thinking as the default LLM, each of these calls
+# spent 20-30 k tokens generating a ``<think>`` block before emitting
+# its two-line JSON, and 3-4 of them run in parallel (see
+# ``encoding_flow.py`` ThreadPoolExecutor).  In a live ZENTEC.NS run
+# the vLLM logs showed KV cache climbing 91 % → 99 % at 0 prompt
+# tok/s across 4 concurrent memory-analyze requests until the client
+# hit its 10-min read timeout and gave up ("Memory save analysis
+# failed, using defaults").
+#
+# The fix is client-side and *only* touches memory: we hand CrewAI a
+# dedicated LLM instance whose ``additional_params`` bakes in
+# ``extra_body={"chat_template_kwargs": {"enable_thinking": false}}``.
+# vLLM 0.11.2's chat completions endpoint reads that key and forces
+# Qwen3's template to pre-seed an empty ``<think></think>`` block, so
+# the model skips CoT entirely for exactly these background calls.
+# The main-analyst / debate / PM LLM is unchanged — those still get
+# vanilla Qwen3-Thinking reasoning quality.
+#
+# For non-thinking models (OSS-120B, Gemma-4, Qwen2.5-Instruct, plain
+# Llama), we return the LLM without any override — ``chat_template
+# _kwargs`` would be ignored by vLLM anyway, but litellm complains
+# about unknown params on some providers.
+_THINKING_MODEL_MARKERS = ("qwen3", "qwen/qwen3", "qwen3-thinking")
+
+
+def _is_thinking_model(model_name: str) -> bool:
+    """True iff ``model_name`` is a HF id / provider-prefixed name for a
+    reasoning model that honours the ``enable_thinking`` chat-template
+    kwarg (Qwen3 family today)."""
+    if not model_name:
+        return False
+    lower = model_name.lower()
+    return any(marker in lower for marker in _THINKING_MODEL_MARKERS)
+
+
+def get_memory_llm(**overrides):
+    """Return an LLM instance for CrewAI's memory analyze subsystem.
+
+    Identical to :func:`get_llm` except that when the resolved model
+    is a known thinking model (Qwen3 family), we bake in
+    ``additional_params={"extra_body": {"chat_template_kwargs":
+    {"enable_thinking": False}}}`` so every memory-analyze call skips
+    the chain-of-thought phase.  Non-thinking models get the vanilla
+    LLM unchanged.
+
+    Thread-safe by construction: the returned LLM instance is
+    immutable-in-config and ``additional_params`` is set once at
+    construction, so concurrent ``analyze_for_*`` calls from CrewAI's
+    encoding-flow thread pool cannot race on it.
+    """
+    llm = get_llm(temperature=0.1, **overrides)  # low temp — utility calls, not creativity
+    model_name = str(getattr(llm, "model", "") or "")
+    if not _is_thinking_model(model_name):
+        return llm
+
+    existing = dict(getattr(llm, "additional_params", None) or {})
+    existing_extra = dict(existing.get("extra_body") or {})
+    existing_kwargs = dict(existing_extra.get("chat_template_kwargs") or {})
+    # Explicit request override wins; otherwise force False.
+    existing_kwargs.setdefault("enable_thinking", False)
+    existing_extra["chat_template_kwargs"] = existing_kwargs
+    existing["extra_body"] = existing_extra
+    llm.additional_params = existing
+    return llm
 
 
 def get_embedder_config() -> dict:

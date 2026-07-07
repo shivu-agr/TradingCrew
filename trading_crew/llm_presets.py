@@ -169,6 +169,45 @@ BUILTIN_PRESETS: Dict[str, LlmPreset] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Runtime-registered presets.  The web UI's "serve a model with / without
+# the RLMF LoRA adapter" control launches a vLLM server and then registers
+# the served endpoint(s) here so they show up in the same run-config LLM
+# dropdown as the built-ins — the operator picks "…(with LoRA)" or
+# "…(base)" at inference time without touching ``.env``.  We keep them in
+# a *separate* dict (merged into the catalog by ``list_presets`` /
+# ``set_active``) so they can be swapped wholesale when the served model
+# changes, and never accidentally persist into the built-in catalog.
+# ---------------------------------------------------------------------------
+
+_RUNTIME_PRESETS: Dict[str, LlmPreset] = {}
+_RUNTIME_LOCK = threading.Lock()
+
+
+def register_runtime_preset(preset: LlmPreset) -> None:
+    """Add / replace a runtime preset (keyed by ``preset.id``)."""
+    with _RUNTIME_LOCK:
+        _RUNTIME_PRESETS[preset.id] = preset
+
+
+def clear_runtime_presets(prefix: Optional[str] = None) -> None:
+    """Drop runtime presets — all of them, or only those whose id starts
+    with ``prefix`` (used when a served model is stopped / replaced)."""
+    with _RUNTIME_LOCK:
+        if prefix is None:
+            _RUNTIME_PRESETS.clear()
+            return
+        for pid in [p for p in _RUNTIME_PRESETS if p.startswith(prefix)]:
+            _RUNTIME_PRESETS.pop(pid, None)
+
+
+def _resolve_preset(preset_id: str) -> Optional[LlmPreset]:
+    """Look a preset up in the runtime registry first, then the built-ins."""
+    with _RUNTIME_LOCK:
+        rt = _RUNTIME_PRESETS.get(preset_id)
+    return rt or BUILTIN_PRESETS.get(preset_id)
+
+
 def list_presets() -> List[Dict[str, object]]:
     """Serialisable preset list for ``/api/options``.
 
@@ -177,7 +216,11 @@ def list_presets() -> List[Dict[str, object]]:
     (the env var either doesn't exist or holds the placeholder ``dummy``).
     """
     out: List[Dict[str, object]] = []
-    for preset in BUILTIN_PRESETS.values():
+    with _RUNTIME_LOCK:
+        runtime = list(_RUNTIME_PRESETS.values())
+    # Runtime (server-launched) presets first so they float to the top of
+    # the dropdown right after being served.
+    for preset in [*runtime, *BUILTIN_PRESETS.values()]:
         api_key_val = os.environ.get(preset.api_env) if preset.api_env else None
         configured = bool(api_key_val) and api_key_val.lower() != "dummy"
         # Local vLLM doesn't need a real key — the server ignores it.
@@ -185,8 +228,13 @@ def list_presets() -> List[Dict[str, object]]:
         # entry isn't selectable when the user hasn't configured anything.
         if preset.id == "local-vllm":
             configured = bool(os.environ.get("LOCAL_LLM_MODEL"))
+        # Runtime presets point at a server we just launched locally; the
+        # vLLM endpoint ignores the bearer token, so they're always usable.
+        if preset.id in _RUNTIME_PRESETS:
+            configured = True
         d = asdict(preset)
         d["api_key_configured"] = configured
+        d["runtime"] = preset.id in _RUNTIME_PRESETS
         out.append(d)
     return out
 
@@ -209,7 +257,7 @@ def set_active(preset_id: Optional[str]) -> Optional[LlmPreset]:
     if not preset_id:
         _active.preset = None
         return None
-    preset = BUILTIN_PRESETS.get(preset_id)
+    preset = _resolve_preset(preset_id)
     _active.preset = preset
     return preset
 

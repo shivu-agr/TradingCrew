@@ -1,4 +1,15 @@
-"""TradingCrew — the full 18-agent / 20-task workflow assembled from yaml.
+"""TradingCrew — the lean multi-agent workflow assembled from yaml.
+
+Layout note (post-consolidation)
+--------------------------------
+The analyst team was consolidated from eight narrow desks to FOUR wider
+ones (market+quant, news+social, fundamentals+sector, macro+geopolitical)
+to cut redundant LLM tool-loops and reduce information dilution.  The
+Quality Reviewer and Compliance Officer are now OPTIONAL (toggle-gated,
+default off) and, when enabled, run ASYNC as advisory inputs to the
+Portfolio Manager rather than as sequential gates in front of the
+trader — so they overlap the trader/risk stretch instead of extending
+the critical path.
 
 Layout
 ------
@@ -28,10 +39,24 @@ from crewai import Agent, Crew, Process, Task
 from crewai.project import CrewBase, agent, crew, task
 
 from . import tools as T
-from ._common import get_embedder_config, get_llm
+from ._common import get_embedder_config, get_llm, get_memory_llm
 from .guardrails import confidence_guardrail
 from .schemas import PortfolioDecision
 from .tools import ALL_TOOLS, DEFAULT_AGENT_TOOLS
+
+
+def _rlmf_prefix_enabled() -> bool:
+    """Return True iff ``TRADINGCREW_RLMF_ENABLED`` is truthy.
+
+    The RLMF (Reinforcement-Learning from Market Feedback) few-shot
+    prefix is an experimental hook — we default it to OFF so a fresh
+    install with no resolved episodes doesn't quietly change PM
+    behaviour.  Operators can flip it on with
+    ``TRADINGCREW_RLMF_ENABLED=1`` once they have a case-book of
+    resolved decisions worth learning from.
+    """
+    raw = os.environ.get("TRADINGCREW_RLMF_ENABLED", "0")
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
 
 
 @CrewBase
@@ -50,8 +75,10 @@ class TradingCrew:
         risk_rounds: int = 1,
         step_callback: Optional[Callable[[Any], None]] = None,
         task_callback: Optional[Callable[[Any], None]] = None,
-        memory: bool = True,
+        memory: bool = False,
         tools_enabled: Optional[Dict[str, List[str]]] = None,
+        quality_review_enabled: bool = False,
+        compliance_enabled: bool = False,
     ) -> None:
         self.ticker = ticker
         self.debate_rounds = debate_rounds
@@ -59,6 +86,10 @@ class TradingCrew:
         self._step_callback = step_callback
         self._task_callback = task_callback
         self._use_memory = memory
+        # Optional advisory reviewers.  Default OFF so a normal run is
+        # lean; when ON they run async and feed the PM (see @crew).
+        self._quality_review_enabled = bool(quality_review_enabled)
+        self._compliance_enabled = bool(compliance_enabled)
         # Per-agent tool whitelist. Falls back to DEFAULT_AGENT_TOOLS when an
         # agent key is missing — so an empty dict gets default behaviour.
         self._tools_enabled: Dict[str, List[str]] = tools_enabled or {}
@@ -127,66 +158,45 @@ class TradingCrew:
 
     @agent
     def market_analyst(self) -> Agent:
+        # Merged market + quant desk: price/technicals + options/positioning.
         return Agent(
             config=self.agents_config["market_analyst"],
             tools=self._tools_for("market_analyst"),
-            **self._agent_kwargs(max_iter=8, agent_key="market_analyst"),
-        )
-
-    @agent
-    def social_analyst(self) -> Agent:
-        return Agent(
-            config=self.agents_config["social_analyst"],
-            tools=self._tools_for("social_analyst"),
-            **self._agent_kwargs(agent_key="social_analyst"),
+            **self._agent_kwargs(max_iter=10, agent_key="market_analyst"),
         )
 
     @agent
     def news_analyst(self) -> Agent:
+        # Merged news + social desk.  max_iter sized for the 5-tool budget
+        # in news_task (each tool call burns roughly 2 reasoning
+        # iterations).  Keep just enough headroom for one retry; tighter
+        # than that and OSS-120B can't finish; looser and it gets stuck
+        # in tool-call loops on Indian tickers (the LT.NS / BHARATFORG.NS
+        # / BAJAJ-AUTO.NS degraded-output pattern).
         return Agent(
             config=self.agents_config["news_analyst"],
             tools=self._tools_for("news_analyst"),
-            **self._agent_kwargs(max_iter=8, agent_key="news_analyst"),
+            **self._agent_kwargs(max_iter=12, agent_key="news_analyst"),
         )
 
     @agent
     def fundamentals_analyst(self) -> Agent:
+        # Merged fundamentals + sector desk: financials + long-term thesis
+        # + peer relative strength (7 tools).
         return Agent(
             config=self.agents_config["fundamentals_analyst"],
             tools=self._tools_for("fundamentals_analyst"),
-            **self._agent_kwargs(max_iter=10, agent_key="fundamentals_analyst"),
+            **self._agent_kwargs(max_iter=12, agent_key="fundamentals_analyst"),
         )
 
     @agent
     def macro_analyst(self) -> Agent:
+        # Merged macro + geopolitical desk: macro regime + geopolitical +
+        # supply-chain (5 tools).
         return Agent(
             config=self.agents_config["macro_analyst"],
             tools=self._tools_for("macro_analyst"),
-            **self._agent_kwargs(agent_key="macro_analyst"),
-        )
-
-    @agent
-    def geopolitical_analyst(self) -> Agent:
-        return Agent(
-            config=self.agents_config["geopolitical_analyst"],
-            tools=self._tools_for("geopolitical_analyst"),
-            **self._agent_kwargs(max_iter=8, agent_key="geopolitical_analyst"),
-        )
-
-    @agent
-    def sector_analyst(self) -> Agent:
-        return Agent(
-            config=self.agents_config["sector_analyst"],
-            tools=self._tools_for("sector_analyst"),
-            **self._agent_kwargs(agent_key="sector_analyst"),
-        )
-
-    @agent
-    def quant_analyst(self) -> Agent:
-        return Agent(
-            config=self.agents_config["quant_analyst"],
-            tools=self._tools_for("quant_analyst"),
-            **self._agent_kwargs(agent_key="quant_analyst"),
+            **self._agent_kwargs(max_iter=10, agent_key="macro_analyst"),
         )
 
     # ---- Researcher Team --------------------------------------------------
@@ -257,14 +267,6 @@ class TradingCrew:
         )
 
     @task
-    def social_task(self) -> Task:
-        return Task(
-            config=self.tasks_config["social_task"],
-            agent=self.social_analyst(),
-            async_execution=True,
-        )
-
-    @task
     def news_task(self) -> Task:
         return Task(
             config=self.tasks_config["news_task"],
@@ -288,30 +290,6 @@ class TradingCrew:
             async_execution=True,
         )
 
-    @task
-    def geopolitical_task(self) -> Task:
-        return Task(
-            config=self.tasks_config["geopolitical_task"],
-            agent=self.geopolitical_analyst(),
-            async_execution=True,
-        )
-
-    @task
-    def sector_task(self) -> Task:
-        return Task(
-            config=self.tasks_config["sector_task"],
-            agent=self.sector_analyst(),
-            async_execution=True,
-        )
-
-    @task
-    def quant_task(self) -> Task:
-        return Task(
-            config=self.tasks_config["quant_task"],
-            agent=self.quant_analyst(),
-            async_execution=True,
-        )
-
     # =======================================================================
     # Crew — wires everything together, including the dynamic debate rounds.
     # =======================================================================
@@ -320,13 +298,9 @@ class TradingCrew:
     def crew(self) -> Crew:
         analyst_tasks = [
             self.market_task(),
-            self.social_task(),
             self.news_task(),
             self.fundamentals_task(),
             self.macro_task(),
-            self.geopolitical_task(),
-            self.sector_task(),
-            self.quant_task(),
         ]
 
         # ---- Bull / Bear debate ------------------------------------------
@@ -358,23 +332,33 @@ class TradingCrew:
             debate_tasks += [bull_t, bear_t]
             debate_ctx += [bull_t, bear_t]
 
-        # ---- Research Manager synthesis + Quality Review -----------------
+        # ---- Research Manager synthesis ----------------------------------
         research_synthesis = Task(
             config=self.tasks_config["research_synthesis"],
             agent=self.research_manager(),
             context=list(debate_ctx),
         )
-        quality_review = Task(
-            config=self.tasks_config["quality_review"],
-            agent=self.quality_reviewer(),
-            context=[research_synthesis] + list(debate_ctx),
-        )
+
+        # ---- Quality Review (optional, ASYNC advisory to the PM) ---------
+        # When enabled we mark it ``async_execution=True`` and DO NOT wire
+        # it into the trader's context.  It only depends on the research
+        # synthesis + debate, so it fans out in parallel with the
+        # trader/risk stretch and is awaited only by the PM (which lists
+        # it in context).  This keeps it off the critical path.
+        quality_review: Optional[Task] = None
+        if self._quality_review_enabled:
+            quality_review = Task(
+                config=self.tasks_config["quality_review"],
+                agent=self.quality_reviewer(),
+                context=[research_synthesis] + list(debate_ctx),
+                async_execution=True,
+            )
 
         # ---- Trader ------------------------------------------------------
         trader_t = Task(
             config=self.tasks_config["trader_task"],
             agent=self.trader(),
-            context=[research_synthesis, quality_review] + list(debate_ctx),
+            context=[research_synthesis] + list(debate_ctx),
         )
 
         # ---- Risk debate -------------------------------------------------
@@ -382,7 +366,7 @@ class TradingCrew:
         cons_cfg = self.tasks_config["risk_conservative_round"]
         neut_cfg = self.tasks_config["risk_neutral_round"]
         risk_tasks: List[Task] = []
-        risk_ctx: List[Task] = [trader_t, research_synthesis, quality_review]
+        risk_ctx: List[Task] = [trader_t, research_synthesis]
         for r in range(1, self.risk_rounds + 1):
             # Phase 2E — Aggressive and Conservative argue *independently*
             # from the same prior context.  Marking both
@@ -427,41 +411,109 @@ class TradingCrew:
             risk_tasks += [aggr, cons, neut]
             risk_ctx += [aggr, cons, neut]
 
-        # ---- Compliance + PM --------------------------------------------
-        compliance = Task(
-            config=self.tasks_config["compliance_review"],
-            agent=self.compliance_officer(),
-            context=[trader_t, research_synthesis] + list(risk_tasks),
-        )
+        # ---- Compliance (optional, advisory to the PM) ------------------
+        compliance: Optional[Task] = None
+        if self._compliance_enabled:
+            compliance = Task(
+                config=self.tasks_config["compliance_review"],
+                agent=self.compliance_officer(),
+                context=[trader_t, research_synthesis] + list(risk_tasks),
+                # Async so it overlaps the (also-async) Quality Review
+                # when both are on; the PM awaits it.
+                async_execution=True,
+            )
+
+        # ---- PM ----------------------------------------------------------
+        # Give the PM DIRECT sight of the raw analyst reports (TLDRs +
+        # bodies) on top of the manager's 3-driver/3-risk synthesis and
+        # the risk chain.  Without this the final decision only sees the
+        # manager's heavily-compressed thesis, so the non-yfinance lenses
+        # (news / geopolitical / macro / sector) get diluted out before
+        # the decision is made.  The hosted model's 131K window
+        # comfortably fits the extra context.  The optional Quality
+        # Review + Compliance advisory tasks (async) are appended when
+        # enabled — the PM awaits them here without them gating the
+        # trader / risk chain.
+        pm_context: List[Task] = list(analyst_tasks) + list(risk_ctx)
+        if quality_review is not None:
+            pm_context.append(quality_review)
+        if compliance is not None:
+            pm_context.append(compliance)
         pm = Task(
             config=self.tasks_config["pm_decision"],
             agent=self.portfolio_manager(),
-            context=list(risk_ctx) + [compliance],
+            context=pm_context,
             output_pydantic=PortfolioDecision,
             guardrail=confidence_guardrail,
             guardrail_max_retries=2,
         )
+        # RLMF prefix — inject a compact block of past wins-to-emulate
+        # and losses-to-avoid, ranked by realised market-alignment
+        # reward.  Gated by ``TRADINGCREW_RLMF_ENABLED`` so users on a
+        # cold cache (no resolved episodes yet) don't waste tokens on
+        # an empty prefix, and so a debugging user can A/B the effect
+        # by flipping it off.  Wired here (not in tasks.yaml) because
+        # the exemplar pool changes every run — a YAML string can't
+        # capture that.
+        if _rlmf_prefix_enabled():
+            try:
+                from trading_crew.agentic.rlmf import build_few_shot_pool
+                prefix = build_few_shot_pool(
+                    symbol=self.ticker,
+                    k_wins=int(os.environ.get("TRADINGCREW_RLMF_K_WINS", "3")),
+                    k_losses=int(os.environ.get("TRADINGCREW_RLMF_K_LOSSES", "2")),
+                )
+                if prefix:
+                    pm.description = f"{prefix}\n\n{pm.description}"
+            except Exception:
+                # RLMF is an experimental hook — never crash a workflow
+                # on a bad prefix build.  The regular prompt still runs.
+                import logging
+                logging.getLogger(__name__).warning(
+                    "RLMF prefix build failed; falling back to plain prompt",
+                    exc_info=True,
+                )
 
-        all_tasks = (
-            analyst_tasks
-            + debate_tasks
-            + [research_synthesis, quality_review, trader_t]
-            + risk_tasks
-            + [compliance, pm]
+        # Assemble the task list.  CrewAI's sequential process drains all
+        # pending async futures at the next SYNC task, so an async task
+        # only truly overlaps its async siblings (not the sync tasks that
+        # follow it).  We therefore place the optional Quality Review +
+        # Compliance reviewers as a CONSECUTIVE async pair immediately
+        # before the PM: when BOTH are enabled they run concurrently with
+        # each other and the PM (sync) awaits both — so the critical-path
+        # cost of the reviewers is max(QR, compliance) instead of their
+        # sum.  The PM stays sync + last, satisfying CrewAI's
+        # "end with at most one async task" rule.
+        all_tasks: List[Task] = (
+            list(analyst_tasks)
+            + list(debate_tasks)
+            + [research_synthesis, trader_t]
+            + list(risk_tasks)
         )
+        if quality_review is not None:
+            all_tasks.append(quality_review)
+        if compliance is not None:
+            all_tasks.append(compliance)
+        all_tasks.append(pm)
+
+        agents = [
+            self.market_analyst(),
+            self.news_analyst(),
+            self.fundamentals_analyst(),
+            self.macro_analyst(),
+            self.bull_researcher(), self.bear_researcher(),
+            self.research_manager(),
+        ]
+        if quality_review is not None:
+            agents.append(self.quality_reviewer())
+        agents.append(self.trader())
+        agents += [self.risk_aggressive(), self.risk_neutral(), self.risk_conservative()]
+        if compliance is not None:
+            agents.append(self.compliance_officer())
+        agents.append(self.portfolio_manager())
 
         crew_kwargs: dict = dict(
-            agents=[
-                self.market_analyst(), self.social_analyst(),
-                self.news_analyst(), self.fundamentals_analyst(),
-                self.macro_analyst(), self.geopolitical_analyst(),
-                self.sector_analyst(), self.quant_analyst(),
-                self.bull_researcher(), self.bear_researcher(),
-                self.research_manager(), self.quality_reviewer(),
-                self.trader(),
-                self.risk_aggressive(), self.risk_neutral(), self.risk_conservative(),
-                self.compliance_officer(), self.portfolio_manager(),
-            ],
+            agents=agents,
             tasks=all_tasks,
             process=Process.sequential,
             verbose=True,
@@ -512,12 +564,47 @@ class TradingCrew:
             # memory directory.
             preset_id = embedding_presets.get_active_preset_id() or "default"
             mem = Memory(
-                llm=get_llm(),
+                # get_memory_llm() returns the same LLM as get_llm() for
+                # non-thinking models, but bakes ``enable_thinking=false``
+                # into the chat-template kwargs for Qwen3-family models
+                # so CrewAI's four internal memory-analyze helpers
+                # (analyze_for_save / _consolidation / _query,
+                # extract_memories_from_content) don't spend 20-30 k
+                # tokens each on chain-of-thought for a two-line JSON
+                # classifier response.  See ``trading_crew._common.
+                # get_memory_llm`` for the full rationale — this fix
+                # avoids the KV-cache saturation that surfaced as
+                # ``Memory save analysis failed, using defaults`` after
+                # a 10-min OpenAI SDK read timeout in the ZENTEC.NS +
+                # Qwen3-32B run.  Main-agent / debate / PM LLMs are
+                # unchanged and still get full Qwen3-Thinking quality.
+                llm=get_memory_llm(),
                 embedder=get_embedder_config(),
                 root_scope=(
                     f"/crew/{sanitize_scope_name(crew_name)}"
                     f"/emb/{sanitize_scope_name(preset_id)}"
                 ),
+                # Disable the LLM-based consolidation pass on save.
+                # CrewAI's default ``consolidation_threshold=0.85`` fires
+                # an ``analyze_for_consolidation`` LLM call whenever a
+                # newly saved memory is semantically similar to an
+                # existing record — the LLM is asked to decide whether
+                # to merge / update / drop.  For our workflow this is
+                # almost always wasted budget: every analyst writes a
+                # fresh structured TLDR + body, ticker scope already
+                # partitions records by symbol, and we WANT successive
+                # runs to keep their distinct snapshots for trend audit
+                # rather than be collapsed by the consolidator.
+                #
+                # Setting the threshold to 1.0 falls into the encoding
+                # flow's Group A / C "no consolidation" path — saves
+                # one LLM call per ``remember()`` invocation (CrewAI
+                # silently fires one per task on memory=True) with
+                # zero impact on retrieval quality.  Search behaviour
+                # is unchanged; only the redundant merge-pass is gone.
+                # Confirmed by reading ``crewai.memory.encoding_flow``
+                # decision matrix at the time of this writing.
+                consolidation_threshold=1.0,
             )
             # Replace the default 1-worker save pool with a parallel one.
             # We shut the old pool down first (it has no in-flight work

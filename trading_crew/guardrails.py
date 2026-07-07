@@ -17,9 +17,12 @@ def confidence_guardrail(task_output) -> Tuple[bool, Any]:
     Triggered by CrewAI when ``pm_task`` finishes. Rejects any of:
 
     * Output that did not parse to ``PortfolioDecision``.
-    * ``confidence > 0.88`` with ``action != NEUTRAL`` (single-name overconfidence).
+    * ``confidence > 0.88`` with ``action != HOLD`` (single-name overconfidence).
     * ``size_pct_of_book > 5`` with ``confidence < 0.7`` (over-sizing on weak conviction).
     * ``compliance_status == "BLOCKED"`` but action / size not zeroed out.
+    * ``action == "HOLD"`` with non-zero size, or a directional action
+      (BUY/STRONG_BUY/SELL/STRONG_SELL) with ``size_pct_of_book == 0``
+      — internally inconsistent by construction.
     """
     decision: PortfolioDecision | None = task_output.pydantic
     if decision is None:
@@ -29,10 +32,11 @@ def confidence_guardrail(task_output) -> Tuple[bool, Any]:
             "confidence, size_pct_of_book, entry_price, stop_loss, "
             "target_price, horizon_days, expected_return_pct, rationale, "
             "key_drivers, key_risks, falsifiers, geopolitical_flags, "
-            "compliance_status."
+            "compliance_status. action MUST be one of STRONG_BUY, BUY, "
+            "HOLD, SELL, STRONG_SELL."
         ))
 
-    if decision.confidence > 0.88 and decision.action != "NEUTRAL":
+    if decision.confidence > 0.88 and decision.action != "HOLD":
         return (False, (
             f"confidence={decision.confidence:.2f} is implausibly high "
             "for a single-name trade with macro/news/geopolitical risk. "
@@ -49,12 +53,29 @@ def confidence_guardrail(task_output) -> Tuple[bool, Any]:
         ))
 
     if decision.compliance_status == "BLOCKED" and (
-        decision.action != "NEUTRAL" or decision.size_pct_of_book != 0
+        decision.action != "HOLD" or decision.size_pct_of_book != 0
     ):
         return (False, (
-            "compliance_status is BLOCKED but action != NEUTRAL or "
-            "size != 0. Re-emit with action='NEUTRAL' and "
-            "size_pct_of_book=0."
+            "compliance_status is BLOCKED but action != HOLD or size != 0. "
+            "Re-emit with action='HOLD' and size_pct_of_book=0."
+        ))
+
+    # Internal consistency between the action tier and the sizing field.
+    # ``HOLD`` means "sit out"; a HOLD with size > 0 is contradictory and
+    # will confuse both the M1 bridge and the UI badge.  Conversely, a
+    # directional tier with size == 0 is a NEUTRAL in disguise — the PM
+    # should have picked HOLD instead.
+    if decision.action == "HOLD" and decision.size_pct_of_book != 0:
+        return (False, (
+            f"action=HOLD but size_pct_of_book={decision.size_pct_of_book:.2f}. "
+            "HOLD means sit-out; set size_pct_of_book=0 or change the action "
+            "to BUY/STRONG_BUY/SELL/STRONG_SELL to match the sizing."
+        ))
+    if decision.action != "HOLD" and decision.size_pct_of_book == 0:
+        return (False, (
+            f"action={decision.action} but size_pct_of_book=0. A directional "
+            "call must carry positive sizing; if you truly want no exposure, "
+            "set action=HOLD."
         ))
 
     return (True, decision)

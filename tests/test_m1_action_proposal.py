@@ -135,7 +135,12 @@ def test_horizon_days_must_be_positive_and_capped():
     with pytest.raises(ValidationError):
         ActionProposal(**_kwargs(horizon_days=0))
     with pytest.raises(ValidationError):
-        ActionProposal(**_kwargs(horizon_days=500))
+        # 1500 > 1260 (the five-trading-year LONG-tier accounting cap).
+        # Values in [1, 1260] are legal: 500 is a legitimate MEDIUM-tier
+        # horizon (~2y), 1260 is a legitimate LONG-tier cap.
+        ActionProposal(**_kwargs(horizon_days=1500))
+    ActionProposal(**_kwargs(horizon_days=500))
+    ActionProposal(**_kwargs(horizon_days=1260))
 
 
 # ---------------------------------------------------------------------------

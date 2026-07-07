@@ -43,14 +43,11 @@ def make_event(event_type: str, **fields: Any) -> Dict[str, Any]:
 # verbatim by both crews and intentionally maps to the same kind).
 NODE_KIND: Dict[str, str] = {
     # --- stock crew (trading_crew/config/agents.yaml) ---
+    # 4 merged analyst desks (consolidated from 8).
     "Market Analyst": "analyst",
-    "Social Analyst": "analyst",
     "News Analyst": "analyst",
     "Fundamentals Analyst": "analyst",
     "Macro Analyst": "analyst",
-    "Geopolitical Analyst": "analyst",
-    "Sector / Peer Analyst": "analyst",
-    "Quant / Options Analyst": "analyst",
     "Bullish Researcher": "bull",
     "Bearish Researcher": "bear",
     "Research Manager": "manager",

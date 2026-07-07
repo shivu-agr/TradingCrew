@@ -30,6 +30,8 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
+from trading_crew.horizons import MAX_ACTIONABLE_HORIZON_DAYS
+
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -212,10 +214,16 @@ class ActionProposal(BaseModel):
         description=(
             "Intended holding period in trading days. Drives the M3 outcome-"
             "embargo: the episode cannot be retrieved by future runs until "
-            "horizon_days have elapsed."
+            "horizon_days have elapsed. The upper bound of 1260 (five "
+            "trading years) matches the LONG-tier accounting cap in "
+            "``horizons.MAX_ACTIONABLE_HORIZON_DAYS`` — LONG-tier "
+            "decisions express a 5-10 year *narrative* view (see "
+            "``PortfolioDecision.long_term_view``) but resolve for outcome "
+            "accounting at 5 years so the reflection loop and backtester "
+            "still finish within a bounded review window."
         ),
         ge=1,
-        le=252,
+        le=MAX_ACTIONABLE_HORIZON_DAYS,
     )
 
     # -- conviction & rationale --------------------------------------------

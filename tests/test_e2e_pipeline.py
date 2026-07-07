@@ -32,7 +32,7 @@ def _synthetic_ohlcv(days: int = 260) -> pd.DataFrame:
 
 def _decision(**overrides) -> PortfolioDecision:
     base = dict(
-        action="OVERWEIGHT",
+        action="BUY",
         confidence=0.75,
         size_pct_of_book=5.0,
         entry_price=150.0,
@@ -51,8 +51,8 @@ def _decision(**overrides) -> PortfolioDecision:
     return PortfolioDecision(**base)
 
 
-def test_overweight_decision_flows_through_to_fill(tmp_path, monkeypatch):
-    """Happy path: a clean OVERWEIGHT decision turns into a BUY proposal,
+def test_buy_decision_flows_through_to_fill(tmp_path, monkeypatch):
+    """Happy path: a clean BUY decision turns into a BUY proposal,
     survives the risk gates with non-zero size, and books a fill."""
     monkeypatch.setenv("TRADINGAGENTS_PORTFOLIO_DIR", str(tmp_path / "portfolio"))
     proposal = portfolio_decision_to_action_proposal(
@@ -71,13 +71,13 @@ def test_overweight_decision_flows_through_to_fill(tmp_path, monkeypatch):
     assert result.note or result.fill or result.rejected
 
 
-def test_underweight_high_size_fails_concentration_or_passes(tmp_path, monkeypatch):
-    """An UNDERWEIGHT with 50% size is concentrated; either the sizer
-    clamps it or the risk gate rejects. Either way the result envelope
-    captures a structured outcome — *never* an exception."""
+def test_sell_high_size_fails_concentration_or_passes(tmp_path, monkeypatch):
+    """A SELL with 50% size is concentrated; either the sizer clamps it
+    or the risk gate rejects. Either way the result envelope captures a
+    structured outcome — *never* an exception."""
     monkeypatch.setenv("TRADINGAGENTS_PORTFOLIO_DIR", str(tmp_path / "portfolio"))
     proposal = portfolio_decision_to_action_proposal(
-        _decision(action="UNDERWEIGHT", size_pct_of_book=50.0),
+        _decision(action="SELL", size_pct_of_book=50.0),
         symbol="MSFT",
         decision_ts="2025-06-01",
     )
@@ -95,12 +95,12 @@ def test_underweight_high_size_fails_concentration_or_passes(tmp_path, monkeypat
     assert sized_below_intent or gate_caught
 
 
-def test_neutral_decision_results_in_zero_action(tmp_path, monkeypatch):
-    """NEUTRAL -> HOLD: no order, no fill, no rejection — just a clean
-    record that we deliberately did nothing."""
+def test_hold_decision_results_in_zero_action(tmp_path, monkeypatch):
+    """HOLD -> ``ActionSide.HOLD``: no order, no fill, no rejection —
+    just a clean record that we deliberately did nothing."""
     monkeypatch.setenv("TRADINGAGENTS_PORTFOLIO_DIR", str(tmp_path / "portfolio"))
     proposal = portfolio_decision_to_action_proposal(
-        _decision(action="NEUTRAL", size_pct_of_book=0.0, expected_return_pct=0.0),
+        _decision(action="HOLD", size_pct_of_book=0.0, expected_return_pct=0.0),
         symbol="SPY",
         decision_ts="2025-06-01",
     )

@@ -50,13 +50,9 @@
   // fall through to "no tooltip" — they don't crash.
   const AGENT_HELP_ANCHORS = {
     "Market Analyst": "agent.market_analyst",
-    "Social Analyst": "agent.social_analyst",
     "News Analyst": "agent.news_analyst",
     "Fundamentals Analyst": "agent.fundamentals_analyst",
     "Macro Analyst": "agent.macro_analyst",
-    "Geopolitical Analyst": "agent.geopolitical_analyst",
-    "Sector / Peer Analyst": "agent.sector_analyst",
-    "Quant / Options Analyst": "agent.quant_analyst",
     "Bullish Researcher": "agent.bull_researcher",
     "Bearish Researcher": "agent.bear_researcher",
     "Research Manager": "agent.research_manager",
@@ -140,15 +136,12 @@
   const STOCK_MID_Y = 150;
 
   const STOCK_NODES = [
-    // Analyst team — 2 columns × 4 rows (parallel)
-    { id: "Market Analyst",          label: "Market",          kind: "analyst",  x: STOCK_ANALYST_X_A, y: STOCK_ANALYST_Y0 + 0 * STOCK_ANALYST_ROW_GAP, hasTools: "market_analyst" },
-    { id: "Social Analyst",          label: "Social",          kind: "analyst",  x: STOCK_ANALYST_X_A, y: STOCK_ANALYST_Y0 + 1 * STOCK_ANALYST_ROW_GAP, hasTools: "social_analyst" },
-    { id: "News Analyst",            label: "News",            kind: "analyst",  x: STOCK_ANALYST_X_A, y: STOCK_ANALYST_Y0 + 2 * STOCK_ANALYST_ROW_GAP, hasTools: "news_analyst" },
-    { id: "Fundamentals Analyst",    label: "Fundamentals",    kind: "analyst",  x: STOCK_ANALYST_X_A, y: STOCK_ANALYST_Y0 + 3 * STOCK_ANALYST_ROW_GAP, hasTools: "fundamentals_analyst" },
-    { id: "Macro Analyst",           label: "Macro",           kind: "analyst",  x: STOCK_ANALYST_X_B, y: STOCK_ANALYST_Y0 + 0 * STOCK_ANALYST_ROW_GAP, hasTools: "macro_analyst" },
-    { id: "Geopolitical Analyst",    label: "Geopolitical",    kind: "analyst",  x: STOCK_ANALYST_X_B, y: STOCK_ANALYST_Y0 + 1 * STOCK_ANALYST_ROW_GAP, hasTools: "geopolitical_analyst" },
-    { id: "Sector / Peer Analyst",   label: "Sector / Peer",   kind: "analyst",  x: STOCK_ANALYST_X_B, y: STOCK_ANALYST_Y0 + 2 * STOCK_ANALYST_ROW_GAP, hasTools: "sector_analyst" },
-    { id: "Quant / Options Analyst", label: "Quant / Options", kind: "analyst",  x: STOCK_ANALYST_X_B, y: STOCK_ANALYST_Y0 + 3 * STOCK_ANALYST_ROW_GAP, hasTools: "quant_analyst" },
+    // Analyst team — 4 merged desks, single column (parallel).  The
+    // labels name the merged remit so the diagram reads honestly.
+    { id: "Market Analyst",          label: "Market + Quant",  kind: "analyst",  x: STOCK_ANALYST_X_A, y: STOCK_ANALYST_Y0 + 0 * STOCK_ANALYST_ROW_GAP, hasTools: "market_analyst" },
+    { id: "News Analyst",            label: "News + Social",   kind: "analyst",  x: STOCK_ANALYST_X_A, y: STOCK_ANALYST_Y0 + 1 * STOCK_ANALYST_ROW_GAP, hasTools: "news_analyst" },
+    { id: "Fundamentals Analyst",    label: "Fund. + Sector",  kind: "analyst",  x: STOCK_ANALYST_X_A, y: STOCK_ANALYST_Y0 + 2 * STOCK_ANALYST_ROW_GAP, hasTools: "fundamentals_analyst" },
+    { id: "Macro Analyst",           label: "Macro + Geo",     kind: "analyst",  x: STOCK_ANALYST_X_A, y: STOCK_ANALYST_Y0 + 3 * STOCK_ANALYST_ROW_GAP, hasTools: "macro_analyst" },
 
     // Researcher team — Bull / Bear stack (genuine parallel debate)
     { id: "Bullish Researcher",      label: "Bullish",         kind: "bull",     x: STOCK_COL_BULL_BEAR, y: 80 },
@@ -175,29 +168,23 @@
   const STOCK_EDGES = [
     // analysts -> bull
     ["Market Analyst", "Bullish Researcher"],
-    ["Social Analyst", "Bullish Researcher"],
     ["News Analyst", "Bullish Researcher"],
     ["Fundamentals Analyst", "Bullish Researcher"],
     ["Macro Analyst", "Bullish Researcher"],
-    ["Geopolitical Analyst", "Bullish Researcher"],
-    ["Sector / Peer Analyst", "Bullish Researcher"],
-    ["Quant / Options Analyst", "Bullish Researcher"],
     // analysts -> bear
     ["Market Analyst", "Bearish Researcher"],
-    ["Social Analyst", "Bearish Researcher"],
     ["News Analyst", "Bearish Researcher"],
     ["Fundamentals Analyst", "Bearish Researcher"],
     ["Macro Analyst", "Bearish Researcher"],
-    ["Geopolitical Analyst", "Bearish Researcher"],
-    ["Sector / Peer Analyst", "Bearish Researcher"],
-    ["Quant / Options Analyst", "Bearish Researcher"],
-    // bull/bear -> Research Manager + Quality Reviewer
+    // bull/bear -> Research Manager
     ["Bullish Researcher", "Research Manager"],
     ["Bearish Researcher", "Research Manager"],
-    ["Research Manager", "Quality Reviewer"],
-    // research -> trader
+    // research -> trader (Quality Reviewer is now advisory to the PM,
+    // not a trader gate)
     ["Research Manager", "Trader"],
-    ["Quality Reviewer", "Trader"],
+    // Quality Reviewer (optional) advises the PM directly
+    ["Research Manager", "Quality Reviewer"],
+    ["Quality Reviewer", "Portfolio Manager"],
     // trader -> risk (the SERPENTINE PIVOT — trader on top row, risk
     // team directly below it on row 2; we route this with a vertical
     // bezier instead of the horizontal LR one)
@@ -220,8 +207,8 @@
   // not as giant empty boxes.  Each group box wraps the cells of its
   // column(s) with a small padding (8 px each side).
   const STOCK_GROUPS = [
-    // Analyst grid (2 cols × 4 rows) — spans x=12..308 / y=6..276
-    { label: "Analyst team",     x: 12,   y: 6,   w: 296, h: 270 },
+    // Analyst grid (1 col × 4 merged desks) — spans x=12..168 / y=6..276
+    { label: "Analyst team",     x: 12,   y: 6,   w: 156, h: 270 },
     // Researcher team wraps Bull/Bear (col 3) + Research Mgr (col 4) +
     // Quality Reviewer (col 5).  Left edge = col_bull_bear - 8, right
     // edge = col_q_rev + 140 + 8.

@@ -25,7 +25,8 @@ The script writes:
                                                   ticket / chat
 
 Bias signals to look for in the markdown summary:
-    * All US tickers OVERWEIGHT / all India tickers NEUTRAL (or vice versa)
+    * All US tickers BUY / STRONG_BUY while all India tickers HOLD
+      (or vice versa)
     * Confidence band materially different by country / sector
     * Compliance status BLOCKED concentrated in one country
 """
@@ -190,12 +191,25 @@ def _write_report(rows: list[BasketRow], summary: dict, out_dir: Path) -> tuple[
     lines.append("")
     lines.append("## Decision mix by country")
     lines.append("")
-    lines.append("| Country | OVERWEIGHT | NEUTRAL | UNDERWEIGHT | ERROR |")
-    lines.append("|---|---|---|---|---|")
+    # Report on the retail 5-tier action alphabet.  Older records that
+    # still carry the legacy triplet are collapsed at aggregation time
+    # (OVERWEIGHT → BUY, UNDERWEIGHT → SELL, NEUTRAL → HOLD) so a mixed
+    # basket (new + old runs) still sums correctly.
+    _LEGACY = {"OVERWEIGHT": "BUY", "UNDERWEIGHT": "SELL", "NEUTRAL": "HOLD"}
+
+    def _tier_count(c: dict, tier: str) -> int:
+        legacy_key = {v: k for k, v in _LEGACY.items()}.get(tier)
+        return c.get(tier, 0) + (c.get(legacy_key, 0) if legacy_key else 0)
+
+    lines.append(
+        "| Country | STRONG_BUY | BUY | HOLD | SELL | STRONG_SELL | ERROR |"
+    )
+    lines.append("|---|---|---|---|---|---|---|")
     for country, c in summary["actions_by_country"].items():
         lines.append(
-            f"| {country} | {c.get('OVERWEIGHT', 0)} | {c.get('NEUTRAL', 0)} | "
-            f"{c.get('UNDERWEIGHT', 0)} | {c.get('ERROR', 0)} |"
+            f"| {country} | {c.get('STRONG_BUY', 0)} | {_tier_count(c, 'BUY')} | "
+            f"{_tier_count(c, 'HOLD')} | {_tier_count(c, 'SELL')} | "
+            f"{c.get('STRONG_SELL', 0)} | {c.get('ERROR', 0)} |"
         )
     lines.append("")
     lines.append("## Per-ticker decisions")
@@ -219,25 +233,42 @@ def _write_report(rows: list[BasketRow], summary: dict, out_dir: Path) -> tuple[
     lines.append("## Bias diagnostics")
     lines.append("")
     by_country = summary["actions_by_country"]
+
+    def _long_share(country_counts: dict) -> float:
+        """Share of directional-long tiers (BUY / STRONG_BUY, plus the
+        legacy ``OVERWEIGHT`` alias) in a country's total decisions."""
+        total = max(1, sum(country_counts.values()))
+        longs = (country_counts.get("BUY", 0)
+                 + country_counts.get("STRONG_BUY", 0)
+                 + country_counts.get("OVERWEIGHT", 0))
+        return longs / total
+
     if "US" in by_country and "India" in by_country:
-        us_overweight_rate = by_country["US"].get("OVERWEIGHT", 0) / max(1, sum(by_country["US"].values()))
-        in_overweight_rate = by_country["India"].get("OVERWEIGHT", 0) / max(1, sum(by_country["India"].values()))
-        gap = abs(us_overweight_rate - in_overweight_rate)
+        us_long_rate = _long_share(by_country["US"])
+        in_long_rate = _long_share(by_country["India"])
+        gap = abs(us_long_rate - in_long_rate)
         if gap >= 0.5:
             lines.append(
-                f"- ⚠️ Large country gap: US overweight rate {us_overweight_rate:.0%} "
-                f"vs India {in_overweight_rate:.0%} (Δ {gap:.0%}). Investigate the "
-                "agent backstories, the geopolitical task, and the news-tool's "
-                "coverage parity."
+                f"- ⚠️ Large country gap: US long (BUY/STRONG_BUY) rate "
+                f"{us_long_rate:.0%} vs India {in_long_rate:.0%} (Δ {gap:.0%}). "
+                "Investigate the agent backstories, the geopolitical task, "
+                "and the news-tool's coverage parity."
             )
         else:
             lines.append(
-                f"- ✅ Country gap within tolerance: US overweight rate "
-                f"{us_overweight_rate:.0%} vs India {in_overweight_rate:.0%}."
+                f"- ✅ Country gap within tolerance: US long "
+                f"(BUY/STRONG_BUY) rate {us_long_rate:.0%} vs India "
+                f"{in_long_rate:.0%}."
             )
-    if summary["actions_total"].get("NEUTRAL", 0) / max(1, summary["n_total"]) >= 0.7:
+
+    # Flat-tier saturation check (HOLD == the successor to legacy NEUTRAL).
+    flat_count = (
+        summary["actions_total"].get("HOLD", 0)
+        + summary["actions_total"].get("NEUTRAL", 0)
+    )
+    if flat_count / max(1, summary["n_total"]) >= 0.7:
         lines.append(
-            "- ⚠️ More than 70% of decisions are NEUTRAL — the system is biased "
+            "- ⚠️ More than 70% of decisions are HOLD — the system is biased "
             "toward inaction. Inspect the PM hard rules / quality reviewer / "
             "backtest hit-rate caps before drawing other conclusions."
         )

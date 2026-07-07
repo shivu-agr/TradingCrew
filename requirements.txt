@@ -15,3 +15,17 @@ python-multipart>=0.0.9
 # optimiser. Numpy is already pulled in by pandas, so no separate pin
 # is needed.
 torch>=2.0.0
+# Indian-market data sources (NSE/BSE-suffixed tickers).  We layer these
+# on top of yfinance because Yahoo's Indian data has documented gaps:
+# corporate-action mis-adjustments (RAYMOND demerger, HDFCBANK), missing
+# shareholding patterns, and stale Ind-AS fundamentals.  yfinance
+# remains the default for non-Indian tickers.
+#
+# * screener.in — no official API; we scrape the public company pages
+#   with requests + BeautifulSoup4.  bs4 already ships with lxml above
+#   so no separate parser dep is required.
+# * upstox v3 — official REST SDK for NSE/BSE historical candles + F&O
+#   option-chain.  Authenticates via a 1-year analytics token; only
+#   loaded when ``UPSTOX_ANALYTICS_TOKEN`` is set.
+beautifulsoup4>=4.12.0
+upstox-python-sdk>=2.28.0

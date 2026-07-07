@@ -145,3 +145,215 @@ def test_get_llm_consults_active_preset(monkeypatch: pytest.MonkeyPatch) -> None
         assert "base_url" not in captured
     finally:
         llm_presets.clear_active()
+
+
+# ---------------------------------------------------------------------------
+# Robustness knobs (Phase 2G — Gemma-4 stall fix)
+# ---------------------------------------------------------------------------
+
+
+def test_get_llm_sets_default_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without an env override, ``get_llm()`` must hand a 720-second
+    ``timeout`` to the underlying LLM so a stalled vLLM (Gemma-4 on a
+    saturated GPU) eventually surfaces as a degraded-timeout report
+    instead of hanging the OpenAI client's retry loop indefinitely.
+    """
+    captured: dict[str, object] = {}
+
+    class _FakeLLM:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("crewai.LLM", _FakeLLM, raising=False)
+    monkeypatch.setenv("VLLM_LLM_BASE_URL", "http://x/v1")
+    monkeypatch.setenv("VLLM_LLM_MODEL", "any-model")
+    monkeypatch.setenv("VLLM_LLM_API_KEY", "key")
+    monkeypatch.delenv("LLM_TIMEOUT_SECONDS", raising=False)
+
+    from trading_crew._common import get_llm
+
+    llm_presets.clear_active()
+    get_llm()
+    assert captured.get("timeout") == 720.0
+
+
+def test_get_llm_defaults_max_retries_to_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The OpenAI SDK retries 2x by default on transient failures, but
+    on a local vLLM each retry opens a fresh HTTP connection without
+    telling the server the previous request was abandoned — leaving
+    vLLM to keep decoding tokens for the orphaned call as a zombie
+    that competes for GPU decode slots and worsens the stall.  We
+    default to 0 so a single failed call surfaces as the degraded
+    timeout placeholder instead of accumulating zombies.
+    """
+    captured: dict[str, object] = {}
+
+    class _FakeLLM:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("crewai.LLM", _FakeLLM, raising=False)
+    monkeypatch.setenv("VLLM_LLM_BASE_URL", "http://x/v1")
+    monkeypatch.setenv("VLLM_LLM_MODEL", "any-model")
+    monkeypatch.setenv("VLLM_LLM_API_KEY", "key")
+    monkeypatch.delenv("LLM_MAX_RETRIES", raising=False)
+
+    from trading_crew._common import get_llm
+
+    llm_presets.clear_active()
+    get_llm()
+    assert captured.get("max_retries") == 0
+
+
+def test_get_llm_respects_env_max_retries_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operators on flaky transports can bump retries back via env."""
+    captured: dict[str, object] = {}
+
+    class _FakeLLM:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("crewai.LLM", _FakeLLM, raising=False)
+    monkeypatch.setenv("VLLM_LLM_BASE_URL", "http://x/v1")
+    monkeypatch.setenv("VLLM_LLM_MODEL", "any-model")
+    monkeypatch.setenv("VLLM_LLM_API_KEY", "key")
+    monkeypatch.setenv("LLM_MAX_RETRIES", "2")
+
+    from trading_crew._common import get_llm
+
+    llm_presets.clear_active()
+    get_llm()
+    assert captured.get("max_retries") == 2
+
+
+def test_get_llm_handles_invalid_max_retries_gracefully(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A typo in ``LLM_MAX_RETRIES`` must not crash the run."""
+    captured: dict[str, object] = {}
+
+    class _FakeLLM:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("crewai.LLM", _FakeLLM, raising=False)
+    monkeypatch.setenv("VLLM_LLM_BASE_URL", "http://x/v1")
+    monkeypatch.setenv("VLLM_LLM_MODEL", "any-model")
+    monkeypatch.setenv("VLLM_LLM_API_KEY", "key")
+    monkeypatch.setenv("LLM_MAX_RETRIES", "not-a-number")
+
+    from trading_crew._common import get_llm
+
+    llm_presets.clear_active()
+    get_llm()
+    assert captured.get("max_retries") == 0
+
+
+def test_get_llm_does_not_cap_max_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``get_llm()`` must NOT force a ``max_tokens`` cap.  Capping it
+    either truncates analyst reports below the length budget that
+    ``tasks.yaml`` asks for, or fails the request outright on stricter
+    OpenAI-compatible servers.  vLLM's server-side default
+    (``max_model_len`` minus prompt tokens) is the correct ceiling.
+    Callers that legitimately want a cap can still pass one via kwargs.
+    """
+    captured: dict[str, object] = {}
+
+    class _FakeLLM:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("crewai.LLM", _FakeLLM, raising=False)
+    monkeypatch.setenv("VLLM_LLM_BASE_URL", "http://x/v1")
+    monkeypatch.setenv("VLLM_LLM_MODEL", "any-model")
+    monkeypatch.setenv("VLLM_LLM_API_KEY", "key")
+    monkeypatch.delenv("LLM_MAX_TOKENS", raising=False)
+
+    from trading_crew._common import get_llm
+
+    llm_presets.clear_active()
+    get_llm()
+    assert "max_tokens" not in captured
+    assert "max_completion_tokens" not in captured
+
+
+def test_get_llm_respects_env_timeout_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operators can bump or tighten the timeout via env."""
+    captured: dict[str, object] = {}
+
+    class _FakeLLM:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("crewai.LLM", _FakeLLM, raising=False)
+    monkeypatch.setenv("VLLM_LLM_BASE_URL", "http://x/v1")
+    monkeypatch.setenv("VLLM_LLM_MODEL", "any-model")
+    monkeypatch.setenv("VLLM_LLM_API_KEY", "key")
+    monkeypatch.setenv("LLM_TIMEOUT_SECONDS", "300")
+
+    from trading_crew._common import get_llm
+
+    llm_presets.clear_active()
+    get_llm()
+    assert captured.get("timeout") == 300.0
+
+
+def test_get_llm_kwargs_override_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A per-call kwarg trumps both the env default and the preset overlay.
+
+    Used by the PM / critic path which legitimately wants a tighter or
+    looser timeout, or an explicit ``max_tokens`` cap, on a per-call basis.
+    """
+    captured: dict[str, object] = {}
+
+    class _FakeLLM:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("crewai.LLM", _FakeLLM, raising=False)
+    monkeypatch.setenv("VLLM_LLM_BASE_URL", "http://x/v1")
+    monkeypatch.setenv("VLLM_LLM_MODEL", "any-model")
+    monkeypatch.setenv("VLLM_LLM_API_KEY", "key")
+    monkeypatch.setenv("LLM_TIMEOUT_SECONDS", "720")
+
+    from trading_crew._common import get_llm
+
+    llm_presets.clear_active()
+    get_llm(timeout=60, max_tokens=16384, max_retries=3)
+    assert captured.get("timeout") == 60
+    assert captured.get("max_tokens") == 16384
+    assert captured.get("max_retries") == 3
+
+
+def test_get_llm_handles_invalid_env_timeout_gracefully(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A typo in ``LLM_TIMEOUT_SECONDS`` must not crash the run — we
+    fall back to the documented default instead."""
+    captured: dict[str, object] = {}
+
+    class _FakeLLM:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("crewai.LLM", _FakeLLM, raising=False)
+    monkeypatch.setenv("VLLM_LLM_BASE_URL", "http://x/v1")
+    monkeypatch.setenv("VLLM_LLM_MODEL", "any-model")
+    monkeypatch.setenv("VLLM_LLM_API_KEY", "key")
+    monkeypatch.setenv("LLM_TIMEOUT_SECONDS", "not-a-number")
+
+    from trading_crew._common import get_llm
+
+    llm_presets.clear_active()
+    get_llm()
+    assert captured.get("timeout") == 720.0

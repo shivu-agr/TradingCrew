@@ -1,23 +1,26 @@
-"""All 17 tools used across the analyst team and the trader.
+"""Tools used across the (4 merged) analyst desks and the trader.
 
-Tool ownership (also enforced when wiring agents in ``crew.py``):
+Tool ownership (also enforced when wiring agents in ``crew.py``).  The
+analyst team was consolidated from eight narrow desks to four wider ones,
+so each desk now owns the union of the tools its merged predecessors had:
 
-* Market Analyst:        ``get_stock_data``, ``get_indicators``
-* Social Analyst:        ``get_news``
-* News Analyst:          ``get_news``, ``get_global_news``,
-                         ``get_insider_transactions``
-* Fundamentals Analyst:  ``get_fundamentals``, ``get_balance_sheet``,
-                         ``get_cashflow``, ``get_income_statement``
-* Macro Analyst:         ``get_macro_data``, ``get_global_news``
-* Geopolitical Analyst:  ``get_geopolitical_news``, ``get_global_news``,
-                         ``get_supply_chain_risk``
-* Sector / Peer:         ``get_sector_peers``, ``get_indicators``
-* Quant / Options:       ``get_options_summary``,
-                         ``get_analyst_recommendations``
-* Trader:                ``get_event_proximity``, ``backtest_setup``
+* Market Analyst (price + positioning):
+    ``get_stock_data``, ``get_indicators``, ``get_options_summary``,
+    ``get_analyst_recommendations``
+* News Analyst (catalysts + sentiment):
+    ``get_news``, ``get_global_news``, ``get_corporate_actions``,
+    ``get_insider_transactions``
+* Fundamentals Analyst (financials + long-term + sector):
+    ``get_fundamentals``, ``get_balance_sheet``, ``get_cashflow``,
+    ``get_income_statement``, ``get_shareholding_pattern``,
+    ``get_long_term_thesis``, ``get_sector_peers``
+* Macro Analyst (macro + geopolitical + supply-chain):
+    ``get_macro_data``, ``get_global_news``, ``get_geopolitical_news``,
+    ``get_supply_chain_risk``
+* Trader:                ``get_event_proximity``
 
 Market / fundamentals / macro / options data is sourced from ``yfinance``;
-news comes from Tavily web search.
+news comes from Tavily + SerpAPI web search (merged, de-duplicated).
 
 Provenance
 ----------
@@ -31,19 +34,132 @@ distinguish real fetches from hallucinated numbers.
 
 from __future__ import annotations
 
+import concurrent.futures as _cf
 import datetime as _dt
+import functools
 import json
 import logging
 import os
 import random
+import re
+import threading
 import time
+from typing import Optional
 
 import pandas as pd
+import requests
 import yfinance as yf
 from crewai.tools import tool
 from tavily import TavilyClient
 
+from trading_crew.data_sources import (
+    get_config as get_data_sources_config,
+    is_indian_ticker,
+)
+from trading_crew.data_sources import screener_source, upstox_source
+from trading_crew.data_sources.screener_source import (
+    ScreenerError,
+    ScreenerRateLimitError,
+    ScreenerNotFoundError,
+)
+from trading_crew.data_sources.upstox_source import (
+    UpstoxError,
+    UpstoxAuthError,
+    UpstoxNotFoundError,
+)
+
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Per-process TTL cache for tool results
+# ---------------------------------------------------------------------------
+#
+# Several analysts call the same tool with the same ticker during a single
+# run — e.g. ``get_market_context`` was called 5x (Social, Sector, News,
+# Macro, Geopolitical analysts) and ``get_indicators`` / ``get_corporate_
+# actions`` were each called 2x in a verified BAJAJ-AUTO.NS run.  These
+# tools return the same answer every time within a single workflow (the
+# underlying data — yfinance ``.info``, Tavily news, fundamentals — does
+# not change in the ~5-15 min window of a run), so the duplicate calls
+# burn external API quota AND force the agent loop to re-process the
+# same payload through another LLM iteration.
+#
+# We cache by ``(tool_name, args)`` with a configurable TTL (default 10
+# minutes — comfortably longer than any single run, short enough that a
+# subsequent run picks up fresh data).  Cache is thread-safe so the
+# async analyst phase's 8 parallel agents can hit it concurrently
+# without races.
+#
+# IMPORTANT: this is a *read-through* cache, not a substitute for the
+# tool itself.  Quality is unaffected because the cached value is the
+# exact bytes the underlying tool would have produced.  Only the wall
+# clock, the external API quota, and the duplicate agent-loop LLM call
+# are saved — the analyst still sees the data, still cites it inline,
+# and still owns the [source: ...] tag.  Operators can set
+# ``TRADINGCREW_TOOL_CACHE_TTL_SECONDS=0`` to disable caching entirely
+# if they want to verify a regression isn't cache-induced.
+# ---------------------------------------------------------------------------
+
+_TOOL_CACHE_TTL_DEFAULT = 600.0
+_tool_cache_lock = threading.Lock()
+_tool_cache: dict[str, tuple[float, object]] = {}
+
+
+def _tool_cache_ttl() -> float:
+    try:
+        return float(os.environ.get("TRADINGCREW_TOOL_CACHE_TTL_SECONDS", _TOOL_CACHE_TTL_DEFAULT))
+    except ValueError:
+        return _TOOL_CACHE_TTL_DEFAULT
+
+
+def _memoize_tool(fn):
+    """Memoize a tool function on ``(qualname, args, kwargs)``.
+
+    Wraps the inner function (NOT the CrewAI ``@tool`` decorator) so the
+    Tool the agent sees is unchanged — only the body short-circuits on a
+    cache hit.  Use as::
+
+        @tool("get_market_context")
+        @_memoize_tool
+        def get_market_context(ticker: str) -> str:
+            ...
+
+    The cache key includes the function name so two tools with the same
+    signature don't collide.  Disable via ``TRADINGCREW_TOOL_CACHE_TTL_
+    SECONDS=0`` for an A/B regression test.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        ttl = _tool_cache_ttl()
+        if ttl <= 0:
+            return fn(*args, **kwargs)
+        # Build a stable JSON key from args + kwargs.  We avoid hashing
+        # bare positional args directly because tool inputs may include
+        # dicts / lists; ``json.dumps(..., sort_keys=True)`` gives us a
+        # deterministic key regardless of dict ordering.
+        try:
+            key_payload = json.dumps([args, kwargs], sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            # Un-cacheable input shape — fall back to bypassing the cache
+            # so we never lose a real call to a serialisation quirk.
+            return fn(*args, **kwargs)
+        key = f"{fn.__qualname__}::{key_payload}"
+        now = time.monotonic()
+        with _tool_cache_lock:
+            entry = _tool_cache.get(key)
+            if entry is not None and (now - entry[0]) < ttl:
+                logger.debug("tool cache hit: %s", fn.__qualname__)
+                return entry[1]
+        # Cache miss / expired — compute outside the lock so concurrent
+        # readers don't serialise behind a slow yfinance / Tavily call.
+        result = fn(*args, **kwargs)
+        with _tool_cache_lock:
+            _tool_cache[key] = (now, result)
+        return result
+
+    return wrapper
 
 
 def _with_retry(
@@ -112,11 +228,88 @@ def _source_line(identifier: str) -> str:
     safe = identifier.replace("\n", " ").replace("[", "(").replace("]", ")")
     return f"\nSource: {safe} · retrieved {_utc_now_iso()}"
 
+
 # ---------------------------------------------------------------------------
-# Tavily client (constructed lazily so import works even without the key set)
+# Data-source router: upstox for Indian tickers (if enabled), else yfinance
+# ---------------------------------------------------------------------------
+
+
+def _load_price_history(ticker: str, *, period: str = "5y") -> tuple[pd.DataFrame, str]:
+    """Return (OHLCV DataFrame, source identifier) for ``ticker``.
+
+    Indian tickers (``.NS`` / ``.BO``) are served from the upstox v3
+    historical-candle API when ``UPSTOX_ANALYTICS_TOKEN`` is set — this
+    gives exchange-clean corporate-action adjustments and cleaner
+    backtest numbers than yfinance's frequently mis-adjusted "Adj
+    Close" (RAYMOND demerger, HDFCBANK, BAJAJ-AUTO buyback cases).
+    All other tickers go through the existing yfinance path.
+
+    ``period`` accepts the yfinance short form (``"5y"``, ``"10y"``,
+    ``"max"``); the upstox path maps those to a lookback-days count.
+    Longer windows are only asked for by the multi-year backtest panel;
+    day-count math and the LLM prompts don't care about the raw string.
+
+    Per the project's no-hidden-fallback rule, when the upstox call
+    fails we let the exception propagate — the tool layer surfaces it
+    as a "upstox returned <status>" line and the analyst continues
+    with a degraded report.  The alternative (silent yfinance fallback)
+    would hide the very corporate-action-adjustment problem we're
+    trying to fix.
+
+    Returns ``(df, identifier)`` where ``identifier`` is the string the
+    tool should embed in its ``Source:`` footer.
+    """
+    if upstox_source.is_indian_and_upstox_available(ticker):
+        # Map yfinance-style period strings to a lookback-days number.
+        # ``"max"`` on upstox means "as much history as the exchange
+        # has for this ticker" — we send 20 years which is more than
+        # any NSE cash-equity listing.
+        lookback = {
+            "max": 20 * 365,
+            "15y": 15 * 365,
+            "10y": 10 * 365,
+            "5y": 5 * 365,
+            "2y": 2 * 365,
+            "1y": 365,
+            "2mo": 60,
+        }.get(period, 5 * 365)
+        cf = upstox_source.fetch_daily_candles(ticker, lookback_days=lookback)
+        return cf.df, f"upstox v3 historical-candle {ticker} ({cf.instrument_key}, {cf.from_date}→{cf.to_date})"
+    df = _with_retry(
+        yf.Ticker(ticker).history,
+        period=period,
+        label=f"yfinance.history({ticker}, {period})",
+    )
+    return df, f"yfinance OHLCV {ticker} ({period})"
+
+# ---------------------------------------------------------------------------
+# News providers — Tavily + SerpAPI (Google News), merged and de-duplicated.
+#
+# Both providers are queried IN PARALLEL whenever their API key is set; the
+# results are merged and de-duplicated by normalized URL / headline.  This
+# is a breadth-widening MERGE, not a fallback chain — neither provider
+# "backs up" the other (per the project's no-hidden-fallback rule).  If a
+# provider errors or its key is missing, its contribution is simply empty
+# and the merge proceeds with whatever the other returned.
 # ---------------------------------------------------------------------------
 
 _tavily_client: TavilyClient | None = None
+
+# Hosts that only ever appear in fabricated / placeholder citations.  A
+# real news article never lives on one of these, so any row (or any
+# LLM-authored [source: …] tag) pointing here is an invented source.
+_PLACEHOLDER_URL_HOSTS: tuple[str, ...] = (
+    "example.com",
+    "example.org",
+    "example.net",
+    "example.edu",
+    "test.com",
+    "test.org",
+    "domain.com",
+    "url.com",
+    "placeholder.com",
+    "yourwebsite.com",
+)
 
 
 def _tavily() -> TavilyClient:
@@ -127,24 +320,237 @@ def _tavily() -> TavilyClient:
     return _tavily_client
 
 
-def _tavily_news(query: str, max_results: int = 5) -> str:
-    res = _with_retry(
-        _tavily().search,
-        query,
-        max_results=max_results,
-        topic="news",
-        search_depth="basic",
-        label=f"tavily.search({query!r})",
-    )
-    rows = []
+def _is_placeholder_url(url: str) -> bool:
+    """True when ``url`` is empty, relative, or points at a known
+    placeholder host — i.e. a fabricated citation rather than a real one."""
+    if not url or not isinstance(url, str):
+        return True
+    u = url.strip().lower()
+    if not (u.startswith("http://") or u.startswith("https://")):
+        # Relative or scheme-less "URLs" are never real article links.
+        return True
+    host = u.split("://", 1)[1].split("/", 1)[0]
+    host = host.split("?", 1)[0].split("#", 1)[0].split(":", 1)[0]
+    if not host or "." not in host:
+        # A bare host with no dot (e.g. http://localhost, http://foo) is
+        # not a real news article.
+        return True
+    for bad in _PLACEHOLDER_URL_HOSTS:
+        if host == bad or host.endswith("." + bad):
+            return True
+    return False
+
+
+def _reject_placeholder_urls(rows: list[dict]) -> list[dict]:
+    """Drop any row whose ``url`` is a placeholder / fabricated link, so a
+    fake citation can never leave the tool layer."""
+    return [r for r in rows if not _is_placeholder_url(r.get("url", ""))]
+
+
+# Matches an inline provenance tag ``[source: <identifier>]`` (the tag the
+# whole workflow uses to attribute a claim to a tool output).
+_SOURCE_TAG_RE = re.compile(r"\[source:\s*([^\]]+?)\s*\]", re.IGNORECASE)
+
+
+def _is_fabricated_identifier(identifier: str) -> bool:
+    """True when a ``[source: <identifier>]`` payload is a fabricated /
+    placeholder citation rather than a real URL or a real tool identifier.
+
+    We deliberately DO NOT treat every non-URL identifier as fabricated:
+    legitimate tool identifiers (``yfinance .info ...``, ``screener.in
+    ... #ratios``, ``long_term_thesis ...``) are not URLs and must be
+    preserved.  Only two shapes are fabricated:
+
+      1. an ``http(s)://`` URL that resolves to a placeholder host, or
+      2. any string containing a known placeholder host token
+         (``example.com`` etc.) even without a scheme.
+    """
+    if not identifier or not isinstance(identifier, str):
+        return False
+    ident = identifier.strip().lower()
+    if ident.startswith("http://") or ident.startswith("https://"):
+        return _is_placeholder_url(ident)
+    for bad in _PLACEHOLDER_URL_HOSTS:
+        if bad in ident:
+            return True
+    return False
+
+
+def sanitize_citations(text: str) -> str:
+    """Rewrite fabricated ``[source: <placeholder-url>]`` tags in free
+    prose to an honest ``[analyst judgement]`` label.
+
+    LLMs sometimes invent an ``example.com`` citation in their own
+    reasoning to satisfy the provenance rule.  A downstream reviewer /
+    critic then (correctly) flags it as unsupported and downgrades an
+    otherwise sound thesis.  This deterministic pass fixes the root
+    cause: a model-invented URL is relabelled as the honest qualitative
+    judgement it actually is, so a genuine claim keeps its weight while
+    the fake link is removed.  Real URLs and real tool identifiers are
+    left untouched.
+    """
+    if not text or not isinstance(text, str):
+        return text
+
+    def _repl(m: "re.Match[str]") -> str:
+        identifier = m.group(1)
+        if _is_fabricated_identifier(identifier):
+            return "[analyst judgement]"
+        return m.group(0)
+
+    return _SOURCE_TAG_RE.sub(_repl, text)
+
+
+def _normalize_url(url: str) -> str:
+    u = url.strip().lower()
+    if "://" in u:
+        u = u.split("://", 1)[1]
+    if u.startswith("www."):
+        u = u[4:]
+    u = u.split("?", 1)[0].split("#", 1)[0]
+    return u.rstrip("/")
+
+
+def _normalize_title(title: str) -> str:
+    return " ".join((title or "").lower().split())
+
+
+def _tavily_news_rows(query: str, max_results: int = 8) -> list[dict]:
+    """Fetch news rows from Tavily using ADVANCED search depth for richer
+    coverage.  Returns ``[]`` (never raises) so the merge always proceeds."""
+    try:
+        res = _with_retry(
+            _tavily().search,
+            query,
+            max_results=max_results,
+            topic="news",
+            search_depth="advanced",
+            label=f"tavily.search({query!r})",
+        )
+    except Exception as exc:  # noqa: BLE001 — merge must survive one provider
+        logger.warning("tavily news failed for %r: %s", query, exc)
+        return []
+    rows: list[dict] = []
     for r in res.get("results", []):
-        snippet = (r.get("content") or "").strip().replace("\n", " ")[:240]
-        rows.append(f"- {r['title']}\n  {r['url']}\n  {snippet}")
-    body = "\n".join(rows) if rows else "No news found."
-    # The Source line names the query so analysts can cite "Tavily News
-    # · q='NTNX earnings'" — and each row already carries the article URL
-    # which the analyst can use as a more granular [source: <url>] tag.
-    return body + _source_line(f"Tavily News Search · q='{query}'")
+        rows.append(
+            {
+                "title": (r.get("title") or "").strip(),
+                "url": (r.get("url") or "").strip(),
+                "snippet": (r.get("content") or "").strip().replace("\n", " ")[:240],
+                "provider": "tavily",
+            }
+        )
+    return rows
+
+
+def _serpapi_news(query: str, max_results: int = 8) -> list[dict]:
+    """Fetch news rows from SerpAPI's Google News engine.  Returns ``[]``
+    when the key is unset or the call fails (merge must survive)."""
+    api_key = os.environ.get("SERPAPI_API_KEY")
+    if not api_key:
+        return []
+    try:
+        resp = _with_retry(
+            requests.get,
+            "https://serpapi.com/search.json",
+            params={
+                "engine": "google_news",
+                "q": query,
+                "api_key": api_key,
+                "hl": "en",
+                "gl": "us",
+            },
+            timeout=20,
+            label=f"serpapi.google_news({query!r})",
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:  # noqa: BLE001 — merge must survive one provider
+        logger.warning("serpapi news failed for %r: %s", query, exc)
+        return []
+
+    def _row(r: dict) -> dict | None:
+        url = (r.get("link") or "").strip()
+        title = (r.get("title") or "").strip()
+        if not url or not title:
+            return None
+        src = r.get("source") or {}
+        src_name = src.get("name") if isinstance(src, dict) else str(src)
+        snippet = (r.get("snippet") or src_name or "").strip().replace("\n", " ")[:240]
+        return {"title": title, "url": url, "snippet": snippet, "provider": "serpapi"}
+
+    rows: list[dict] = []
+    for r in data.get("news_results", []):
+        # Google News groups related coverage under a "stories" list; flatten it.
+        stories = r.get("stories")
+        if isinstance(stories, list) and stories:
+            for s in stories:
+                row = _row(s)
+                if row:
+                    rows.append(row)
+        else:
+            row = _row(r)
+            if row:
+                rows.append(row)
+    return rows[:max_results]
+
+
+def _web_news_rows(query: str, max_results: int = 6) -> list[dict]:
+    """Query Tavily AND SerpAPI in parallel and return the merged,
+    de-duplicated, placeholder-free rows (no formatting)."""
+    rows: list[dict] = []
+    with _cf.ThreadPoolExecutor(max_workers=2) as pool:
+        fut_tav = pool.submit(_tavily_news_rows, query, max_results + 4)
+        fut_serp = pool.submit(_serpapi_news, query, max_results + 4)
+        for fut in (fut_tav, fut_serp):
+            try:
+                rows.extend(fut.result())
+            except Exception as exc:  # noqa: BLE001 — defensive; providers already guard
+                logger.warning("news provider future failed for %r: %s", query, exc)
+
+    rows = _reject_placeholder_urls(rows)
+
+    seen_url: set[str] = set()
+    seen_title: set[str] = set()
+    merged: list[dict] = []
+    for row in rows:
+        nu = _normalize_url(row["url"])
+        nt = _normalize_title(row["title"])
+        if nu in seen_url or (nt and nt in seen_title):
+            continue
+        seen_url.add(nu)
+        if nt:
+            seen_title.add(nt)
+        merged.append(row)
+
+    # Two providers deliberately widen breadth, so keep a bit more than a
+    # single-provider search would.
+    return merged[: max_results * 2]
+
+
+def _web_news(query: str, max_results: int = 6) -> str:
+    """Query Tavily AND SerpAPI in parallel, merge + de-duplicate, and
+    render a markdown digest with real article URLs.
+
+    Each row carries an inline ``[source: <url>]`` tag so the analyst can
+    cite the concrete article instead of inventing a placeholder link.
+    """
+    merged = _web_news_rows(query, max_results)
+
+    if merged:
+        body = "\n".join(
+            f"- {r['title']}\n  {r['url']}\n  {r['snippet']}\n  [source: {r['url']}]"
+            for r in merged
+        )
+        providers = sorted({r["provider"] for r in merged})
+    else:
+        body = "No news found."
+        providers = []
+
+    provider_tag = "+".join(providers) if providers else "none"
+    return body + _source_line(
+        f"Web News ({provider_tag}) · q='{query}'"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +559,7 @@ def _tavily_news(query: str, max_results: int = 5) -> str:
 
 
 @tool("get_stock_data")
+@_memoize_tool
 def get_stock_data(ticker: str) -> str:
     """Retrieve 5-year OHLCV history for a given ticker symbol.
 
@@ -169,21 +576,24 @@ def get_stock_data(ticker: str) -> str:
       3. ``DAILY OHLCV`` — the last 30 daily sessions for short-term
          price action and key recent levels.
     """
-    df = _with_retry(
-        yf.Ticker(ticker).history,
-        period="5y",
-        label=f"yfinance.history({ticker}, 5y)",
-    )
+    try:
+        df, source_id = _load_price_history(ticker, period="5y")
+    except (UpstoxError, UpstoxAuthError, UpstoxNotFoundError) as exc:
+        logger.warning("get_stock_data: upstox failed for %s: %s", ticker, exc)
+        return (
+            f"upstox v3 returned an error for {ticker}: {exc}. "
+            "No price panel produced for this analyst turn."
+        ) + _source_line(f"upstox v3 historical-candle {ticker} (failed: {type(exc).__name__})")
     if df.empty:
         return f"No price data for {ticker}." + _source_line(
-            f"yfinance OHLCV {ticker} (empty)"
+            f"{source_id} (empty)"
         )
 
     df.index = pd.to_datetime(df.index)
     close = df["Close"].dropna()
     if close.empty:
         return f"No close data for {ticker}." + _source_line(
-            f"yfinance OHLCV {ticker} (5y, no close)"
+            f"{source_id} (no close)"
         )
 
     last_px = float(close.iloc[-1])
@@ -256,11 +666,12 @@ def get_stock_data(ticker: str) -> str:
         + monthly.round(2).to_string()
         + f"\n\nDAILY OHLCV (last {len(daily_tail)} sessions):\n"
         + daily_tail.to_string()
-        + _source_line(f"yfinance OHLCV {ticker} (5y, monthly + recent daily)")
+        + _source_line(f"{source_id} · monthly + recent daily")
     )
 
 
 @tool("get_indicators")
+@_memoize_tool
 def get_indicators(ticker: str) -> str:
     """Retrieve a technical-indicator snapshot computed over 5 years of
     daily history.
@@ -270,19 +681,22 @@ def get_indicators(ticker: str) -> str:
     return are well-defined for the Market Analyst's regime call —
     short windows force them to ``n/a`` for any IPO younger than the
     window."""
-    df = _with_retry(
-        yf.Ticker(ticker).history,
-        period="5y",
-        label=f"yfinance.history({ticker}, 5y)",
-    )
+    try:
+        df, source_id = _load_price_history(ticker, period="5y")
+    except (UpstoxError, UpstoxAuthError, UpstoxNotFoundError) as exc:
+        logger.warning("get_indicators: upstox failed for %s: %s", ticker, exc)
+        return (
+            f"upstox v3 returned an error for {ticker}: {exc}. "
+            "No indicator panel produced for this analyst turn."
+        ) + _source_line(f"upstox v3 historical-candle {ticker} (failed: {type(exc).__name__})")
     if df.empty:
         return f"No price data for {ticker}." + _source_line(
-            f"yfinance OHLCV {ticker} (empty)"
+            f"{source_id} (empty)"
         )
     close = df["Close"].dropna()
     if close.empty:
         return f"No close data for {ticker}." + _source_line(
-            f"yfinance OHLCV {ticker} (5y, no close)"
+            f"{source_id} (no close)"
         )
 
     def _fmt(val: float) -> str:
@@ -319,7 +733,7 @@ def get_indicators(ticker: str) -> str:
         f"SMA20={_fmt(sma20)}, SMA50={_fmt(sma50)}, SMA200={_fmt(sma200)}, "
         f"RSI14={_fmt(rsi)}, "
         f"60d_return={_fmt_pct(ret60)}, 1y_return={_fmt_pct(ret252)}"
-        + _source_line(f"yfinance OHLCV {ticker} (5y, indicators)")
+        + _source_line(f"{source_id} · indicators")
     )
 
 
@@ -329,6 +743,7 @@ def get_indicators(ticker: str) -> str:
 
 
 @tool("get_news")
+@_memoize_tool
 def get_news(ticker: str) -> str:
     """Retrieve recent news data for a given ticker symbol (company-specific
     headlines plus social-style sentiment cues).
@@ -341,10 +756,11 @@ def get_news(ticker: str) -> str:
     canonical = resolve_ticker(ticker)
     profile = get_market_profile(canonical)
     name = profile.long_name or canonical
-    return _tavily_news(f"{name} {canonical} stock news sentiment last week", max_results=6)
+    return _web_news(f"{name} {canonical} stock news sentiment last week", max_results=6)
 
 
 @tool("get_global_news")
+@_memoize_tool
 def get_global_news(ticker: str = "", query: str = "") -> str:
     """Retrieve global / macro news in the **ticker's own country**.
 
@@ -358,20 +774,21 @@ def get_global_news(ticker: str = "", query: str = "") -> str:
     layer has a specific catalyst in mind ("OPEC meeting", "FOMC dots").
     """
     if query:
-        return _tavily_news(query, max_results=6)
+        return _web_news(query, max_results=6)
     if not ticker:
         # No ticker, no override → return a *neutral* global query rather
         # than silently defaulting to US Fed terms.
-        return _tavily_news(
+        return _web_news(
             "global markets macro overview central bank policy currencies",
             max_results=6,
         )
     canonical = resolve_ticker(ticker)
     profile = get_market_profile(canonical)
-    return _tavily_news(profile.country_news_query(), max_results=6)
+    return _web_news(profile.country_news_query(), max_results=6)
 
 
 @tool("get_insider_transactions")
+@_memoize_tool
 def get_insider_transactions(ticker: str) -> str:
     """Retrieve insider transaction information about a company (executives
     or directors buying/selling their own stock)."""
@@ -383,15 +800,161 @@ def get_insider_transactions(ticker: str) -> str:
     return f"Insider transactions for {ticker}:\n" + df.head(10).to_string() + src
 
 
+# Corporate-action search themes for ``get_corporate_actions``.  Targeted
+# enough that a generic "stock news sentiment last week" query
+# (``get_news`` above) would routinely miss them — buybacks, dividends,
+# splits, M&A and board changes have specific vocabulary the model needs
+# to be steered toward.  Each theme is a SHORT phrase the Tavily ranker
+# can match without burning the per-query budget.
+_CORPORATE_ACTION_THEMES: tuple[tuple[str, str], ...] = (
+    ("buyback",  "share buyback OR share repurchase OR tender offer"),
+    ("dividend", "dividend special dividend interim dividend record date"),
+    ("split",    "stock split bonus issue rights issue"),
+    ("m_and_a",  "acquisition merger takeover stake purchase divestiture spin-off"),
+    ("guidance", "earnings guidance management commentary outlook update"),
+    ("board",    "board appointment management change CEO CFO resignation"),
+)
+
+
+@tool("get_corporate_actions")
+@_memoize_tool
+def get_corporate_actions(ticker: str) -> str:
+    """Surface specific *corporate-action* catalysts for a ticker —
+    buybacks, dividends, splits, M&A, guidance updates, board /
+    management changes — that the generic ``get_news`` sentiment query
+    routinely misses.
+
+    Why this exists
+    ---------------
+    ``get_news`` issues a single Tavily search with the phrase ``"stock
+    news sentiment last week"`` and ``max_results=6``.  That biases the
+    ranker toward generic sentiment / market-roundup articles and
+    silently buries specific corporate-action announcements outside the
+    top 6 — for example, on a recent Bajaj Auto run the company had
+    announced a share buyback during the analysis window and the news
+    layer never returned it.
+
+    This tool runs **one focused Tavily query per action theme** (six
+    themes total: buyback, dividend, split, M&A, guidance, board
+    changes) and merges the results into a single markdown digest.
+    Each theme's query uses the company's long name from
+    ``get_market_context`` so the ranker doesn't get confused by
+    ambiguous tickers.
+
+    Output
+    ------
+    A markdown report with one section per theme that returned hits.
+    Themes with no hits are listed in a single ``(no recent
+    headlines)`` summary line at the end so the analyst can see what
+    was searched-and-empty vs not-searched.  Every headline carries
+    the article URL as ``[source: <url>]`` so downstream agents can
+    preserve provenance.
+    """
+    canonical = resolve_ticker(ticker)
+    profile = get_market_profile(canonical)
+    name = profile.long_name or canonical
+
+    sections: list[str] = []
+    empty_themes: list[str] = []
+    for theme, query_seeds in _CORPORATE_ACTION_THEMES:
+        query = f"{name} {canonical} {query_seeds}"
+        try:
+            results = _web_news_rows(query, max_results=4)
+        except Exception as exc:
+            logger.warning(
+                "get_corporate_actions: %s theme %s failed: %s",
+                canonical, theme, exc,
+            )
+            sections.append(f"### {theme}\n  (search failed: {exc})")
+            continue
+        rows = [
+            f"- {r['title']}\n  {r['url']}\n  {(r['snippet'] or '')[:200]}\n  [source: {r['url']}]"
+            for r in results
+        ]
+        if rows:
+            sections.append(f"### {theme}\n" + "\n".join(rows))
+        else:
+            empty_themes.append(theme)
+
+    body = (
+        f"# Corporate-action scan · {name} ({canonical})\n\n"
+        + ("\n\n".join(sections) if sections else "(no corporate-action hits across any theme)")
+    )
+    if empty_themes:
+        body += (
+            "\n\n"
+            f"_Themes with no recent headlines:_ {', '.join(empty_themes)}."
+        )
+
+    # India-first augmentation: append screener.in's primary SEBI/BSE
+    # announcements feed so specific filings (buyback resolutions,
+    # dividend record dates, board-meeting outcomes) that miss the
+    # Tavily ranker's top-4 still land here.  This is the direct fix
+    # for the BAJAJ-AUTO buyback-miss failure mode observed in a prior
+    # live run — the buyback announcement was public on BSE the whole
+    # time; only Tavily's ranker dropped it.
+    if _screener_available_for(canonical):
+        try:
+            page = screener_source.fetch_company(canonical)
+        except (ScreenerRateLimitError, ScreenerNotFoundError, ScreenerError) as exc:
+            logger.warning(
+                "get_corporate_actions: screener.in augmentation failed for %s: %s",
+                canonical, exc,
+            )
+        else:
+            docs_block = screener_source.render_announcements_report(page, limit=12)
+            body += "\n\n" + docs_block
+
+    return body + _source_line(
+        f"Web News (Tavily+SerpAPI) · corporate-action scan ({canonical}, "
+        f"themes={','.join(t for t, _ in _CORPORATE_ACTION_THEMES)})"
+        + (" + screener.in #documents" if _screener_available_for(canonical) else "")
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fundamentals tools
 # ---------------------------------------------------------------------------
 
 
+def _screener_available_for(ticker: str) -> bool:
+    """Return True iff the ticker is Indian and screener.in is enabled.
+
+    Kept as a tiny helper so every fundamentals tool routes through the
+    same predicate — one wire to flip if we ever want to disable the
+    India-first path (e.g. during a screener.in outage without waiting
+    for the env-var propagation).
+    """
+    return bool(is_indian_ticker(ticker) and get_data_sources_config().screener_enabled)
+
+
 @tool("get_fundamentals")
+@_memoize_tool
 def get_fundamentals(ticker: str) -> str:
     """Retrieve comprehensive fundamental data for a given ticker symbol
-    (P/E, EPS, market cap, profitability, growth, etc.)."""
+    (P/E, EPS, market cap, profitability, growth, etc.).
+
+    For Indian tickers (``.NS`` / ``.BO``) we prefer the Ind-AS
+    fundamentals from screener.in — Yahoo's ``.info`` payload is
+    frequently stale or empty on NSE names outside the top-100 float.
+    The screener path emits the header ratios (Market Cap / P/E /
+    Book Value / ROCE / ROE / etc.) plus screener.in's rule-generated
+    pros/cons, all wrapped with an inline ``[source: <screener URL>]``
+    tag.  Non-Indian tickers fall through to the yfinance path
+    unchanged.
+    """
+    if _screener_available_for(ticker):
+        try:
+            page = screener_source.fetch_company(ticker)
+        except (ScreenerRateLimitError, ScreenerNotFoundError, ScreenerError) as exc:
+            logger.warning("get_fundamentals: screener.in failed for %s: %s", ticker, exc)
+            return (
+                f"screener.in returned an error for {ticker}: {exc}. "
+                "No fundamentals produced for this analyst turn."
+            ) + _source_line(f"screener.in company {ticker} (failed: {type(exc).__name__})")
+        return screener_source.render_fundamentals_report(page) + _source_line(
+            f"screener.in {page.source_url}"
+        )
     info = yf.Ticker(ticker).info
     keys = [
         "shortName", "sector", "industry", "marketCap", "currentPrice",
@@ -411,10 +974,38 @@ def _latest_column(df: pd.DataFrame, n: int = 20) -> str:
     return df.iloc[:, 0].head(n).to_string()
 
 
+def _render_indian_statement(ticker: str, statement: str) -> str:
+    """Route an Indian-ticker financial-statement lookup to screener.in.
+
+    ``statement`` is the screener.in section id (``"balance-sheet"``,
+    ``"cash-flow"``, ``"profit-loss"``).  Returns a full markdown block
+    (10+ years of Ind-AS history) with the source URL captured for
+    provenance.
+    """
+    try:
+        page = screener_source.fetch_company(ticker)
+    except (ScreenerRateLimitError, ScreenerNotFoundError, ScreenerError) as exc:
+        logger.warning(
+            "get_%s: screener.in failed for %s: %s",
+            statement.replace("-", "_"), ticker, exc,
+        )
+        return (
+            f"screener.in returned an error for {ticker}: {exc}. "
+            f"No {statement} produced for this analyst turn."
+        ) + _source_line(f"screener.in company {ticker} (failed: {type(exc).__name__})")
+    return screener_source.render_financial_statement_report(page, statement) + _source_line(
+        f"screener.in {page.source_url} #{statement}"
+    )
+
+
 @tool("get_balance_sheet")
+@_memoize_tool
 def get_balance_sheet(ticker: str) -> str:
     """Retrieve balance-sheet data (assets, liabilities, equity) for a given
-    ticker symbol — most-recent fiscal period."""
+    ticker symbol.  Indian tickers use screener.in's Ind-AS 10-year table;
+    others use yfinance's single-latest-period snapshot."""
+    if _screener_available_for(ticker):
+        return _render_indian_statement(ticker, "balance-sheet")
     return (
         f"Balance sheet for {ticker} (latest period):\n"
         + _latest_column(yf.Ticker(ticker).balance_sheet)
@@ -423,9 +1014,13 @@ def get_balance_sheet(ticker: str) -> str:
 
 
 @tool("get_cashflow")
+@_memoize_tool
 def get_cashflow(ticker: str) -> str:
-    """Retrieve cash-flow-statement data for a given ticker symbol —
-    most-recent fiscal period."""
+    """Retrieve cash-flow-statement data for a given ticker symbol.
+    Indian tickers use screener.in's Ind-AS 10-year table; others use
+    yfinance's single-latest-period snapshot."""
+    if _screener_available_for(ticker):
+        return _render_indian_statement(ticker, "cash-flow")
     return (
         f"Cash flow for {ticker} (latest period):\n"
         + _latest_column(yf.Ticker(ticker).cashflow)
@@ -434,13 +1029,343 @@ def get_cashflow(ticker: str) -> str:
 
 
 @tool("get_income_statement")
+@_memoize_tool
 def get_income_statement(ticker: str) -> str:
     """Retrieve income-statement data (revenue, costs, net income) for a
-    given ticker symbol — most-recent fiscal period."""
+    given ticker symbol.  Indian tickers use screener.in's Ind-AS 10-year
+    P&L table (annual + compounded growth); others use yfinance's
+    single-latest-period snapshot."""
+    if _screener_available_for(ticker):
+        return _render_indian_statement(ticker, "profit-loss")
     return (
         f"Income statement for {ticker} (latest period):\n"
         + _latest_column(yf.Ticker(ticker).income_stmt)
         + _source_line(f"yfinance income_stmt {ticker} (latest period)")
+    )
+
+
+@tool("get_shareholding_pattern")
+@_memoize_tool
+def get_shareholding_pattern(ticker: str) -> str:
+    """Return the quarterly shareholding pattern for an Indian ticker.
+
+    Surfaces the promoter / FII / DII / public / government split
+    across the last ~8 quarters, sourced from screener.in
+    (``#shareholding`` section on the company page).  yfinance does
+    not expose this data at all, and it's one of the most
+    trader-relevant signals on Indian names — promoter pledges,
+    FII outflows, and DII accumulation regularly precede large price
+    moves on NSE.
+
+    Only meaningful for Indian tickers.  A US / European ticker
+    receives a clear "not applicable" note so the analyst doesn't
+    waste an LLM turn trying to reconcile the absent data.
+    """
+    if not is_indian_ticker(ticker):
+        return (
+            f"Shareholding pattern is only tracked for Indian tickers via "
+            f"screener.in.  {ticker} is not an NSE/BSE symbol; the "
+            "analyst should treat this signal as not-applicable and "
+            "focus on 13F / 13D filings instead."
+        ) + _source_line("shareholding_pattern (not-applicable, non-Indian ticker)")
+    if not get_data_sources_config().screener_enabled:
+        return (
+            "screener.in source is disabled "
+            "(``TRADINGCREW_SCREENER_ENABLED=0``); no shareholding "
+            "pattern available for this run."
+        ) + _source_line("shareholding_pattern (screener.in disabled)")
+    try:
+        page = screener_source.fetch_company(ticker)
+    except (ScreenerRateLimitError, ScreenerNotFoundError, ScreenerError) as exc:
+        logger.warning("get_shareholding_pattern: screener.in failed for %s: %s", ticker, exc)
+        return (
+            f"screener.in returned an error for {ticker}: {exc}. "
+            "No shareholding pattern produced for this analyst turn."
+        ) + _source_line(f"screener.in company {ticker} (failed: {type(exc).__name__})")
+    return screener_source.render_shareholding_report(page) + _source_line(
+        f"screener.in {page.source_url} #shareholding"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Long-term thesis (multi-year fundamentals aggregation for LONG horizon)
+# ---------------------------------------------------------------------------
+
+
+def _cagr(values: list[float], years: float) -> float | None:
+    """Compute a compound annual growth rate.
+
+    Returns ``None`` if either endpoint is non-positive (a CAGR from
+    a loss-making year to a profitable one is undefined; forcing a
+    number there would hallucinate a growth rate).  ``years`` is the
+    number of *periods* between the endpoints, not the count of
+    values — e.g. 4 annual samples span 3 years.
+    """
+    if len(values) < 2 or years <= 0:
+        return None
+    start, end = values[0], values[-1]
+    if start <= 0 or end <= 0:
+        return None
+    return ((end / start) ** (1.0 / years) - 1.0) * 100.0
+
+
+def _pl_row(table, row_name: str) -> list[float]:
+    """Best-effort numeric extraction of one row from a screener.in
+    ``FinancialTable``.  Non-numeric cells (``"n/a"``, empty) are
+    dropped; TTM columns are kept because they usefully bookend a
+    growth-rate calculation.
+    """
+    if table is None:
+        return []
+    import re as _re
+    _NUM = _re.compile(r"-?\d[\d,]*(?:\.\d+)?")
+    for metric, values in table.rows:
+        if metric.strip().lower() == row_name.strip().lower():
+            out: list[float] = []
+            for v in values:
+                m = _NUM.search(str(v).replace(",", ""))
+                if m:
+                    try:
+                        out.append(float(m.group(0).replace(",", "")))
+                    except ValueError:
+                        pass
+            return out
+    return []
+
+
+def _long_term_thesis_from_screener(ticker: str) -> str:
+    """Render a LONG-horizon thesis using screener.in's 10-year Ind-AS
+    tables.  Aggregates revenue CAGR, EPS CAGR, ROCE / ROE trend,
+    debt trajectory, and shareholding stability into one markdown
+    block the LLM can quote verbatim.
+
+    Every numeric claim carries a ``[source: screener.in <URL>]`` tag
+    so the Reflective Critic can verify provenance.
+    """
+    page = screener_source.fetch_company(ticker)
+    source = f"screener.in {page.source_url}"
+
+    pl = page.profit_loss
+    bs = page.balance_sheet
+
+    sales = _pl_row(pl, "Sales") or _pl_row(pl, "Revenue")
+    profit = _pl_row(pl, "Net Profit")
+    eps = _pl_row(pl, "EPS in Rs") or _pl_row(pl, "EPS")
+
+    borrowings = _pl_row(bs, "Borrowings")
+    equity = _pl_row(bs, "Reserves") + _pl_row(bs, "Equity Capital")
+
+    lines: list[str] = [f"# {page.long_name} — Long-term thesis ({page.mode})"]
+    lines.append("")
+    lines.append(
+        "This block aggregates screener.in's 10-year Ind-AS tables into a "
+        "single LONG-horizon (5–10 year) view.  Use it to decide whether "
+        "the compounding thesis is intact BEFORE picking a directional tier."
+    )
+    lines.append("")
+
+    # Growth block: revenue / earnings / EPS CAGR over the *full* window
+    # (typically 10 years of annuals + TTM = 11 columns).
+    if sales:
+        span_years = max(1.0, len(sales) - 1.0)
+        rev_cagr = _cagr(sales, span_years)
+        lines.append(
+            f"- **Revenue CAGR** over {len(sales)-1}y "
+            f"({sales[0]:,.0f} → {sales[-1]:,.0f} Cr): "
+            f"{('%+.1f%%' % rev_cagr) if rev_cagr is not None else 'undefined'} "
+            f"[source: {source} #profit-loss]"
+        )
+    if profit:
+        span_years = max(1.0, len(profit) - 1.0)
+        prof_cagr = _cagr(profit, span_years)
+        lines.append(
+            f"- **Net Profit CAGR** over {len(profit)-1}y "
+            f"({profit[0]:,.0f} → {profit[-1]:,.0f} Cr): "
+            f"{('%+.1f%%' % prof_cagr) if prof_cagr is not None else 'undefined'} "
+            f"[source: {source} #profit-loss]"
+        )
+    if eps:
+        span_years = max(1.0, len(eps) - 1.0)
+        eps_cagr = _cagr(eps, span_years)
+        lines.append(
+            f"- **EPS CAGR** over {len(eps)-1}y "
+            f"({eps[0]:.1f} → {eps[-1]:.1f}): "
+            f"{('%+.1f%%' % eps_cagr) if eps_cagr is not None else 'undefined'} "
+            f"[source: {source} #profit-loss]"
+        )
+
+    # Balance-sheet trajectory — debt and equity direction over the last
+    # ~5 years.  For a long-term compounder we want equity ↑ and
+    # borrowings flat/↓; for a value trap the opposite.
+    if borrowings and len(borrowings) >= 2:
+        chg = borrowings[-1] - borrowings[0]
+        direction = "reduced" if chg < 0 else ("increased" if chg > 0 else "flat")
+        lines.append(
+            f"- **Borrowings**: {borrowings[0]:,.0f} → {borrowings[-1]:,.0f} Cr "
+            f"({direction} by {abs(chg):,.0f} Cr over the window) "
+            f"[source: {source} #balance-sheet]"
+        )
+
+    # Return-on-capital trend — the true compounder tell.
+    roce_row = _pl_row(page.ratios, "ROCE %") if page.ratios else []
+    roe_row = _pl_row(page.ratios, "ROE %") if page.ratios else []
+    if roce_row:
+        avg_roce = sum(roce_row) / len(roce_row)
+        lines.append(
+            f"- **ROCE (avg over {len(roce_row)}y)**: {avg_roce:.1f}% "
+            f"(latest {roce_row[-1]:.1f}%) — "
+            f"{'high-quality compounder' if avg_roce >= 15 else ('durable' if avg_roce >= 10 else 'below cost of capital — value-trap risk')} "
+            f"[source: {source} #ratios]"
+        )
+    if roe_row:
+        avg_roe = sum(roe_row) / len(roe_row)
+        lines.append(
+            f"- **ROE (avg over {len(roe_row)}y)**: {avg_roe:.1f}% "
+            f"(latest {roe_row[-1]:.1f}%) [source: {source} #ratios]"
+        )
+
+    # Shareholding stability — a promoter / FII / DII pattern shift is
+    # the earliest signal of a broken long-term thesis on Indian names.
+    sh = page.shareholding
+    if sh and sh.quarterly and sh.quarterly.rows:
+        prom_row = next((r for r in sh.quarterly.rows if r[0].lower().startswith("promoter")), None)
+        fii_row = next((r for r in sh.quarterly.rows if r[0].lower().startswith("fii") or "foreign" in r[0].lower()), None)
+        if prom_row and len(prom_row[1]) >= 2:
+            lines.append(
+                f"- **Promoter holding trajectory** ({sh.quarterly.columns[0]} → {sh.quarterly.columns[-1]}): "
+                f"{prom_row[1][0]} → {prom_row[1][-1]} "
+                f"[source: {source} #shareholding]"
+            )
+        if fii_row and len(fii_row[1]) >= 2:
+            lines.append(
+                f"- **FII holding trajectory** ({sh.quarterly.columns[0]} → {sh.quarterly.columns[-1]}): "
+                f"{fii_row[1][0]} → {fii_row[1][-1]} "
+                f"[source: {source} #shareholding]"
+            )
+
+    # Screener's own pros/cons distillation — cheap way to include a
+    # human-quality summary without asking the LLM to re-write it.
+    if page.pros_cons.pros:
+        lines.append("")
+        lines.append("## Structural pros (from screener.in analysis)")
+        lines.extend(f"- {p} [source: {source} #analysis]" for p in page.pros_cons.pros[:5])
+    if page.pros_cons.cons:
+        lines.append("")
+        lines.append("## Structural cons (from screener.in analysis)")
+        lines.extend(f"- {c} [source: {source} #analysis]" for c in page.pros_cons.cons[:5])
+
+    return "\n".join(lines)
+
+
+def _long_term_thesis_from_yfinance(ticker: str) -> str:
+    """Fallback long-term thesis for non-Indian tickers.
+
+    yfinance's ``.income_stmt`` / ``.balance_sheet`` typically hand
+    back 4 annual periods (~3 years of change) — not the 10y screener
+    delivers but still enough to compute a directional CAGR and a
+    debt-trajectory line.  Deliberately does NOT try to fabricate a
+    10-year story from 3 years of data — it says so explicitly so the
+    LLM does not over-weight the row.
+    """
+    t = yf.Ticker(ticker)
+    info = t.info or {}
+    name = info.get("shortName") or info.get("longName") or ticker
+
+    lines: list[str] = [f"# {name} ({ticker}) — Long-term thesis (yfinance path)"]
+    lines.append("")
+    lines.append(
+        "yfinance only exposes ~3–4 years of annual statements — this "
+        "block is a *lower-bound* long-term view.  For a genuine 10y "
+        "read on an Indian ticker, route via screener.in; for a US name, "
+        "consider 10-K comparisons manually."
+    )
+    lines.append("")
+
+    inc = t.income_stmt
+    bs = t.balance_sheet
+    if inc is not None and not inc.empty:
+        for row_name in ("Total Revenue", "Net Income"):
+            if row_name in inc.index:
+                vals = [float(v) for v in inc.loc[row_name].dropna().values][::-1]
+                if len(vals) >= 2:
+                    cagr = _cagr(vals, max(1.0, len(vals) - 1.0))
+                    lines.append(
+                        f"- **{row_name} CAGR** over {len(vals)-1}y "
+                        f"({vals[0]/1e9:.2f}B → {vals[-1]/1e9:.2f}B): "
+                        f"{('%+.1f%%' % cagr) if cagr is not None else 'undefined'} "
+                        f"[source: yfinance income_stmt {ticker}]"
+                    )
+    if bs is not None and not bs.empty:
+        if "Total Debt" in bs.index:
+            vals = [float(v) for v in bs.loc["Total Debt"].dropna().values][::-1]
+            if len(vals) >= 2:
+                chg = vals[-1] - vals[0]
+                direction = "reduced" if chg < 0 else ("increased" if chg > 0 else "flat")
+                lines.append(
+                    f"- **Total Debt**: {vals[0]/1e9:.2f}B → {vals[-1]/1e9:.2f}B "
+                    f"({direction} by {abs(chg)/1e9:.2f}B) "
+                    f"[source: yfinance balance_sheet {ticker}]"
+                )
+
+    for label, key in (
+        ("Return on Equity", "returnOnEquity"),
+        ("Return on Assets", "returnOnAssets"),
+        ("Debt/Equity", "debtToEquity"),
+    ):
+        v = info.get(key)
+        if v is None:
+            continue
+        # yfinance uses fractional units for ratios (0.15 = 15%) but
+        # occasionally reports raw percentages — we render both without
+        # guessing.
+        if isinstance(v, (int, float)):
+            lines.append(f"- **{label}** (latest): {v} [source: yfinance .info {ticker}]")
+
+    return "\n".join(lines)
+
+
+@tool("get_long_term_thesis")
+@_memoize_tool
+def get_long_term_thesis(ticker: str) -> str:
+    """Multi-year fundamentals thesis for a **LONG-horizon** (5–10 year)
+    decision.
+
+    Aggregates the evidence that matters for a compounder / value
+    thesis into a single markdown block the LLM can quote verbatim:
+
+    - Revenue / Net Profit / EPS **CAGR** over the longest available
+      window (10y from screener.in on Indian tickers; 3–4y from
+      yfinance elsewhere).
+    - **Balance-sheet trajectory** — direction and magnitude of debt
+      over the window.
+    - **ROCE / ROE trend** — the true "quality of compounding" tell.
+    - **Shareholding stability** (Indian names only) — promoter /
+      FII / DII drift is the earliest signal of a broken thesis.
+    - Screener.in's own structural pros/cons — a curated summary the
+      LLM can cite alongside the raw numbers.
+
+    Use this tool BEFORE picking ``horizon = LONG`` — a LONG decision
+    without a supporting revenue/EPS CAGR line, or with degrading
+    ROCE, is exactly the "value-trap" failure mode the
+    Reflective Critic will REVISE.
+    """
+    canonical = resolve_ticker(ticker)
+    if _screener_available_for(canonical):
+        try:
+            return _long_term_thesis_from_screener(canonical) + _source_line(
+                f"long_term_thesis via screener.in {canonical}"
+            )
+        except (ScreenerRateLimitError, ScreenerNotFoundError, ScreenerError) as exc:
+            logger.warning("get_long_term_thesis: screener.in failed for %s: %s", canonical, exc)
+            return (
+                f"screener.in returned an error for {canonical}: {exc}. "
+                "No long-term thesis produced — the PM should NOT pick "
+                "horizon=LONG for this run."
+            ) + _source_line(
+                f"screener.in company {canonical} (failed: {type(exc).__name__})"
+            )
+    return _long_term_thesis_from_yfinance(canonical) + _source_line(
+        f"long_term_thesis via yfinance {canonical}"
     )
 
 
@@ -450,6 +1375,7 @@ def get_income_statement(ticker: str) -> str:
 
 
 @tool("get_macro_data")
+@_memoize_tool
 def get_macro_data(ticker: str = "") -> str:
     """Retrieve a country-aware macro basket (rates / FX / vol / commodities).
 
@@ -499,6 +1425,7 @@ def get_macro_data(ticker: str = "") -> str:
 
 
 @tool("get_sector_peers")
+@_memoize_tool
 def get_sector_peers(ticker: str) -> str:
     """Compare a ticker to its sector peers across YTD price return,
     market cap, and trailing P/E.
@@ -539,6 +1466,7 @@ def get_sector_peers(ticker: str) -> str:
 
 
 @tool("get_geopolitical_news")
+@_memoize_tool
 def get_geopolitical_news(ticker: str) -> str:
     """Retrieve geopolitical news (tariffs, export controls, sanctions,
     regulatory action, regional conflict) relevant to the ticker.
@@ -550,10 +1478,11 @@ def get_geopolitical_news(ticker: str) -> str:
     """
     canonical = resolve_ticker(ticker)
     profile = get_market_profile(canonical)
-    return _tavily_news(profile.geopolitical_query(), max_results=6)
+    return _web_news(profile.geopolitical_query(), max_results=6)
 
 
 @tool("get_supply_chain_risk")
+@_memoize_tool
 def get_supply_chain_risk(ticker: str) -> str:
     """Retrieve supply-chain and customer-concentration risk for a given
     ticker — top customers, supplier dependencies, geographic revenue
@@ -566,7 +1495,7 @@ def get_supply_chain_risk(ticker: str) -> str:
     """
     canonical = resolve_ticker(ticker)
     profile = get_market_profile(canonical)
-    return _tavily_news(profile.supply_chain_query(), max_results=6)
+    return _web_news(profile.supply_chain_query(), max_results=6)
 
 
 # ---------------------------------------------------------------------------
@@ -575,6 +1504,7 @@ def get_supply_chain_risk(ticker: str) -> str:
 
 
 @tool("get_market_context")
+@_memoize_tool
 def get_market_context(ticker: str) -> str:
     """One-shot research brief for ``ticker`` — country, sector, peer
     basket, macro basket, and country/industry news seeds.
@@ -602,10 +1532,60 @@ def get_market_context(ticker: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _upstox_options_summary(ticker: str) -> str:
+    """Render an options summary from upstox v3 for an Indian F&O ticker.
+
+    Uses the v2 put-call chain endpoint (still current on v3 accounts).
+    We pick the nearest listed expiry from the exchange calendar
+    implied by ``today + 7d`` — most NSE options list weekly-Thursday
+    expiries, so a 30-day forward search picks up the front month
+    reliably.  If the ticker isn't F&O-enabled the upstox call
+    surfaces an ``UpstoxError`` which we render as a clean
+    "not F&O enabled" line.
+    """
+    # Nearest common NSE weekly-Thursday expiries within the next 45 days.
+    # Upstox returns 400 for unlisted expiries, so we walk forward from
+    # the next Thursday until we get a non-empty chain.
+    today = _dt.date.today()
+    days_ahead = (3 - today.weekday()) % 7  # Thursday == 3
+    if days_ahead == 0:
+        days_ahead = 7
+    candidates = [today + _dt.timedelta(days=days_ahead + 7 * i) for i in range(6)]
+    last_error: Optional[Exception] = None
+    for expiry in candidates:
+        try:
+            chain = upstox_source.fetch_option_chain(ticker, expiry.isoformat())
+        except UpstoxError as exc:
+            last_error = exc
+            continue
+        if not chain.rows:
+            continue
+        return upstox_source.render_option_chain_summary(
+            chain, name=ticker,
+        ) + _source_line(
+            f"upstox v3 option_chain {ticker} expiry={expiry.isoformat()}"
+        )
+    return (
+        f"upstox v3 returned no option chain for {ticker} across the next "
+        f"{len(candidates)} weekly expiries — either the ticker is not "
+        f"F&O enabled or the analytics token lacks options data. "
+        f"Last error: {last_error}"
+    ) + _source_line(f"upstox v3 option_chain {ticker} (no expiry matched)")
+
+
 @tool("get_options_summary")
+@_memoize_tool
 def get_options_summary(ticker: str) -> str:
     """Retrieve nearest-expiry options summary (ATM call/put implied
-    volatility, total open interest, put/call ratio) for a given ticker."""
+    volatility, total open interest, put/call ratio) for a given ticker.
+
+    For Indian tickers with upstox enabled we use the v3 option-chain
+    endpoint — Yahoo does not expose Indian F&O reliably, so this is a
+    strictly-additive capability.  For all other tickers we keep the
+    existing yfinance path unchanged.
+    """
+    if upstox_source.is_indian_and_upstox_available(ticker):
+        return _upstox_options_summary(ticker)
     t = yf.Ticker(ticker)
     expiries = t.options
     if not expiries:
@@ -633,6 +1613,7 @@ def get_options_summary(ticker: str) -> str:
 
 
 @tool("get_analyst_recommendations")
+@_memoize_tool
 def get_analyst_recommendations(ticker: str) -> str:
     """Retrieve sell-side analyst recommendations and consensus price
     targets for a given ticker."""
@@ -663,6 +1644,7 @@ def get_analyst_recommendations(ticker: str) -> str:
 
 
 @tool("get_event_proximity")
+@_memoize_tool
 def get_event_proximity(ticker: str) -> str:
     """Retrieve the next earnings date and recent earnings-surprise history
     so the trader can size around catalyst dates. Returns next-earnings
@@ -696,8 +1678,35 @@ def get_event_proximity(ticker: str) -> str:
     )
 
 
-def _simulate_horizon(closes, horizon: int, tgt: float, stp: float):
+def _simulate_horizon(
+    closes,
+    horizon: int,
+    tgt: float,
+    stp: float,
+    *,
+    direction: str = "long",
+):
     """Walk one (target, stop, horizon) combo and return per-trade stats.
+
+    ``direction`` selects the trade side:
+
+    * ``"long"`` (default): entry at close, exit at ``+tgt`` (WIN), exit
+      at ``-stp`` (LOSS), or timeout after ``horizon`` bars.
+    * ``"short"``: entry at close, exit at ``-tgt`` (WIN — price fell
+      the target magnitude), exit at ``+stp`` (LOSS — price rose the
+      stop magnitude), or timeout.  Returns are **signed by the short
+      side** — i.e. a −8% price move on a short is reported as a
+      +8% realised return so ``expectancy`` / ``payoff`` are directly
+      comparable to the long case.
+
+    Historically this function only implemented the LONG case, and the
+    trader passed positive magnitudes for both target and stop
+    regardless of side.  That silently over-estimated SHORT-trade
+    expectancy for any ticker with positive long-run drift (which is
+    most surviving liquid names) — the "why does the number look
+    similar across stocks" pattern the user reported was exactly this:
+    ``expectancy ≈ +1 to +2%`` is the ambient LONG per-trade
+    expectancy at a 2:1 payoff on a positive-drift universe.
 
     Returns ``(hit_rate, expectancy, payoff_ratio, avg, median, total,
     wins, losses, timeouts, avg_win, avg_loss)`` so the caller can render
@@ -708,6 +1717,7 @@ def _simulate_horizon(closes, horizon: int, tgt: float, stp: float):
     payoff ratio still has positive expectancy and should NOT collapse
     confidence to a hard floor.
     """
+    is_short = (direction or "long").strip().lower() == "short"
     n = len(closes)
     wins = losses = timeouts = 0
     win_returns: list[float] = []
@@ -719,23 +1729,45 @@ def _simulate_horizon(closes, horizon: int, tgt: float, stp: float):
         outcome = None
         for j in range(1, horizon + 1):
             r = (closes[i + j] / entry) - 1
-            if r >= tgt:
-                wins += 1
-                win_returns.append(r * 100)
-                all_returns.append(r * 100)
-                outcome = "win"
-                break
-            if r <= -stp:
-                losses += 1
-                loss_returns.append(r * 100)
-                all_returns.append(r * 100)
-                outcome = "loss"
-                break
+            # For SHORT trades the "trade-side return" is -r (price down
+            # = short-side profit), and the exit conditions flip: WIN
+            # when the price falls to -tgt (r <= -tgt); LOSS when the
+            # price rises to +stp (r >= stp).
+            if is_short:
+                if r <= -tgt:
+                    wins += 1
+                    side_r = -r * 100  # positive number for SHORT-side win
+                    win_returns.append(side_r)
+                    all_returns.append(side_r)
+                    outcome = "win"
+                    break
+                if r >= stp:
+                    losses += 1
+                    side_r = -r * 100  # negative number for SHORT-side loss
+                    loss_returns.append(side_r)
+                    all_returns.append(side_r)
+                    outcome = "loss"
+                    break
+            else:
+                if r >= tgt:
+                    wins += 1
+                    win_returns.append(r * 100)
+                    all_returns.append(r * 100)
+                    outcome = "win"
+                    break
+                if r <= -stp:
+                    losses += 1
+                    loss_returns.append(r * 100)
+                    all_returns.append(r * 100)
+                    outcome = "loss"
+                    break
         if outcome is None:
             timeouts += 1
-            tor = (closes[i + horizon] / entry - 1) * 100
-            timeout_returns.append(tor)
-            all_returns.append(tor)
+            terminal_r = (closes[i + horizon] / entry - 1) * 100
+            if is_short:
+                terminal_r = -terminal_r  # sign by short side
+            timeout_returns.append(terminal_r)
+            all_returns.append(terminal_r)
 
     total = wins + losses + timeouts
     if total == 0:
@@ -760,21 +1792,60 @@ def _simulate_horizon(closes, horizon: int, tgt: float, stp: float):
 
 
 @tool("backtest_setup")
+@_memoize_tool
 def backtest_setup(
     ticker: str,
     horizon_days: int,
     target_pct: float,
     stop_pct: float,
+    direction: str = "long",
 ) -> str:
     """Score a proposed trade plan against historical analogous setups.
 
-    Walks 5 years of daily price history. For each starting day, simulates
-    entry at close, exit at +target_pct, exit at -stop_pct, or timeout
-    after horizon_days — whichever comes first.
+    Walks up to 15 years of daily price history (whatever the source has).
+    For each starting day, simulates entry at close, exit at target %
+    move, exit at stop % move, or timeout after horizon_days —
+    whichever comes first.
 
-    Returns the per-horizon table AND a multi-horizon panel covering
-    short-term (the trader's chosen horizon), 60d, 120d, and 252d so the
-    PM can weigh both short-term technicals and the long-term thesis.
+    ``direction`` selects the trade side (**pass it explicitly for
+    every call — the default is only for backwards compatibility**):
+
+    * ``"long"``:  WIN condition = price rises ``+target_pct``;
+                   LOSS condition = price falls ``-stop_pct``.
+    * ``"short"``: WIN condition = price falls ``target_pct``;
+                   LOSS condition = price rises ``stop_pct``.
+                   Returns are signed by the short side so
+                   ``expectancy`` / ``payoff`` are directly comparable
+                   to the long case (a short trade with expectancy
+                   +2% is a genuine short-side edge, not "the price
+                   went up 2%").
+
+    Historically this function was LONG-only and traders passed
+    positive magnitudes for both fields regardless of side — that
+    silently over-estimated SHORT-trade expectancy for any ticker
+    with positive long-run drift (which is most surviving liquid
+    names).  The "expectancy ≈ +1-2% per trade" convergence across
+    unrelated tickers reflected the ambient long-only per-trade
+    expectancy at a 2:1 payoff on a positive-drift universe, not a
+    genuine short-side edge.
+
+    Returns the per-horizon table AND a multi-horizon panel that now
+    spans SHORT / MEDIUM / LONG bands so the PM can weigh a genuinely
+    long-term thesis (5–10 years) alongside the trader's short-term
+    window:
+
+    * SHORT tier:  60d
+    * MEDIUM tier: 126d (6 months), 189d (9 months), 252d (1 year)
+    * LONG tier:   504d (2 years), 1260d (5 years), 2520d (10 years,
+                   only when >= 12 years of history is available)
+
+    The 2y / 5y / 10y horizons are simulated with the same target /
+    stop as the shorter panels so the PM sees a *risk-adjusted*
+    long-hold comparison rather than a naive buy-and-hold CAGR.  When
+    a horizon can't be simulated (not enough history), we surface an
+    explicit "n=insufficient" line so the LLM does not silently treat
+    a missing panel as neutral evidence.
+
     For each horizon we surface:
 
     * hit-rate                 — base rate the target gets hit
@@ -785,14 +1856,32 @@ def backtest_setup(
     * avg / median realized %
 
     This richer view is what lets the PM avoid the "hit-rate < 40% =>
-    NEUTRAL by default" failure mode.  Whenever expectancy > 0 with
+    HOLD by default" failure mode.  Whenever expectancy > 0 with
     payoff >= 1.5 on any horizon, the PM is allowed to express full
-    conviction even if the short-term hit-rate is low.
+    conviction (BUY / STRONG_BUY, or SELL / STRONG_SELL for the bearish
+    mirror) even if the short-term hit-rate is low.
     """
-    df = yf.Ticker(ticker).history(period="5y")
-    if df.empty or len(df) < horizon_days + 30:
+    _direction = (direction or "long").strip().lower()
+    if _direction not in ("long", "short"):
+        return (
+            f"Invalid direction={direction!r}; must be 'long' or 'short'."
+        )
+    # Pull the longest history we can — 15y captures the medium-tier
+    # (1y windows) with dozens of samples and gives the 5y horizon a
+    # handful of overlapping episodes.  Anything shorter starves the
+    # long-tier panels.  Sources without 15y just return what they have;
+    # the "min-samples" gate below still catches an unusable window.
+    try:
+        df, source_id = _load_price_history(ticker, period="15y")
+    except (UpstoxError, UpstoxAuthError, UpstoxNotFoundError) as exc:
+        logger.warning("backtest_setup: upstox failed for %s: %s", ticker, exc)
+        return (
+            f"upstox v3 returned an error for {ticker}: {exc}. "
+            "No backtest panel produced for this analyst turn."
+        ) + _source_line(f"upstox v3 historical-candle {ticker} (failed: {type(exc).__name__})")
+    if df.empty or len(df) < max(horizon_days + 30, 90):
         return f"Insufficient history for {ticker} backtest." + _source_line(
-            f"yfinance OHLCV {ticker} (5y, insufficient for backtest)"
+            f"{source_id} (insufficient for backtest)"
         )
     closes = df["Close"].values
     n = len(closes)
@@ -800,21 +1889,51 @@ def backtest_setup(
     stp = abs(float(stop_pct)) / 100.0
 
     short_h = max(5, int(horizon_days))
-    horizons = sorted({short_h, 60, 120, 252})
-    # Don't try to simulate a horizon longer than what the history can support.
-    horizons = [h for h in horizons if h + 30 <= n]
+    # SHORT band anchors on the trader's chosen horizon + a stable 60d.
+    # MEDIUM band = 6m / 9m / 1y (the "few months" bucket).
+    # LONG band = 2y / 5y / 10y (the "5-10 year" bucket the user asked
+    # for; 10y is dropped automatically when history can't cover it).
+    all_horizons = sorted({short_h, 60, 126, 189, 252, 504, 1260, 2520})
+    # Require a minimum of 20 non-overlapping starting points for a
+    # horizon to be considered statistically meaningful — otherwise the
+    # panel is dominated by a single episode and misleads the LLM.
+    horizons = [h for h in all_horizons if (n - h) >= 20 and h + 20 <= n]
+    dropped = [h for h in all_horizons if h not in horizons]
     if not horizons:
         horizons = [short_h]
+
+    # Tier labels help the LLM cluster horizons by intent ("this is a
+    # LONG-tier row, so a positive expectancy here supports the
+    # buy-and-hold thesis; a positive expectancy on a SHORT row just
+    # means the setup times well").  We prefix the row label so the
+    # LLM doesn't have to memorise the tier boundaries.
+    def _tier_for(h: int) -> str:
+        from trading_crew.horizons import horizon_days_to_horizon
+        return horizon_days_to_horizon(h).value
 
     rows = []
     for h in horizons:
         hit_rate, expectancy, payoff, avg, median, total, wins, losses, timeouts, avg_win, avg_loss = _simulate_horizon(
-            closes, h, tgt, stp
+            closes, h, tgt, stp, direction=_direction
         )
-        label = f"{h}d" + (" (trader)" if h == short_h else "")
+        # Human-readable window: 21d -> "21d ≈ 1m", 252d -> "252d ≈ 1y",
+        # 1260d -> "1260d ≈ 5y".  Makes the panel scan-friendly in the
+        # LLM prompt without forcing it to convert trading days.
+        if h >= 252:
+            years = h / 252.0
+            human = f"{h}d≈{years:.0f}y" if years >= 2 else f"{h}d≈1y"
+        elif h >= 60:
+            months = round(h / 21)  # ~21 trading days per month
+            human = f"{h}d≈{months}m"
+        else:
+            human = f"{h}d"
+        marker = " *" if h == short_h else ""
+        label = f"[{_tier_for(h)}] {human}{marker}"
         rows.append({
             "h": h,
+            "tier": _tier_for(h),
             "label": label,
+            "human": human,
             "hit_rate": hit_rate,
             "expectancy": expectancy,
             "payoff": payoff,
@@ -832,40 +1951,81 @@ def backtest_setup(
     # so existing prompt regexes / log parsers keep working.
     primary = next((r for r in rows if r["h"] == short_h), rows[0])
     primary_total = primary["total"]
+    # For SHORT trades the "win" condition is "price fell target% below
+    # entry" — describe the target/stop in trade-side terms so the LLM
+    # sees "target=-10% (price falls)" rather than the numerically-flipped
+    # LONG framing.
+    if _direction == "short":
+        tgt_label = f"-{tgt*100:.1f}% price move (short-side target)"
+        stp_label = f"+{stp*100:.1f}% price move (short-side stop)"
+        side_banner = "SHORT-side simulation — returns are signed by the short side"
+    else:
+        tgt_label = f"+{tgt*100:.1f}% (long-side target)"
+        stp_label = f"-{stp*100:.1f}% (long-side stop)"
+        side_banner = "LONG-side simulation"
     legacy = (
-        f"Backtest for {ticker} (horizon={primary['h']}d, "
-        f"target=+{tgt*100:.1f}%, stop=-{stp*100:.1f}%):\n"
+        f"Backtest for {ticker} (direction={_direction.upper()}, "
+        f"horizon={primary['h']}d, target={tgt_label}, stop={stp_label}):\n"
         f"- N samples: {primary_total}\n"
         f"- Wins (target hit): {primary['wins']} ({primary['hit_rate']*100:.1f}%)\n"
         f"- Stops hit: {primary['losses']} ({(primary['losses']/primary_total*100) if primary_total else 0:.1f}%)\n"
         f"- Timeouts: {primary['timeouts']} ({(primary['timeouts']/primary_total*100) if primary_total else 0:.1f}%)\n"
-        f"- Avg realized return: {primary['avg']:+.2f}%, median {primary['median']:+.2f}%\n"
+        f"- Avg realized return ({_direction}-side): {primary['avg']:+.2f}%, median {primary['median']:+.2f}%\n"
         f"- Avg win: {primary['avg_win']:+.2f}%, avg loss: {primary['avg_loss']:+.2f}%\n"
         f"- Payoff ratio: {primary['payoff']:.2f}, per-trade expectancy: {primary['expectancy']:+.2f}%"
     )
 
-    # Multi-horizon panel — PM uses this for the short-vs-long view.
-    multi_lines = ["", "Multi-horizon panel (short-term vs long-term, same target/stop):"]
-    multi_lines.append(
-        "  horizon  | hit-rate | payoff | expectancy | avg     | median"
-    )
+    # Multi-horizon panel — PM uses this for the short-vs-medium-vs-long view.
+    multi_lines = [
+        "",
+        f"Multi-horizon panel ({side_banner}; SHORT vs MEDIUM vs LONG, "
+        "same target/stop; ``*`` marks the trader's primary window):",
+        "  window            | n      | hit-rate | payoff | expectancy | avg     | median",
+    ]
     for r in rows:
         multi_lines.append(
-            f"  {r['label']:<9}| {r['hit_rate']*100:6.1f}%  | {r['payoff']:>5.2f}x | "
-            f"{r['expectancy']:+6.2f}%   | {r['avg']:+6.2f}% | {r['median']:+6.2f}%"
+            f"  {r['label']:<18}| {r['total']:>5}  | {r['hit_rate']*100:6.1f}%  | "
+            f"{r['payoff']:>5.2f}x | {r['expectancy']:+6.2f}%   | "
+            f"{r['avg']:+6.2f}% | {r['median']:+6.2f}%"
+        )
+    if dropped:
+        # Surface *which* long-tier panels were dropped so the LLM
+        # doesn't silently ignore the absence of e.g. the 10y row.
+        multi_lines.append(
+            f"  (dropped for insufficient history: "
+            f"{', '.join(f'{d}d' for d in dropped)})"
         )
 
     # Headline: best expectancy + best hit-rate across the panel so the
-    # PM can quote them directly without re-doing the math.
+    # PM can quote them directly without re-doing the math.  We ALSO
+    # emit per-tier best-expectancy so the LLM can compare "long-tier
+    # edge" vs "short-tier edge" without eyeballing.
     best_expectancy = max(rows, key=lambda r: r["expectancy"])
     best_hit = max(rows, key=lambda r: r["hit_rate"])
+    per_tier_best: dict[str, dict] = {}
+    for r in rows:
+        prev = per_tier_best.get(r["tier"])
+        if prev is None or r["expectancy"] > prev["expectancy"]:
+            per_tier_best[r["tier"]] = r
+    tier_lines = [
+        f"  {tier:<7}: best {per_tier_best[tier]['human']:>9} — "
+        f"expectancy {per_tier_best[tier]['expectancy']:+.2f}%, "
+        f"hit-rate {per_tier_best[tier]['hit_rate']*100:.1f}%, "
+        f"payoff {per_tier_best[tier]['payoff']:.2f}x"
+        for tier in ("SHORT", "MEDIUM", "LONG")
+        if tier in per_tier_best
+    ]
     headline = [
         "",
         f"Best expectancy: {best_expectancy['expectancy']:+.2f}% on {best_expectancy['label']} "
         f"(hit-rate {best_expectancy['hit_rate']*100:.1f}%, payoff {best_expectancy['payoff']:.2f}x).",
         f"Best hit-rate:   {best_hit['hit_rate']*100:.1f}% on {best_hit['label']} "
         f"(expectancy {best_hit['expectancy']:+.2f}%).",
-    ]
+        "",
+        "Per-tier best expectancy (SECONDARY corroboration — the primary "
+        "horizon must come from the analyst thesis character, NOT this "
+        "table; do NOT switch horizons to chase a better row):",
+    ] + tier_lines
 
     return (
         legacy
@@ -874,9 +2034,9 @@ def backtest_setup(
         + "\n"
         + "\n".join(headline)
         + _source_line(
-            f"backtest_setup({ticker}, "
+            f"backtest_setup({ticker}, dir={_direction}, "
             f"h={'+'.join(f'{h}d' for h in horizons)}, "
-            f"tgt={tgt*100:.1f}%, stop={stp*100:.1f}%) on yfinance 5y OHLCV"
+            f"tgt={tgt*100:.1f}%, stop={stp*100:.1f}%) on {source_id}"
         )
     )
 
@@ -1060,11 +2220,14 @@ ALL_TOOLS = {
     "get_indicators": get_indicators,
     "get_news": get_news,
     "get_global_news": get_global_news,
+    "get_corporate_actions": get_corporate_actions,
     "get_insider_transactions": get_insider_transactions,
     "get_fundamentals": get_fundamentals,
     "get_balance_sheet": get_balance_sheet,
     "get_cashflow": get_cashflow,
     "get_income_statement": get_income_statement,
+    "get_shareholding_pattern": get_shareholding_pattern,
+    "get_long_term_thesis": get_long_term_thesis,
     "get_macro_data": get_macro_data,
     "get_sector_peers": get_sector_peers,
     "get_geopolitical_news": get_geopolitical_news,
@@ -1088,18 +2251,51 @@ ALL_TOOLS = {
 # pull the brief BEFORE phrasing their searches — otherwise we end up
 # with US-centric questions on Indian / UK / HK / JP names.
 DEFAULT_AGENT_TOOLS: dict[str, list[str]] = {
-    "market_analyst": ["get_stock_data", "get_indicators", "retrieve_past_episodes", "rl_policy_recommendation"],
-    "social_analyst": ["get_market_context", "get_news"],
-    "news_analyst": ["get_market_context", "get_news", "get_global_news", "get_insider_transactions"],
+    # ---- 4 merged analyst desks --------------------------------------------
+    # Market desk = price/technicals + options/positioning (was market + quant).
+    "market_analyst": [
+        "get_stock_data", "get_indicators",
+        "get_options_summary", "get_analyst_recommendations",
+        "retrieve_past_episodes", "rl_policy_recommendation",
+    ],
+    # News desk = catalysts + corporate actions + sentiment + insider
+    # (was news + social).
+    "news_analyst": [
+        "get_market_context", "get_news", "get_global_news",
+        "get_corporate_actions", "get_insider_transactions",
+    ],
+    # Fundamentals desk = financials + long-term thesis + sector/peers
+    # (was fundamentals + sector).
     "fundamentals_analyst": [
         "get_fundamentals", "get_balance_sheet",
         "get_cashflow", "get_income_statement",
+        # Indian tickers only: quarterly promoter/FII/DII/public split.
+        # For non-Indian names the tool returns a one-line
+        # "not-applicable" placeholder so the LLM does not waste a
+        # turn on it.
+        "get_shareholding_pattern",
+        # LONG-horizon aggregator: revenue / EPS CAGR + ROCE trend +
+        # debt trajectory + shareholding drift, all in one markdown
+        # block.  The PM anchors the horizon=LONG decision on this
+        # tool's output, so the fundamentals analyst is responsible
+        # for pulling + citing it.
+        "get_long_term_thesis",
+        # Sector/peer relative strength (absorbed from the sector desk).
+        "get_market_context", "get_sector_peers",
     ],
-    "macro_analyst": ["get_market_context", "get_macro_data", "get_global_news"],
-    "geopolitical_analyst": [
-        "get_market_context", "get_geopolitical_news", "get_global_news", "get_supply_chain_risk",
+    # Macro desk = macro regime + geopolitical + supply-chain
+    # (was macro + geopolitical).
+    "macro_analyst": [
+        "get_market_context", "get_macro_data", "get_global_news",
+        "get_geopolitical_news", "get_supply_chain_risk",
     ],
-    "sector_analyst": ["get_market_context", "get_sector_peers", "get_indicators"],
-    "quant_analyst": ["get_options_summary", "get_analyst_recommendations"],
-    "trader": ["get_event_proximity", "backtest_setup", "retrieve_past_episodes", "rl_policy_recommendation"],
+    # NOTE: ``backtest_setup`` was intentionally removed from the trader's
+    # toolset.  Past-heavy statistical expectancy was dominating the
+    # trader + PM decision reasoning and dragging structurally-strong
+    # names (esp. Indian growth stocks in an investment/production
+    # upcycle) toward HOLD, while adding little forward-looking value.
+    # The ``backtest_setup`` @tool and the standalone M6 walk-forward
+    # engine (agentic/backtest/) remain available for the Backtest tab
+    # and grid search — they are validation features, not decision inputs.
+    "trader": ["get_event_proximity", "retrieve_past_episodes", "rl_policy_recommendation"],
 }
