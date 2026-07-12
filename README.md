@@ -23,7 +23,8 @@ A team of specialist LLM agents debates a trade idea; the verdict then runs thro
 - **Pick your model in the UI** — hosted vLLM, local vLLM, OpenAI, or Anthropic, switchable per run.
 - **Multi-region tickers** — `AAPL`, `RELIANCE.NS`, `0700.HK`, `7203.T`, `HSBA.L`, `CL=F`, … auto-resolved with the right macro basket + news themes.
 - **India-first data path** — `.NS` / `.BO` tickers can route through **screener.in** + **upstox v3** for clean fundamentals, shareholding, and OHLCV.
-- **Auditable risk layer** — every decision passes a typed pipeline: bridge → simulator → episodic memory → reflective critic → Kelly/vol/CVaR sizer + hard risk gates → walk-forward backtest → allocator.
+- **Auditable risk layer** — every decision passes a typed pipeline: bridge → simulator → episodic memory → reflective critic → Kelly/vol/CVaR sizer + hard risk gates → walk-forward backtest → allocator, with deterministic **volatility-grounded stop/target normalization** so the LLM can't attach a 2% stop to a multi-year hold.
+- **Forward + trailing fundamentals** — the Fundamentals desk pairs a trailing multi-year thesis with `get_forward_estimates` (analyst targets, forward-vs-trailing P/E & EPS, consensus revisions), and the critic flags fabricated precision (e.g. invented ROCE trends).
 - **Refresh-safe background sessions** — queue multiple tickers; runs are owned by the server, not the browser tab.
 - **Learns from outcomes** — reflection on resolved trades, walk-forward grid search, PPO on the simulator, and RLMF (prompt-only or LoRA fine-tune).
 

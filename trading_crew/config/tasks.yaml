@@ -189,8 +189,17 @@ fundamentals_task:
          debt trajectory, and screener.in's structural pros/cons.
          For Indian names this is ~10y of Ind-AS data; for global
          names it degrades to 3-4y of yfinance annuals (and the tool
-         says so explicitly — quote that caveat).
-      5. get_sector_peers — YTD return / market-cap / P/E across the
+         says so explicitly — quote that caveat).  This tool is
+         BACKWARD-LOOKING (trailing statements only).
+      5. **get_forward_estimates** — required.  The FORWARD counterweight
+         to step 4: analyst price target + implied upside, forward vs
+         trailing P/E and EPS (the earnings *trajectory*), consensus
+         earnings / revenue growth for the current and next fiscal year,
+         EPS-revision momentum, and the rating distribution.  Use it so
+         the call weighs where the business is HEADING, not only where it
+         has been.  If coverage is sparse the tool says so — do not invent
+         estimates.
+      6. get_sector_peers — YTD return / market-cap / P/E across the
          country-appropriate peer basket, so you can state the alpha
          vs the median peer.
 
@@ -201,19 +210,33 @@ fundamentals_task:
     Write the report in TWO sections so the trader + PM can consume it
     at the appropriate horizon:
       * "Near-term view (SHORT / MEDIUM)": current-year snapshot,
-        margin trajectory, quarterly print, alpha vs median peer.
+        margin trajectory, quarterly print, alpha vs median peer, AND
+        the FORWARD consensus from get_forward_estimates — implied upside
+        to the mean target, the forward-vs-trailing P/E / EPS trajectory,
+        next-FY earnings & revenue growth, and revision momentum.
       * "Long-term view (LONG)": revenue / EPS CAGR, ROCE trend,
         debt trajectory, shareholding stability, structural
         pros/cons.  If the CAGR is negative or ROCE is degrading,
         flag it as a value-trap warning — the PM must NOT pick
         horizon=LONG on a broken compounder thesis.
+      * RECONCILE past vs future: when the trailing trend
+        (get_long_term_thesis) and the forward consensus
+        (get_forward_estimates) disagree — e.g. a soft trailing print but
+        rising forward EPS and a positive target — say so explicitly and
+        state which one the thesis leans on and WHY.  Do not let a weak
+        past silently override a strong forward setup, or vice-versa.
 
     PROVENANCE: every metric (P/E, EPS, revenue, margin, growth, CAGR,
     peer figure) must carry ``[source: <identifier>]`` — typically
     ``[source: yfinance .info {ticker} (fundamentals)]`` or
     ``[source: screener.in ... #profit-loss]`` or
     ``[source: screener.in ... #ratios]`` or
-    ``[source: yfinance OHLCV + .info peer basket [...] (YTD)]``.  A
+    ``[source: yfinance OHLCV + .info peer basket [...] (YTD)]``.
+    Forward-consensus figures carry the estimate-specific tag the tool
+    prints — ``[source: yfinance analyst_price_targets {ticker}]``,
+    ``[source: yfinance earnings_estimate {ticker}]``,
+    ``[source: yfinance revenue_estimate {ticker}]``, or
+    ``[source: yfinance eps_revisions {ticker}]``.  A
     qualitative structural read with no citable figure (e.g. "the
     franchise has durable pricing power") must be labelled
     ``[analyst judgement]`` — never invent a URL or placeholder link
@@ -221,11 +244,21 @@ fundamentals_task:
   expected_output: >
     A FUNDAMENTALS & SECTOR REPORT that opens with a ``TLDR:`` 3-5 line
     block (growth pct + margin + leverage + alpha vs median peer +
+    forward outlook: implied upside + fwd-vs-trailing EPS direction +
     long-term compounder bias) and then splits into "Near-term view"
-    and "Long-term view" sections.  The long-term view MUST cite at
-    least one CAGR line and one ROCE-trend line (or explicitly say the
-    data is not available).  Keep under ~3800 chars.  Every figure
-    cited carries an inline ``[source: <identifier>]`` tag.
+    and "Long-term view" sections.  The near-term view MUST cite the
+    forward consensus (implied upside to the mean target AND the
+    forward-vs-trailing EPS / P/E direction) whenever get_forward_estimates
+    returned data (say "sparse coverage" if it did not).  The long-term
+    view MUST cite at least one CAGR line drawn from get_long_term_thesis.
+    Cite a ROCE
+    trend ONLY when the tool actually returned one (the screener.in path
+    does; the yfinance fallback does NOT — in that case write "ROCE trend
+    not available via yfinance" rather than inventing figures).  NEVER
+    cite a metric or a fiscal-year range the tool did not print, and
+    never attach a ``get_long_term_thesis`` source tag to a number that
+    is not in its output.  Keep under ~3800 chars.  Every figure cited
+    carries an inline ``[source: <identifier>]`` tag.
 
 macro_task:
   description: >
@@ -494,6 +527,17 @@ trader_task:
            * A LONG target is a multi-year total return (e.g. +80–200%
              for 5y) — anchor it on the revenue / EPS CAGR from the
              long-term-thesis tool, not a chart level.
+         STOP PLACEMENT — ground it in measured volatility, not a made-up
+         ATR.  Read the "Annualised volatility (1y trailing)" line from
+         get_stock_data; a rough 1-day move ≈ that vol / 16.  The stop must
+         clear normal noise over the HOLDING PERIOD, so a multi-month /
+         multi-year trade needs a much wider band than a 2-3% day-trade
+         stop — a stop only a couple of percent from entry on a 6-month+
+         horizon is wrong and will be widened downstream.  Do NOT invent an
+         "ATR252 = X" number; if you reference volatility, quote the
+         get_stock_data vol line verbatim with its ``[source: …]`` tag.  A
+         deterministic risk check will widen any stop that is too tight for
+         the horizon+volatility, so place a realistic one yourself.
       3. If the Research Manager flagged a degraded / missing analyst
          lens or a thin-evidence risk, reduce your default size by 25%
          and explicitly cite the gap.  Otherwise keep the size and

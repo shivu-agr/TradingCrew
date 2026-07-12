@@ -102,6 +102,7 @@ async def _run(args: argparse.Namespace) -> int:
         "tools_enabled": None,  # server defaults
         "llm_preset": args.llm_preset,
         "embedding_preset": args.embedding_preset,
+        "quality_review": args.quality_review,
     }
     print(f"Connecting to {uri} …")
     async with websockets.connect(uri, max_size=8 * 1024 * 1024) as ws:
@@ -140,6 +141,8 @@ def main() -> int:
     p.add_argument("--no-memory", dest="memory", action="store_false")
     p.add_argument("--debate-rounds", type=int, default=2)
     p.add_argument("--risk-rounds", type=int, default=1)
+    p.add_argument("--quality-review", action="store_true", default=False,
+                   help="enable the (optional) Quality Reviewer audit")
     p.add_argument("--llm-preset", default=None, help="LLM preset id (default: server default)")
     p.add_argument("--embedding-preset", default=None, help="Embedding preset id (default: server default)")
     args = p.parse_args()

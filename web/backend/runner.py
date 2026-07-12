@@ -713,6 +713,90 @@ class AnalysisRunner:
         )
 
     # ---- M2 + M5 Execution pipeline ------------------------------------
+    def _normalize_stops(self, ticker: str, decision, ohlcv):
+        """Widen an implausibly tight / wrong-side / missing stop to a
+        deterministic volatility+horizon floor.
+
+        Pure-ish: reads OHLCV, computes ATR + annualised vol, and (only when
+        the stop is too tight) returns a ``model_copy`` of ``decision`` with a
+        corrected ``entry_price`` / ``stop_loss`` and an audit note appended to
+        the rationale.  Re-emits ``final_decision`` so the report card shows the
+        grounded levels.  On any failure it returns the decision untouched — we
+        never fabricate a stop when volatility can't be measured.
+        """
+        try:
+            from trading_crew.agentic.risk.stops import (
+                assess_stop,
+                compute_atr,
+                annualised_vol_from_close,
+            )
+        except Exception:
+            return decision
+        try:
+            if ohlcv is None or getattr(ohlcv, "empty", True) or len(ohlcv) < 30:
+                return decision
+            close = [float(x) for x in ohlcv["Close"].tolist()]
+            high = [float(x) for x in ohlcv["High"].tolist()]
+            low = [float(x) for x in ohlcv["Low"].tolist()]
+            atr = compute_atr(high, low, close)
+            ann_vol = annualised_vol_from_close(close)
+            current_price = close[-1] if close else 0.0
+
+            assessment = assess_stop(
+                action=str(decision.action),
+                entry=float(decision.entry_price or 0.0),
+                stop=float(decision.stop_loss or 0.0),
+                target=float(decision.target_price or 0.0),
+                horizon_days=int(decision.horizon_days or 21),
+                current_price=current_price,
+                atr=atr,
+                ann_vol=ann_vol,
+            )
+        except Exception:
+            logger.exception("stop normalization failed; leaving levels unchanged")
+            return decision
+
+        if not assessment.assessable or not assessment.any_adjusted:
+            return decision
+
+        changes = []
+        if assessment.adjusted:
+            changes.append(assessment.reason)
+        if assessment.target_adjusted:
+            changes.append(assessment.target_reason)
+        vol_ctx = (
+            f" (ATR14={atr:.2f}, ann_vol={ann_vol * 100:.0f}%"
+            + (f", reward:risk now ~{assessment.reward_risk:.1f}:1" if assessment.reward_risk is not None else "")
+            + ")"
+        )
+        note = f"[risk] Levels normalized deterministically: {'; '.join(changes)}.{vol_ctx}"
+        update = {
+            "entry_price": assessment.entry,
+            "stop_loss": assessment.stop,
+            "rationale": f"{(decision.rationale or '').strip()}\n{note}".strip(),
+        }
+        if assessment.target_adjusted:
+            update["target_price"] = assessment.target
+            if assessment.expected_return_pct is not None:
+                update["expected_return_pct"] = assessment.expected_return_pct
+        try:
+            updated = decision.model_copy(update=update)
+        except Exception:
+            logger.exception("could not apply normalized levels to decision")
+            return decision
+
+        logger.info("levels normalized for %s: %s", ticker, "; ".join(changes))
+        try:
+            self._emit(make_event(
+                "final_decision",
+                decision=updated.model_dump(),
+                raw=updated.rationale,
+                source="risk_stop_normalizer",
+            ))
+        except Exception:
+            logger.exception("failed to re-emit final_decision after stop normalization")
+        return updated
+
     def _run_execution_pipeline(
         self,
         ticker: str,
@@ -1206,17 +1290,25 @@ class AnalysisRunner:
                         else:
                             logger.exception("Reflective critic failed; using PM decision unchanged")
 
-                    proposal = portfolio_decision_to_action_proposal(
-                        pm_decision,
-                        symbol=ticker,
-                        decision_ts=decision_ts,
-                    )
                     # Reuse the OHLCV that the chart UI already fetched.
                     try:
                         end_dt = datetime.fromisoformat(decision_ts.replace("Z", "+00:00")).replace(tzinfo=None)
                     except Exception:
                         end_dt = datetime.utcnow()
                     ohlcv = _fetch_ohlcv(ticker, end_dt, lookback_days=365)
+
+                    # Deterministic stop sanity: widen an implausibly tight /
+                    # wrong-side / missing stop to a volatility+horizon floor
+                    # before the bridge freezes the levels. Runs on the
+                    # post-critic decision so the UI + episode see the grounded
+                    # entry/stop rather than the LLM's free-form guess.
+                    pm_decision = self._normalize_stops(ticker, pm_decision, ohlcv)
+
+                    proposal = portfolio_decision_to_action_proposal(
+                        pm_decision,
+                        symbol=ticker,
+                        decision_ts=decision_ts,
+                    )
                     self._run_execution_pipeline(ticker, proposal, ohlcv)
                     self._record_episode(ticker, proposal, decision_ts, regime_label)
                 except Exception:

@@ -824,9 +824,9 @@ The global-news search is grounded in the company's home country: an Indian name
     long: `
 CFA-charter-holder. Reads income statements like prose, anchors every claim in the filings, never guesses a multiple.
 
-**Tools**: \`get_fundamentals\`, \`get_balance_sheet\`, \`get_cashflow\`, \`get_income_statement\`.
+**Tools**: \`get_fundamentals\`, \`get_balance_sheet\`, \`get_cashflow\`, \`get_income_statement\`, \`get_long_term_thesis\` (trailing multi-year), \`get_forward_estimates\` (forward consensus — targets, fwd P/E, next-FY growth, revisions), \`get_sector_peers\`.
 
-**Output**: FUNDAMENTALS REPORT — growth, profitability, leverage/cash, valuation snapshot (P/E, P/B), and 1-line bias.
+**Output**: FUNDAMENTALS REPORT — growth, profitability, leverage/cash, valuation snapshot (P/E, P/B), a forward-consensus read (implied upside + fwd-vs-trailing EPS), and 1-line bias.
 `.trim(),
     keywords: ["fundamentals", "valuation", "earnings"],
   },

@@ -218,7 +218,9 @@ Iteration {iteration + 1} of {max_iters}. On REVISE the decision is amended and 
 
      (b) HONEST qualitative judgement — a claim the analyst explicitly labelled ``[analyst judgement]`` (i.e. reasoned domain knowledge with no single citable URL).  This is ACCEPTABLE, not a violation.  Do NOT push such a claim to REVISE / ABSTAIN and do NOT force HOLD merely because a well-reasoned thesis leans on labelled judgement rather than a URL for every sentence.  A missing URL downgrades at most that ONE claim's weight — never the whole thesis.
 
-   A rationale that says "management guided 18% revenue CAGR [source: yfinance ...]" plus "the domestic capex cycle favours the sector [analyst judgement]" is CORRECT — ratify.  A rationale citing "[source: https://example.com/hal-order-book]" is INCORRECT (fabricated) — revise and strip the fake source.
+     (c) FABRICATED PRECISION — a claim that attaches a REAL tool's source tag to a figure that tool cannot produce.  The clearest tells: a **specific calendar-year range** (e.g. "2019–2023") or a **ROCE trend** tagged ``[source: yfinance get_long_term_thesis]`` — the yfinance path reports only relative fiscal-year windows and NO ROCE, so precise years / ROCE trends carrying that tag are invented.  Treat this exactly like a fabricated URL: ``evidence_ok=False`` and REVISE — the invented specificity must be dropped or re-labelled ``[analyst judgement]``.
+
+   A rationale that says "management guided 18% revenue CAGR [source: yfinance ...]" plus "the domestic capex cycle favours the sector [analyst judgement]" is CORRECT — ratify.  A rationale citing "[source: https://example.com/hal-order-book]" is INCORRECT (fabricated) — revise and strip the fake source.  A rationale citing "ROCE fell 18%→12% (2019–2023) [source: yfinance get_long_term_thesis]" is INCORRECT (fabricated precision) — revise: that tool never emitted a ROCE trend or those calendar years.
 
 4. **Counterfactual** — What single piece of evidence, if reversed, would flip the decision? Keep to one sentence.
 

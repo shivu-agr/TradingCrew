@@ -1283,26 +1283,62 @@ def _long_term_thesis_from_yfinance(ticker: str) -> str:
 
     inc = t.income_stmt
     bs = t.balance_sheet
+
+    def _vals_and_years(series):
+        """Return (values, fiscal-years) oldest→newest for a statement row.
+
+        yfinance indexes statement columns by period-end Timestamps; we keep
+        the actual fiscal years so the report can label the *real* window
+        (e.g. ``FY2022→FY2025``) instead of a bare period count that the LLM
+        was previously re-dressing as an invented ``2019–2023`` range.
+        """
+        s = series.dropna()
+        try:
+            s = s.sort_index()  # oldest first
+        except Exception:
+            pass
+        vals = [float(v) for v in s.values]
+        years: list[int | None] = []
+        for idx in s.index:
+            yr = getattr(idx, "year", None)
+            if yr is None:
+                try:
+                    yr = int(str(idx)[:4])
+                except Exception:
+                    yr = None
+            years.append(yr)
+        return vals, years
+
+    def _span_label(years: list[int | None], n: int) -> tuple[str, float]:
+        """Human window label + the true year-span for CAGR annualisation."""
+        if years and years[0] and years[-1] and years[-1] > years[0]:
+            return f"FY{years[0]}→FY{years[-1]}", float(years[-1] - years[0])
+        return f"{n - 1} annual periods", max(1.0, n - 1.0)
+
+    window_note = ""
     if inc is not None and not inc.empty:
         for row_name in ("Total Revenue", "Net Income"):
             if row_name in inc.index:
-                vals = [float(v) for v in inc.loc[row_name].dropna().values][::-1]
+                vals, years = _vals_and_years(inc.loc[row_name])
                 if len(vals) >= 2:
-                    cagr = _cagr(vals, max(1.0, len(vals) - 1.0))
+                    label, span_years = _span_label(years, len(vals))
+                    window_note = label
+                    cagr = _cagr(vals, span_years)
                     lines.append(
-                        f"- **{row_name} CAGR** over {len(vals)-1}y "
+                        f"- **{row_name} CAGR** over {label} ({len(vals)} annual periods) "
                         f"({vals[0]/1e9:.2f}B → {vals[-1]/1e9:.2f}B): "
                         f"{('%+.1f%%' % cagr) if cagr is not None else 'undefined'} "
                         f"[source: yfinance income_stmt {ticker}]"
                     )
     if bs is not None and not bs.empty:
         if "Total Debt" in bs.index:
-            vals = [float(v) for v in bs.loc["Total Debt"].dropna().values][::-1]
+            vals, years = _vals_and_years(bs.loc["Total Debt"])
             if len(vals) >= 2:
+                label, _ = _span_label(years, len(vals))
                 chg = vals[-1] - vals[0]
                 direction = "reduced" if chg < 0 else ("increased" if chg > 0 else "flat")
                 lines.append(
-                    f"- **Total Debt**: {vals[0]/1e9:.2f}B → {vals[-1]/1e9:.2f}B "
+                    f"- **Total Debt** over {label}: {vals[0]/1e9:.2f}B → {vals[-1]/1e9:.2f}B "
                     f"({direction} by {abs(chg)/1e9:.2f}B) "
                     f"[source: yfinance balance_sheet {ticker}]"
                 )
@@ -1317,9 +1353,34 @@ def _long_term_thesis_from_yfinance(ticker: str) -> str:
             continue
         # yfinance uses fractional units for ratios (0.15 = 15%) but
         # occasionally reports raw percentages — we render both without
-        # guessing.
+        # guessing.  Labelled a LATEST SNAPSHOT, never a multi-year trend,
+        # so the LLM cannot re-present it as "ROE fell from X to Y over N years".
         if isinstance(v, (int, float)):
-            lines.append(f"- **{label}** (latest): {v} [source: yfinance .info {ticker}]")
+            lines.append(
+                f"- **{label}** (LATEST snapshot — NOT a multi-year trend): {v} "
+                f"[source: yfinance .info {ticker}]"
+            )
+
+    # Explicit data-availability contract so the analyst / PM cannot launder
+    # fabricated precision through this tool's source tag.  This is the direct
+    # fix for reports that cited e.g. "ROCE fell 18%→12% (2019–2023)
+    # [source: yfinance get_long_term_thesis]" — a metric and calendar range
+    # this path never produced.
+    lines.append("")
+    lines.append("## Data availability (yfinance path — READ BEFORE CITING)")
+    lines.append(
+        f"- AVAILABLE here: multi-year Revenue / Net-Income CAGR over "
+        f"{window_note or 'the fiscal years listed above'}, the total-debt "
+        f"trajectory, and a LATEST-snapshot ROE / ROA / Debt-Equity."
+    )
+    lines.append(
+        "- NOT AVAILABLE here (do NOT cite these with a "
+        "`[source: ... get_long_term_thesis]` tag): a **ROCE** figure or trend, "
+        "a multi-year **ROE/EPS trend**, or any number for a fiscal year outside "
+        "the window above. If your thesis needs one of these, either omit it or "
+        "label the reasoning `[analyst judgement]` — never attribute an invented "
+        "figure to this tool."
+    )
 
     return "\n".join(lines)
 
@@ -1636,6 +1697,169 @@ def get_analyst_recommendations(ticker: str) -> str:
         f"- Recent rating distribution:\n{rec_text}"
         + _source_line(f"yfinance recommendations_summary {ticker}")
     )
+
+
+@tool("get_forward_estimates")
+@_memoize_tool
+def get_forward_estimates(ticker: str) -> str:
+    """Forward-looking consensus: analyst price targets + upside, the
+    valuation *trajectory* (forward vs trailing P/E and EPS), consensus
+    earnings / revenue growth for the current and next fiscal year,
+    EPS-revision momentum, and the rating distribution.
+
+    This is the deliberate counterweight to the backward-looking
+    ``get_long_term_thesis`` (which is trailing statements only).  It
+    answers "what does the street expect NEXT" rather than "what did the
+    company do over the last N years", so the desk can weigh the FUTURE
+    outlook rather than anchoring the call on the past.  These are
+    sell-side *estimates* — they herd and are frequently wrong — so treat
+    them as one input, not gospel; every line is provenance-tagged.
+    """
+    canonical = resolve_ticker(ticker)
+    t = yf.Ticker(canonical)
+    lines: list[str] = [
+        f"FORWARD-LOOKING CONSENSUS for {canonical} "
+        "(sell-side estimates — directional, can herd / be wrong):"
+    ]
+
+    def _pct(x) -> str:
+        try:
+            return f"{float(x) * 100:+.1f}%"
+        except (TypeError, ValueError):
+            return "n/a"
+
+    def _num(x):
+        try:
+            v = float(x)
+        except (TypeError, ValueError):
+            return None
+        return v if v == v else None  # drop NaN
+
+    try:
+        info = t.info or {}
+    except Exception:
+        info = {}
+
+    # -- Price target + implied upside -----------------------------------
+    spot = _num(info.get("currentPrice"))
+    tgt_mean = _num(info.get("targetMeanPrice"))
+    tgt_high = _num(info.get("targetHighPrice"))
+    tgt_low = _num(info.get("targetLowPrice"))
+    n_an = info.get("numberOfAnalystOpinions")
+    if spot and tgt_mean:
+        upside = (tgt_mean / spot - 1.0)
+        lines.append(
+            f"- Price target: spot {spot:.2f} → mean {tgt_mean:.2f} "
+            f"({_pct(upside)} implied), range {tgt_low or 'n/a'}..{tgt_high or 'n/a'}"
+            f"{f', {n_an} analysts' if n_an else ''} "
+            f"[source: yfinance analyst_price_targets {canonical}]"
+        )
+
+    # -- Valuation trajectory (forward vs trailing) ----------------------
+    fpe = _num(info.get("forwardPE"))
+    tpe = _num(info.get("trailingPE"))
+    feps = _num(info.get("forwardEps"))
+    teps = _num(info.get("trailingEps"))
+    if fpe and tpe:
+        direction = "compressing (earnings expected to rise)" if fpe < tpe else (
+            "expanding (earnings expected to fall)" if fpe > tpe else "flat")
+        lines.append(
+            f"- Valuation trajectory: forward P/E {fpe:.1f} vs trailing {tpe:.1f} "
+            f"— {direction} [source: yfinance .info {canonical}]"
+        )
+    if feps is not None and teps is not None:
+        eps_chg = (feps / teps - 1.0) if teps not in (0, None) else None
+        lines.append(
+            f"- EPS power: forward EPS {feps:.2f} vs trailing {teps:.2f}"
+            f"{f' ({_pct(eps_chg)})' if eps_chg is not None else ''} "
+            f"[source: yfinance .info {canonical}]"
+        )
+
+    # -- Consensus earnings / revenue growth -----------------------------
+    def _est_line(df, label: str, source: str, *, scale: float = 1.0, unit: str = "") -> None:
+        if df is None or getattr(df, "empty", True):
+            return
+        parts = []
+        for period, human in (("0y", "FY0"), ("+1y", "FY+1")):
+            if period in df.index:
+                row = df.loc[period]
+                avg = _num(row.get("avg"))
+                growth = row.get("growth")
+                if avg is not None:
+                    val = f"{avg / scale:,.2f}{unit}" if scale != 1.0 else f"{avg:,.2f}{unit}"
+                    parts.append(f"{human} {val} (growth {_pct(growth)})")
+        if parts:
+            lines.append(f"- {label}: " + "; ".join(parts) + f" [source: {source}]")
+
+    try:
+        _est_line(t.earnings_estimate, "Earnings estimates (EPS)",
+                  f"yfinance earnings_estimate {canonical}")
+    except Exception:
+        pass
+    try:
+        _est_line(t.revenue_estimate, "Revenue estimates",
+                  f"yfinance revenue_estimate {canonical}", scale=1e9, unit="B")
+    except Exception:
+        pass
+
+    # -- EPS-revision momentum (last 30 days) ----------------------------
+    try:
+        rev = t.eps_revisions
+        if rev is not None and not rev.empty:
+            rparts = []
+            for period, human in (("0y", "FY0"), ("+1y", "FY+1")):
+                if period in rev.index:
+                    up = rev.loc[period].get("upLast30days")
+                    dn = rev.loc[period].get("downLast30days")
+                    up = int(up) if up == up else 0
+                    dn = int(dn) if dn == dn else 0
+                    tilt = "↑" if up > dn else ("↓" if dn > up else "→")
+                    rparts.append(f"{human} {up}up/{dn}down {tilt}")
+            if rparts:
+                lines.append(
+                    "- EPS revision momentum (30d): " + "; ".join(rparts)
+                    + f" [source: yfinance eps_revisions {canonical}]"
+                )
+    except Exception:
+        pass
+
+    # -- Long-term growth estimate ---------------------------------------
+    try:
+        ge = t.growth_estimates
+        if ge is not None and not ge.empty and "LTG" in ge.index:
+            ltg = _num(ge.loc["LTG"].get("stockTrend"))
+            if ltg is not None:
+                lines.append(
+                    f"- Long-term growth estimate (LTG): {_pct(ltg)} "
+                    f"[source: yfinance growth_estimates {canonical}]"
+                )
+    except Exception:
+        pass
+
+    # -- Rating distribution ---------------------------------------------
+    try:
+        rs = t.recommendations_summary
+        if rs is not None and not rs.empty:
+            row = rs.iloc[0]
+            lines.append(
+                "- Rating distribution (current month): "
+                f"strongBuy {int(row.get('strongBuy', 0))}, buy {int(row.get('buy', 0))}, "
+                f"hold {int(row.get('hold', 0))}, sell {int(row.get('sell', 0))}, "
+                f"strongSell {int(row.get('strongSell', 0))} "
+                f"[source: yfinance recommendations_summary {canonical}]"
+            )
+    except Exception:
+        pass
+
+    if len(lines) == 1:
+        return (
+            f"No forward-looking consensus available via yfinance for {canonical} "
+            "(sparse analyst coverage — common for smaller / non-US names). "
+            "Do NOT fabricate estimates; rely on the trailing fundamentals and "
+            "label any forward view [analyst judgement]."
+            + _source_line(f"yfinance forward estimates {canonical} (empty)")
+        )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -2234,6 +2458,7 @@ ALL_TOOLS = {
     "get_supply_chain_risk": get_supply_chain_risk,
     "get_options_summary": get_options_summary,
     "get_analyst_recommendations": get_analyst_recommendations,
+    "get_forward_estimates": get_forward_estimates,
     "get_event_proximity": get_event_proximity,
     "backtest_setup": backtest_setup,
     "retrieve_past_episodes": retrieve_past_episodes,
@@ -2280,6 +2505,11 @@ DEFAULT_AGENT_TOOLS: dict[str, list[str]] = {
         # tool's output, so the fundamentals analyst is responsible
         # for pulling + citing it.
         "get_long_term_thesis",
+        # Forward-looking counterweight to the (trailing) long-term thesis:
+        # analyst targets + upside, forward vs trailing P/E and EPS, consensus
+        # earnings/revenue growth, and revision momentum.  Ensures the desk
+        # weighs the FUTURE outlook rather than anchoring only on the past.
+        "get_forward_estimates",
         # Sector/peer relative strength (absorbed from the sector desk).
         "get_market_context", "get_sector_peers",
     ],

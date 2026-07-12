@@ -75,7 +75,7 @@ The equities crew defines **14 agent personas**; a **lean default run uses 11 ag
 | --- | --- | --- |
 | **Market** | price / technicals **+ options / positioning** (was Market + Quant) | `get_stock_data`, `get_indicators`, `get_options_summary`, `get_analyst_recommendations` |
 | **News** | catalysts / corporate actions **+ sentiment / insider** (was News + Social) | `get_news`, `get_global_news`, `get_corporate_actions`, `get_insider_transactions` |
-| **Fundamentals** | financials + long-term thesis **+ sector / peers** (was Fundamentals + Sector) | `get_fundamentals`, `get_balance_sheet`, `get_cashflow`, `get_income_statement`, `get_shareholding_pattern`, `get_long_term_thesis`, `get_sector_peers` |
+| **Fundamentals** | financials + long-term thesis **+ forward consensus + sector / peers** (was Fundamentals + Sector) | `get_fundamentals`, `get_balance_sheet`, `get_cashflow`, `get_income_statement`, `get_shareholding_pattern`, `get_long_term_thesis`, `get_forward_estimates`, `get_sector_peers` |
 | **Macro** | macro regime **+ geopolitical / supply-chain** (was Macro + Geopolitical) | `get_macro_data`, `get_global_news`, `get_geopolitical_news`, `get_supply_chain_risk` |
 
 **Toggles** (sidebar → *Dialogue* section, or `POST /api/sessions` body):
@@ -955,6 +955,14 @@ The `get_long_term_thesis` tool aggregates screener.in's 10-year Ind-AS tables (
 - Shareholding stability (promoter / FII drift on Indian names)
 - Screener's own structural pros/cons
 
+`get_long_term_thesis` is **trailing only** — it reports *relative* fiscal-year windows (e.g. "latest 5 fiscal years") and, on the yfinance path, deliberately emits **no ROCE trend** (yfinance doesn't expose it). Its companion `get_forward_estimates` supplies the **forward counterweight** so the Fundamentals desk doesn't anchor a multi-year call purely on the rear-view mirror:
+
+- **Analyst price targets** — mean / high / low target and the implied upside/downside vs the last close.
+- **Valuation trajectory** — forward P/E vs trailing P/E, and forward EPS vs trailing EPS (is the multiple expanding or compressing, is EPS power rising or falling).
+- **Consensus estimates + revisions** — next-FY revenue / earnings growth and the direction of recent estimate revisions.
+
+Each line carries an estimate-specific source tag (`[source: yfinance analyst_price_targets …]`, `… earnings_estimate …`, `… revenue_estimate …`), and when yfinance has no forward consensus the tool says so explicitly and instructs the analyst to label any forward view `[analyst judgement]` — no fabricated numbers. The Reflective Critic enforces the flip side: a **fabricated-precision** check now flags any specific calendar-year range (e.g. "2019–2023") or ROCE trend that carries a `get_long_term_thesis` tag on the yfinance path (which never emitted them), treating it like a fabricated URL — `evidence_ok=False`, revise.
+
 For the accounting side: because the outcome-resolution loop can't wait 10 years, LONG-tier decisions have their `ActionProposal.horizon_days` **clamped to 5 years (1260 trading days)** — the narrative 5-10 year thesis lives in `PortfolioDecision.long_term_view` (the field was previously named `long_term_thesis` and the schema accepts the old key as an alias) and the RLMF loop uses the 5y realised return as the reward proxy.
 
 `long_term_view` is now **required on every decision**, not just LONG-tier calls.  For horizon=LONG it holds the 2-5 sentence multi-year narrative; for horizon=SHORT / MEDIUM it holds a 1-2 sentence "the multi-year compounding thesis is intact / broken / not applicable" line so the LONG-panel context is preserved in the PM's final report even when the desk chose a shorter primary window.  Historically the trader reasoned over the LONG row of the backtest panel but that context was silently dropped once the PM's JSON was emitted — the field rename + always-populate rule closes that gap.
@@ -994,7 +1002,7 @@ The deterministic backend draws on the design described in [arxiv:2605.19337](ht
 | **M2** Execution + cost layer | `agentic/execution/{cost,simulator,pipeline}.py` | Cost model (fees + half-spread + √impact), next-bar fill simulator, sensitivity sweep | "Execution" card in Workflow tab |
 | **M3** Audit-grade memory v2 | `agentic/memory/{episodic,semantic,regime}.py` | Outcome-embargoed `EpisodicMemory`, time-decay retrieval, regime tags, `SemanticKnowledgeBase` with provenance | **Memory** tab + episode banner |
 | **M4** Reflection + cascaded controller | `trading_crew/critic.py`, `web/backend/runner.py::_run_cascade_controller` + `_crisis_override_decision` | **Cascaded controller** detects regime *before* the crew kicks off and short-circuits to ABSTAIN on CRISIS (saving ~30k tokens). **Reflective Critic** runs after the PM with 5-stage protocol (intent / evidence / counterfactual / risk / verdict), bounded reflection budget (2 iterations), and 3-temperature consistency vote (mode < 2/3 → forced ABSTAIN). | Cascade badge + Reflective-critic panel with per-sample checklist |
-| **M5** Risk + sizing layer | `agentic/risk/{var,sizing,gates}.py` | Historical + parametric VaR/CVaR, Fractional Kelly × vol-target × CVaR clamp sizing, hard gates (concentration, leverage, drawdown stop, kill switch) | "Sizing" + "Risk gates" panels |
+| **M5** Risk + sizing layer | `agentic/risk/{var,sizing,gates,stops}.py` | Historical + parametric VaR/CVaR, Fractional Kelly × vol-target × CVaR clamp sizing, hard gates (concentration, leverage, drawdown stop, kill switch), plus **deterministic stop/target normalization** (`stops.py`) that widens implausibly tight / wrong-side / missing stops to a volatility+horizon floor | "Sizing" + "Risk gates" panels |
 | **M6** Walk-forward backtest + manifest | `agentic/backtest/{walk_forward,metrics,manifest,engine}.py` | Embargoed train/test folds, Sharpe / Sortino / Calmar / MaxDD / **Deflated Sharpe**, run manifest with git-sha + prompts hash + data hashes | **Backtest** tab (equity curve + per-fold metrics) |
 | **M7** Multi-ticker allocator | `agentic/portfolio/allocator.py` | HRP / Mean-Variance / Equal-Risk allocator over the most recent `ActionProposal` per ticker | **Portfolio** tab |
 
@@ -1005,10 +1013,24 @@ The deterministic backend draws on the design described in [arxiv:2605.19337](ht
 3. **If regime == CRISIS** → the runner skips `crew.kickoff()` entirely and builds a synthetic ABSTAIN `PortfolioDecision` (paper §5.3 emergency stop). The deterministic M1→M5→M3 pipeline still runs so the audit trail is identical.
 4. **Otherwise** `crew.kickoff()` runs the lean CrewAI flow. The Market Analyst and Trader can call the new `retrieve_past_episodes` tool to ground their analysis in prior outcomes (M3, embargo-enforced). UI streams `node_started` / `agent_step` / `tool_call` / `tool_result` / `node_completed` / `final_decision`.
 5. **Reflective Critic (M4)** — once the Portfolio Manager returns its typed `PortfolioDecision`, the runner runs the 5-stage critique (up to 2 iterations) then a 3-temperature consistency vote. If the modal verdict has < 2/3 share, the decision is forced to ABSTAIN. The runner emits `reflection_records` and (if revised) a second `final_decision` with `source="critic"`.
-6. **Bridge (M1)** — the post-critic `PortfolioDecision` is mapped to a typed `ActionProposal` via `portfolio_decision_to_action_proposal()` and emitted as `action_proposal`.
-7. **Pipeline (M2+M5)** — `run_pipeline()` computes VaR/CVaR from the OHLCV, runs the **sizer** (Fractional Kelly × vol-target × CVaR clamp × debate-derived risk multiplier), runs the **risk gates** (concentration, leverage, DD stop, kill switch, …), and runs the **simulator** for a next-bar fill. The runner emits `execution_result` with sizing breakdown, risk-gate outcomes, and a low/standard/high cost-sensitivity sweep.
-8. **Episode (M3)** — a PENDING `Episode` (state, action, outcome_ts = decision_ts + horizon, regime tag, embargo) is appended to episodic memory and `episode_recorded` is emitted.
-9. **Persistence (Phase E)** — every event since step 1 is captured into the `RunRecord` and written atomically to `~/.trading_crew/runs/{TICKER}/{ts}.json` plus an index line so the UI sidebar can list it.
+6. **Stop/target normalization (M5)** — before the bridge freezes the levels, `runner._normalize_stops()` computes ATR + annualised vol from the OHLCV and, only if the PM's stop is implausibly tight / on the wrong side of entry / missing, widens it to the volatility+horizon floor (and caps a moonshot target). It appends an audit note to the rationale and re-emits `final_decision` (`source="risk_stop_normalizer"`) so the UI + episode show the grounded levels. If volatility can't be measured, the levels are left untouched — never fabricated. See [Deterministic stop & target normalization](#deterministic-stop--target-normalization-m5) below.
+7. **Bridge (M1)** — the post-critic `PortfolioDecision` is mapped to a typed `ActionProposal` via `portfolio_decision_to_action_proposal()` and emitted as `action_proposal`.
+8. **Pipeline (M2+M5)** — `run_pipeline()` computes VaR/CVaR from the OHLCV, runs the **sizer** (Fractional Kelly × vol-target × CVaR clamp × debate-derived risk multiplier), runs the **risk gates** (concentration, leverage, DD stop, kill switch, …), and runs the **simulator** for a next-bar fill. The runner emits `execution_result` with sizing breakdown, risk-gate outcomes, and a low/standard/high cost-sensitivity sweep.
+9. **Episode (M3)** — a PENDING `Episode` (state, action, outcome_ts = decision_ts + horizon, regime tag, embargo) is appended to episodic memory and `episode_recorded` is emitted.
+10. **Persistence (Phase E)** — every event since step 1 is captured into the `RunRecord` and written atomically to `~/.trading_crew/runs/{TICKER}/{ts}.json` plus an index line so the UI sidebar can list it.
+
+### Deterministic stop & target normalization (M5)
+
+`trading_crew/agentic/risk/stops.py` fixes a subtle but expensive failure mode: the PM's `entry_price` / `stop_loss` / `target_price` are free-form numbers the LLM writes, and nothing used to compute or validate them. In practice the model would attach a *tight* technical stop (a ~2% band) to a **multi-month or multi-year** hold, so one ordinary day of noise stops the trade out long before the thesis can play out — and any "ATR" it quoted was invented, since the equity crew computes none.
+
+The module is a pure, deterministic sanity layer wired in at `runner._normalize_stops()` **after the critic, before the bridge** (step 6 above):
+
+- **Volatility measurement** — `compute_atr()` (Wilder's ATR-14) and `annualised_vol_from_close()` are computed from the OHLCV the chart UI already fetched. If neither can be measured, the levels are returned **untouched** (no fabricated volatility — per the "no silent fallback" rule).
+- **Minimum stop distance** — `min_stop_pct()` combines an ATR floor (never tighter than `ATR_FLOOR_MULT` ATRs) with a horizon-scaled 1-σ move (√-time scaling, capped at ~one quarter because beyond that a "stop" is really a thesis-invalidation exit). Absolute clamps (`HARD_FLOOR_PCT` … `HARD_CAP_PCT`) keep it sane for very low-/high-vol names.
+- **Stop correction** — a stop that is missing, on the wrong side of entry, or tighter than the floor is widened to the floor; a conservatively wide stop is **never** tightened.
+- **Target validation** — an implausibly large target (e.g. "+300% in 30 days") is capped to `TARGET_MAX_SIGMA_MULT × horizon-σ` (target scaling is *not* quarter-capped — a multi-year hold legitimately targets a large total return), and a missing / wrong-side / degenerate target is set to a horizon-scaled default. A reward:risk ratio is derived from the final levels.
+
+Only when something actually changes does the runner append an audit note to the rationale (with the ATR / annualised-vol context and the new reward:risk) and re-emit `final_decision` with `source="risk_stop_normalizer"`, so the report card and the persisted episode show the grounded levels rather than the LLM's guess. The behaviour is covered by `tests/test_stops.py`; the paired `get_forward_estimates` wiring is covered by `tests/test_forward_estimates.py`.
 
 ### New API endpoints
 
