@@ -357,6 +357,38 @@ def test_fetch_company_falls_back_to_standalone_on_404(fixture_html, monkeypatch
     assert session.get.call_count == 2
 
 
+def test_fetch_company_falls_back_when_consolidated_quarters_empty(fixture_html, monkeypatch):
+    """A name with no consolidated financials (e.g. COLPAL) serves a
+    label-only #quarters SKELETON on ``/consolidated/`` (HTTP 200, no period
+    columns) while its ANNUAL P&L is still populated with stale history.  The
+    fetch must not stop at that page — it must fetch ``/`` (standalone), which
+    carries real quarterly numbers, and surface ``mode="standalone"``."""
+    skeleton = (
+        "<html><body><h1>Colgate Palmolive</h1>"
+        "<section id='quarters'><table class='data-table'><tbody>"
+        "<tr><td class='text'>Sales +</td></tr>"
+        "<tr><td class='text'>Net Profit +</td></tr>"
+        "</tbody></table></section>"
+        # a populated annual P&L, to prove the P&L is NOT enough to keep the page
+        "<section id='profit-loss'><table class='data-table'>"
+        "<thead><tr><th></th><th>Mar 2022</th><th>Mar 2023</th></tr></thead>"
+        "<tbody><tr><td class='text'>Sales</td><td>100</td><td>110</td></tr></tbody>"
+        "</table></section></body></html>"
+    )
+    session = MagicMock()
+    session.get.side_effect = [
+        _mock_response(200, skeleton),      # /consolidated/ — empty quarters
+        _mock_response(200, fixture_html),  # /             — real quarters
+    ]
+    monkeypatch.setattr(ss, "_get_session", lambda: session)
+    monkeypatch.setattr(ss, "_maybe_login", lambda s: None)
+
+    page = ss.fetch_company("COLPALTEST.NS")
+    assert page.mode == "standalone"
+    assert session.get.call_count == 2
+    assert ss._table_has_values(page.quarters)
+
+
 def test_fetch_company_raises_on_rate_limit(monkeypatch):
     """A 429 must NOT be papered over with a yfinance fallback (project
     rule) — it propagates so the tool layer can emit a clear line.
@@ -378,6 +410,45 @@ def test_fetch_company_raises_not_found_on_double_404(monkeypatch):
 
     with pytest.raises(ss.ScreenerNotFoundError):
         ss.fetch_company("BOGUS.NS")
+
+
+def test_fetch_company_resolves_listing_slug_via_search(fixture_html, monkeypatch):
+    """Yahoo root SBI is not the NSE listing (SBIN). Search on the same
+    source must resolve the slug instead of raising not-found."""
+    search = MagicMock()
+    search.status_code = 200
+    search.json.return_value = [
+        {"name": "State Bank of India", "url": "/company/SBIN/consolidated/"},
+    ]
+
+    def _get(url, **kwargs):
+        if "api/company/search" in str(url):
+            return search
+        if "/company/SBIN/" in str(url):
+            return _mock_response(200, fixture_html)
+        return _mock_response(404)
+
+    session = MagicMock()
+    session.get.side_effect = _get
+    monkeypatch.setattr(ss, "_get_session", lambda: session)
+    monkeypatch.setattr(ss, "_maybe_login", lambda s: None)
+
+    page = ss.fetch_company("SBI.NS")
+    assert page.symbol == "SBIN"
+    assert page.mode == "consolidated"
+
+
+def test_search_company_slug_prefers_name_or_code_match():
+    session = MagicMock()
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = [
+        {"name": "SBI Cards", "url": "/company/SBICARD/consolidated/"},
+        {"name": "State Bank of India", "url": "/company/SBIN/consolidated/"},
+    ]
+    session.get.return_value = resp
+    slug = ss.search_company_slug("SBI", session=session)
+    assert slug == "SBIN"
 
 
 def test_fetch_company_is_cached(fixture_html, monkeypatch):

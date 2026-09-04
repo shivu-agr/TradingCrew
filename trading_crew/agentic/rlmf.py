@@ -183,6 +183,14 @@ class RLMFRow:
     alpha_return: Optional[float]
     reward: float
     reflection: Optional[str] = None
+    # Structured L2 reflection fields (from ``Episode.reflection_meta``).
+    # ``desks`` drives per-desk feedback routing; ``error_class`` segments
+    # learning + calibration by failure mode.
+    desks: List[str] = field(default_factory=list)
+    error_class: Optional[str] = None
+    recommended_change: Optional[str] = None
+    outcome_label: Optional[str] = None
+    desk_lessons: List[dict] = field(default_factory=list)
 
     def to_jsonl_dict(self) -> dict:
         """Return a dict shaped like FinGPT-Forecaster's JSONL rows.
@@ -219,6 +227,11 @@ class RLMFRow:
             "alpha_return": self.alpha_return,
             "reward": self.reward,
             "reflection": self.reflection,
+            "desks": self.desks,
+            "error_class": self.error_class,
+            "recommended_change": self.recommended_change,
+            "outcome_label": self.outcome_label,
+            "desk_lessons": self.desk_lessons,
         }
 
 
@@ -231,6 +244,7 @@ def _episode_to_row(ep: Episode) -> Optional[RLMFRow]:
         return None
     proposal = ep.action_proposal or {}
     horizon_days = int(proposal.get("horizon_days") or 0)
+    meta = ep.reflection_meta or {}
     return RLMFRow(
         episode_id=ep.episode_id,
         symbol=ep.symbol,
@@ -246,6 +260,14 @@ def _episode_to_row(ep: Episode) -> Optional[RLMFRow]:
         ),
         reward=reward,
         reflection=ep.reflection,
+        desks=list(meta.get("desks") or []),
+        error_class=meta.get("error_class"),
+        recommended_change=meta.get("recommended_change"),
+        outcome_label=(
+            meta.get("outcome_label")
+            or getattr(ep, "outcome_label", None)
+        ),
+        desk_lessons=list(meta.get("desk_lessons") or []),
     )
 
 
@@ -260,6 +282,9 @@ def build_dataset(
     symbol: Optional[str] = None,
     horizon_tier: Optional[Horizon] = None,
     now: Optional[datetime] = None,
+    workflow_version: Optional[str] = None,
+    prompts_hash: Optional[str] = None,
+    source: Optional[str] = None,
 ) -> List[RLMFRow]:
     """Return every resolved episode as an RLMF training row.
 
@@ -267,6 +292,9 @@ def build_dataset(
       * ``symbol`` — restrict to a single ticker (case-insensitive).
       * ``horizon_tier`` — restrict to SHORT / MEDIUM / LONG (helpful
         when you want to fine-tune a long-only or short-only adapter).
+      * ``workflow_version`` / ``prompts_hash`` / ``source`` — restrict to a
+        trustworthy cohort (Phase 0).  ``None`` = no filter; a concrete
+        value excludes unstamped / drifting-workflow episodes.
       * ``now`` — respected only for the ``embargo`` check downstream;
         this function itself only touches RESOLVED episodes.
 
@@ -274,10 +302,17 @@ def build_dataset(
     a few-shot exemplar pool can just ``take(k)`` from the top.
     """
     from trading_crew.agentic.reflection import _default_memory_path  # local import — avoids startup cost when RLMF unused
+    from trading_crew.agentic.versioning import filter_episodes_by_cohort
 
     memory = memory or EpisodicMemory(_default_memory_path())
+    episodes = filter_episodes_by_cohort(
+        list(memory.all_episodes()),
+        workflow_version=workflow_version,
+        prompts_hash=prompts_hash,
+        source=source,
+    )
     rows: List[RLMFRow] = []
-    for ep in memory.all_episodes():
+    for ep in episodes:
         if symbol and ep.symbol.upper() != symbol.upper():
             continue
         row = _episode_to_row(ep)
@@ -377,6 +412,8 @@ def build_few_shot_pool(
     horizon_tier: Optional[Horizon] = None,
     k_wins: int = 3,
     k_losses: int = 2,
+    workflow_version: Optional[str] = None,
+    source: Optional[str] = None,
 ) -> str:
     """Build a compact few-shot prompt block from resolved episodes.
 
@@ -401,6 +438,8 @@ def build_few_shot_pool(
         memory=memory,
         symbol=symbol,
         horizon_tier=horizon_tier,
+        workflow_version=workflow_version,
+        source=source,
     )
     if not rows:
         return ""

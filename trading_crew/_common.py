@@ -64,12 +64,18 @@ def get_llm(temperature: float = 0.3, agent_key: str | None = None, **overrides)
     1. ``LOCAL_LLM_*`` env vars (in-workspace fallback).
     2. ``VLLM_LLM_*`` env vars (preferred default — any OpenAI-compatible
        hosted vLLM-style endpoint).
-    3. **Per-agent JSON override** via ``LLM_PER_AGENT[agent_key]``
+    3. ``LLAMACPP_LLM_*`` env vars (optional llama.cpp server, e.g.
+       DeepSeek-V4 served via ``llama-server``).  Falls through only when
+       neither ``VLLM_LLM_*`` nor ``LOCAL_LLM_*`` is set, so the vLLM
+       endpoints keep priority; pick the ``llamacpp-deepseek-v4`` preset
+       in the UI to route per-run instead.
+    4. **Per-agent JSON override** via ``LLM_PER_AGENT[agent_key]``
        (Phase 2E — lets cheap agents use a smaller model and long-context
        agents keep the 131K hosted endpoint).
     4. **Active UI preset** via ``llm_presets.get_active_overrides()``
-       (Phase 2F — what the user picked from the LLM dropdown in the
-       sidebar; thread-local so concurrent WS sessions don't collide).
+       (Phase 2F — what the user picked from the LLM dropdown; a
+       ContextVar so concurrent WS sessions don't collide and graph
+       thread-pool workers inherit the same endpoint).
     5. Direct kwargs passed to this function.
     """
     from crewai import LLM
@@ -77,11 +83,20 @@ def get_llm(temperature: float = 0.3, agent_key: str | None = None, **overrides)
     # Local import to avoid a circular dep — ``llm_presets`` is a sibling.
     from . import llm_presets
 
-    base_url = os.environ.get("VLLM_LLM_BASE_URL") or os.environ.get("LOCAL_LLM_BASE_URL")
-    model = os.environ.get("VLLM_LLM_MODEL") or os.environ.get("LOCAL_LLM_MODEL")
+    base_url = (
+        os.environ.get("VLLM_LLM_BASE_URL")
+        or os.environ.get("LOCAL_LLM_BASE_URL")
+        or os.environ.get("LLAMACPP_LLM_BASE_URL")
+    )
+    model = (
+        os.environ.get("VLLM_LLM_MODEL")
+        or os.environ.get("LOCAL_LLM_MODEL")
+        or os.environ.get("LLAMACPP_LLM_MODEL")
+    )
     api_key = (
         os.environ.get("VLLM_LLM_API_KEY")
         or os.environ.get("OPENAI_API_KEY")
+        or os.environ.get("LLAMACPP_LLM_API_KEY")
         or "dummy"
     )
     provider = os.environ.get("LLM_PROVIDER_PREFIX", "hosted_vllm")
@@ -193,21 +208,9 @@ def get_llm(temperature: float = 0.3, agent_key: str | None = None, **overrides)
     # applied to *both* thinking and non-thinking models on the
     # explicit understanding that it may truncate.  ``0`` (default) or
     # a negative value disables the cap entirely.
-    try:
-        params["timeout"] = float(os.environ.get("LLM_TIMEOUT_SECONDS", "720"))
-    except ValueError:
-        params["timeout"] = 720.0
-    try:
-        params["max_retries"] = int(os.environ.get("LLM_MAX_RETRIES", "0"))
-    except ValueError:
-        params["max_retries"] = 0
+    params.update(_llm_client_knobs())
 
-    try:
-        max_tokens_cap = int(os.environ.get("LLM_MAX_TOKENS", "0"))
-    except ValueError:
-        max_tokens_cap = 0
-    if max_tokens_cap > 0:
-        params["max_tokens"] = max_tokens_cap
+    disable_thinking = bool(overrides.pop("disable_thinking", False))
 
     # Direct kwargs win last.
     params.update(overrides)
@@ -215,7 +218,75 @@ def get_llm(temperature: float = 0.3, agent_key: str | None = None, **overrides)
     # closed-source path where the SDK handles routing itself.
     if params.get("base_url") is None:
         params.pop("base_url", None)
-    return LLM(**params)
+    llm = LLM(**params)
+    if disable_thinking:
+        return apply_no_think(llm)
+    return llm
+
+
+def _llm_client_knobs() -> dict:
+    """Shared timeout / retry / max_tokens for CrewAI ``LLM`` constructors."""
+    knobs: dict = {}
+    try:
+        knobs["timeout"] = float(os.environ.get("LLM_TIMEOUT_SECONDS", "720"))
+    except ValueError:
+        knobs["timeout"] = 720.0
+    try:
+        knobs["max_retries"] = int(os.environ.get("LLM_MAX_RETRIES", "0"))
+    except ValueError:
+        knobs["max_retries"] = 0
+    try:
+        max_tokens_cap = int(os.environ.get("LLM_MAX_TOKENS", "0"))
+    except ValueError:
+        max_tokens_cap = 0
+    if max_tokens_cap > 0:
+        knobs["max_tokens"] = max_tokens_cap
+    return knobs
+
+
+def get_report_process_llm(temperature: float = 0.2):
+    """LLM used only by ``get_report_insights`` map-reduce.
+
+    Reads ``REPORT_PROCESS_BASE_URL`` / ``MODEL`` / ``API_KEY`` and
+    ``LLM_PROVIDER_PREFIX``. Switch the model by changing those vars.
+    Missing vars raise. Does not follow ``TRADINGCREW_LLM_PRESET``.
+    """
+    from crewai import LLM
+
+    base_url = (os.environ.get("REPORT_PROCESS_BASE_URL") or "").strip()
+    model = (os.environ.get("REPORT_PROCESS_MODEL") or "").strip()
+    api_key = (os.environ.get("REPORT_PROCESS_API_KEY") or "").strip()
+    if not base_url or not model or not api_key:
+        raise RuntimeError(
+            "get_report_insights requires REPORT_PROCESS_BASE_URL, "
+            "REPORT_PROCESS_MODEL, and REPORT_PROCESS_API_KEY."
+        )
+    provider = (os.environ.get("LLM_PROVIDER_PREFIX") or "").strip()
+    if not provider:
+        raise RuntimeError(
+            "get_report_insights requires LLM_PROVIDER_PREFIX."
+        )
+    if provider in ("openai", "anthropic") and not base_url:
+        full_model = f"{provider}/{model}"
+    else:
+        full_model = f"{provider}/{model}"
+    params = dict(
+        model=full_model,
+        base_url=base_url,
+        api_key=api_key,
+        temperature=temperature,
+    )
+    params.update(_llm_client_knobs())
+    if params.get("base_url") is None:
+        params.pop("base_url", None)
+    llm = LLM(**params)
+    # Map-reduce is extractive. A thinking model can spend the full
+    # LLM_TIMEOUT_SECONDS inside <think> and never return a digest.
+    # Flip via REPORT_PROCESS_DISABLE_THINKING in .env (no-op on OSS).
+    flag = (os.environ.get("REPORT_PROCESS_DISABLE_THINKING") or "").strip().lower()
+    if flag in ("1", "true", "yes", "on"):
+        return apply_no_think(llm)
+    return llm
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +339,37 @@ def _is_thinking_model(model_name: str) -> bool:
     return any(marker in lower for marker in _THINKING_MODEL_MARKERS)
 
 
+def apply_no_think(llm):
+    """Force ``enable_thinking=False`` on Qwen3-family LLMs; no-op otherwise.
+
+    Used for CrewAI memory-analyze calls and for synthesis / decision desks
+    (research manager, trader, risk, PM) where a 10-minute ``<think>``
+    monologue does not improve the call.
+    """
+    model_name = str(getattr(llm, "model", "") or "")
+    if not _is_thinking_model(model_name):
+        return llm
+
+    existing = dict(getattr(llm, "additional_params", None) or {})
+    existing_extra = dict(existing.get("extra_body") or {})
+    existing_kwargs = dict(existing_extra.get("chat_template_kwargs") or {})
+    existing_kwargs.setdefault("enable_thinking", False)
+    existing_extra["chat_template_kwargs"] = existing_kwargs
+    existing["extra_body"] = existing_extra
+    llm.additional_params = existing
+    return llm
+
+
+def _memory_llm_local_enabled() -> bool:
+    """Route CrewAI memory-analyze calls at ``LOCAL_LLM_*`` (default ON).
+
+    Flip ``TRADINGCREW_MEMORY_LLM_LOCAL=0`` to send them to the same endpoint
+    as the debate instead."""
+    return os.environ.get("TRADINGCREW_MEMORY_LLM_LOCAL", "1").strip().lower() not in (
+        "0", "false", "no", "off", "",
+    )
+
+
 def get_memory_llm(**overrides):
     """Return an LLM instance for CrewAI's memory analyze subsystem.
 
@@ -282,21 +384,49 @@ def get_memory_llm(**overrides):
     immutable-in-config and ``additional_params`` is set once at
     construction, so concurrent ``analyze_for_*`` calls from CrewAI's
     encoding-flow thread pool cannot race on it.
-    """
-    llm = get_llm(temperature=0.1, **overrides)  # low temp — utility calls, not creativity
-    model_name = str(getattr(llm, "model", "") or "")
-    if not _is_thinking_model(model_name):
-        return llm
 
-    existing = dict(getattr(llm, "additional_params", None) or {})
-    existing_extra = dict(existing.get("extra_body") or {})
-    existing_kwargs = dict(existing_extra.get("chat_template_kwargs") or {})
-    # Explicit request override wins; otherwise force False.
-    existing_kwargs.setdefault("enable_thinking", False)
-    existing_extra["chat_template_kwargs"] = existing_kwargs
-    existing["extra_body"] = existing_extra
-    llm.additional_params = existing
-    return llm
+    **Endpoint + timeout (latency fix).**  CrewAI's memory subsystem fires
+    these utility calls dozens of times per run.  Pointing them at the same
+    (often congested) remote debate endpoint caused repeated ``upstream
+    request timeout`` fallbacks that each burned the 720s debate ceiling,
+    turning a ~10-min run into 20+.  So by default we (a) route them at the
+    LOCAL LLM endpoint when one is configured (``LOCAL_LLM_BASE_URL`` /
+    ``LOCAL_LLM_MODEL`` — an idle, fast, classifier-grade model is exactly
+    right for analyze/extract/consolidate), and (b) apply a *tight* timeout
+    (``LLM_MEMORY_TIMEOUT_SECONDS``, default 60s) so a stall fails fast to
+    CrewAI's built-in defaults instead of hanging the run.  Opt out of the
+    local routing with ``TRADINGCREW_MEMORY_LLM_LOCAL=0`` (then they use the
+    same endpoint as the debate).
+    """
+    # (a) tight timeout — utility calls, fail fast rather than block the run.
+    if "timeout" not in overrides:
+        try:
+            overrides["timeout"] = float(os.environ.get("LLM_MEMORY_TIMEOUT_SECONDS", "60"))
+        except ValueError:
+            overrides["timeout"] = 60.0
+    # (b) route at the local endpoint when configured + enabled, and the
+    # operator has not selected a UI preset for this run.  A live
+    # Settings pick is one endpoint for every call — do not send
+    # memory-analyze at LOCAL_LLM_* while desks use VLLM_LLM_*.
+    from . import llm_presets
+
+    if (
+        _memory_llm_local_enabled()
+        and "base_url" not in overrides
+        and "model" not in overrides
+        and not llm_presets.get_active_preset_id()
+    ):
+        local_base = os.environ.get("LOCAL_LLM_BASE_URL")
+        local_model = os.environ.get("LOCAL_LLM_MODEL")
+        if local_base and local_model:
+            provider = os.environ.get("LLM_PROVIDER_PREFIX", "hosted_vllm")
+            overrides["base_url"] = local_base
+            overrides["model"] = f"{provider}/{local_model}"
+            local_key = os.environ.get("LOCAL_LLM_API_KEY")
+            if local_key:
+                overrides["api_key"] = local_key
+    llm = get_llm(temperature=0.1, **overrides)  # low temp — utility calls, not creativity
+    return apply_no_think(llm)
 
 
 def get_embedder_config() -> dict:

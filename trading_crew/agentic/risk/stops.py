@@ -36,7 +36,7 @@ The constants below are model parameters, not fallbacks:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
 ATR_FLOOR_MULT: float = 2.0
@@ -58,8 +58,81 @@ TARGET_MIN_PCT: float = 0.01          # below this the target is degenerate
 TARGET_HARD_CAP_PCT: float = 5.0      # absolute ceiling (+500%)
 TARGET_SHORT_MAX_PCT: float = 0.90    # a short can't gain more than ~100%
 
+# --- staged (scale-out) targets ----------------------------------------
+# Firefly-style "two or three staged profit targets": rather than one
+# all-or-nothing target, split the reachable move into tiers so the desk
+# can bank partial profit and de-risk as price advances.  Tiers are placed
+# at fractions of the validated FINAL target distance (monotone, always
+# inside the reachable band), each with a scale-out weight (fraction of the
+# position to exit at that tier).  Weights sum to 1.0.
+STAGED_TARGET_FRACTIONS: tuple[float, ...] = (0.5, 0.75, 1.0)
+STAGED_TARGET_WEIGHTS: tuple[float, ...] = (0.4, 0.35, 0.25)
+
 _LONG_ACTIONS = {"BUY", "STRONG_BUY", "OVERWEIGHT"}
 _SHORT_ACTIONS = {"SELL", "STRONG_SELL", "UNDERWEIGHT"}
+
+# A marketable limit sits a few percent from last close. The previous
+# 0.5×–2.0× ratio let a $100 schema-example survive on a ~$68 name
+# (1.48×). Anything outside ±20% of spot, or non-positive, is grounded.
+ENTRY_PLAUSIBLE_BAND: float = 0.20
+
+
+def entry_needs_grounding(
+    entry: float,
+    spot: float,
+    band: float = ENTRY_PLAUSIBLE_BAND,
+) -> bool:
+    """True when ``entry`` is missing or too far from ``spot`` to keep.
+
+    Returns False when spot itself is unusable — we never invent a close.
+    """
+    if not math.isfinite(spot) or spot <= 0:
+        return False
+    if not math.isfinite(entry) or entry <= 0:
+        return True
+    return abs(entry / spot - 1.0) > band
+
+
+def compute_staged_targets(
+    *,
+    entry: float,
+    side: str,
+    final_target_pct: Optional[float],
+    final_stop_pct: Optional[float],
+) -> list[dict]:
+    """Split the validated final target into scale-out tiers.
+
+    Returns a list of ``{tier, price, pct, reward_risk, weight}`` dicts (one
+    per :data:`STAGED_TARGET_FRACTIONS` tier) for a directional trade, or an
+    empty list when the inputs are degenerate.  ``pct`` is the profit-direction
+    decimal move to the tier; ``price`` is signed by ``side``; ``reward_risk``
+    is the tier's move over the stop distance; ``weight`` is the fraction of
+    the position to exit at that tier.  Pure + deterministic — no fabrication
+    when there is no valid target.
+    """
+    if entry <= 0 or side not in ("long", "short"):
+        return []
+    if final_target_pct is None or final_target_pct <= 0:
+        return []
+    out: list[dict] = []
+    for i, (frac, weight) in enumerate(
+        zip(STAGED_TARGET_FRACTIONS, STAGED_TARGET_WEIGHTS), start=1
+    ):
+        pct = final_target_pct * frac
+        price = entry * (1 + pct) if side == "long" else entry * (1 - pct)
+        rr = (
+            pct / final_stop_pct
+            if (final_stop_pct and final_stop_pct > 0)
+            else None
+        )
+        out.append({
+            "tier": i,
+            "price": round(price, 2),
+            "pct": round(pct, 4),
+            "reward_risk": round(rr, 2) if rr is not None else None,
+            "weight": weight,
+        })
+    return out
 
 
 def side_from_action(action: str) -> str:
@@ -166,7 +239,11 @@ class StopAssessment:
     provided_target_pct: Optional[float] = None
     final_target_pct: Optional[float] = None
     max_target_pct: Optional[float] = None
-    expected_return_pct: Optional[float] = None  # (target-entry)/entry*100
+    expected_return_pct: Optional[float] = None  # decimal fraction (target-entry)/entry
+    # Scale-out tiers derived from the validated final target (see
+    # ``compute_staged_targets``).  Empty for HOLD/flat or when no valid
+    # target exists.  Each item: {tier, price, pct, reward_risk, weight}.
+    staged_targets: list = field(default_factory=list)
 
     @property
     def any_adjusted(self) -> bool:
@@ -301,9 +378,17 @@ def assess_stop(
 
     # ---- derived ---------------------------------------------------------
     reward_risk = (final_target_pct / final_stop_pct) if (final_stop_pct and final_stop_pct > 0) else None
-    # expected_return_pct convention = raw price move to target * 100 (signed
-    # by price direction, matching PortfolioDecision as persisted).
-    expected_return_pct = round((new_target - entry) / entry * 100, 1) if entry > 0 else None
+    # expected_return_pct convention = DECIMAL FRACTION price move to target
+    # (0.05 = +5%), signed by price direction, matching the canonical
+    # PortfolioDecision / ActionProposal convention consumed by M5 sizing.
+    expected_return_pct = round((new_target - entry) / entry, 4) if entry > 0 else None
+
+    staged = compute_staged_targets(
+        entry=entry,
+        side=side,
+        final_target_pct=final_target_pct,
+        final_stop_pct=final_stop_pct,
+    )
 
     return StopAssessment(
         entry=round(entry, 2),
@@ -323,4 +408,5 @@ def assess_stop(
         final_target_pct=final_target_pct,
         max_target_pct=max_target_pct,
         expected_return_pct=expected_return_pct,
+        staged_targets=staged,
     )

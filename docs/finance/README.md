@@ -115,13 +115,13 @@ There are **two different "backtests"** in this codebase and they're solving dif
 
 ### Memory + reflection (L1 + L2)
 
-Every run writes an **Episode** to `~/.trading_crew/memory/episodes.jsonl`: state summary, action proposal, regime tag, decision_ts, outcome_ts (= decision_ts + horizon_days). The Market Analyst can retrieve the top-k most similar past episodes via `retrieve_past_episodes`, **outcome-embargoed**: an episode is invisible until its outcome materialises, otherwise future-known returns leak into "past" retrieval and inflate reported edge.
+Every run writes an **Episode** to `~/.trading_crew/memory/episodes.jsonl`: state summary, action proposal, regime tag, decision_ts, outcome_ts (= decision_ts + horizon_days). The Episodes tab (and `GET /api/memory/retrieve`) is the human tape. Prediction desks do **not** retrieve past episodes as a live tool.
 
-When you click **Resolve outcomes & reflect** in the Memory tab (L2 training), the system:
+When you click **Resolve outcomes & reflect** in the Episodes tab, the system:
 
-1. Pulls OHLCV between `decision_ts` and `outcome_ts`, computes realised return (signed by side), alpha vs SPY, max drawdown.
-2. Asks the LLM for a one-paragraph reflection: *what worked, what didn't, what to do differently*.
-3. Writes the reflection back to the episode. Next run, when the Market Analyst calls `retrieve_past_episodes`, this lesson surfaces verbatim — that's how the system *learns* without touching LLM weights.
+1. Pulls OHLCV between `decision_ts` and `outcome_ts` (or the 30-day review clock), computes realised return (signed by side), alpha vs SPY, max drawdown.
+2. Always writes deterministic `desk_lessons` (which desk leaned against the tape). If an LLM is configured it may call web/news/filings/forwards tools to name why the tape moved, then writes `market_reason`, `unhelpful_tools`, `overemphasized`, and an optional playbook vote.
+3. Hermes scores the 30-day book and opens **one** bounded experiment (desk prompt or graph topology). That is how the system learns without touching LLM weights.
 
 ### Why the Reflective Critic exists
 
@@ -130,7 +130,7 @@ LLMs hallucinate. The Critic (`trading_crew/critic.py`) runs after the PM. By de
 ### How to read the final Workflow output (in order)
 
 1. **Cascade controller badge** — regime detected from 252 bars of OHLCV. `CRISIS` short-circuits the whole debate.
-2. **Per-analyst Reports** (4 merged desks: Market/positioning, News/sentiment, Fundamentals/sector, Macro/geopolitical) — each numeric claim carries `[source: …]`.
+2. **Per-analyst Reports** (5 desks: Market/positioning, News/sentiment, Fundamentals/sector, Reports/filings-guidance, Macro/geopolitical) — each numeric claim carries `[source: …]`.
 3. **Bull / Bear debate** — adversarial; the Research Manager picks a side (does NOT split the difference).
 4. **Trader Plan** — entry, stop, target, horizon, sizing intent, driven by the CHARACTER of the forward thesis (backtest was removed from the trader toolset/prompt; it lives on the independent M6 Backtest tab).
 5. **Risk debate** — Aggressive vs Conservative argue in parallel, Neutral synthesises.

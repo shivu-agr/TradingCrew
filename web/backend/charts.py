@@ -56,6 +56,18 @@ def _fetch_ohlcv(ticker: str, end_date: datetime, lookback_days: int) -> pd.Data
     that need long warm-up (200-SMA) seed correctly even when the user
     asks for a short window.
     """
+    # Point-in-time safety: in a backfill AsOfContext, never fetch bars past
+    # the cutoff even if the caller passed a later end_date.
+    try:
+        from trading_crew.data_sources import pit
+
+        cutoff = pit.cutoff()
+        if cutoff is not None:
+            cutoff_naive = cutoff.replace(tzinfo=None)
+            if end_date > cutoff_naive:
+                end_date = cutoff_naive
+    except Exception:  # noqa: BLE001 — PIT clamp is best-effort, never fatal
+        pass
     buffer_days = max(lookback_days + 360, 540)
     start = end_date - timedelta(days=buffer_days)
     df = yf.Ticker(ticker).history(start=start.date(), end=(end_date + timedelta(days=1)).date())

@@ -6,9 +6,12 @@ from trading_crew.agentic.risk.stops import (
     ATR_FLOOR_MULT,
     HARD_CAP_PCT,
     HARD_FLOOR_PCT,
+    STAGED_TARGET_WEIGHTS,
     annualised_vol_from_close,
     assess_stop,
     compute_atr,
+    compute_staged_targets,
+    entry_needs_grounding,
     min_stop_pct,
     side_from_action,
 )
@@ -53,6 +56,62 @@ def test_ntnx_case_tight_short_stop_is_widened():
     assert a.stop > a.entry
     assert "too tight" in a.reason
     assert a.as_tag() is not None
+
+
+def test_compute_staged_targets_long_monotone_and_weighted():
+    tiers = compute_staged_targets(
+        entry=100.0, side="long", final_target_pct=0.20, final_stop_pct=0.10,
+    )
+    assert [t["tier"] for t in tiers] == [1, 2, 3]
+    # Prices are monotone increasing for a long and end at the final target.
+    prices = [t["price"] for t in tiers]
+    assert prices == sorted(prices)
+    assert prices[-1] == 120.0  # +20% off 100 = final target price
+    # Weights match the configured scale-out schedule and sum to ~1.
+    assert [t["weight"] for t in tiers] == list(STAGED_TARGET_WEIGHTS)
+    assert abs(sum(t["weight"] for t in tiers) - 1.0) < 1e-9
+    # reward:risk grows with each tier (0.5R/0.75R/1.0R over a 0.10 stop -> *2).
+    assert tiers[0]["reward_risk"] == 1.0
+    assert tiers[-1]["reward_risk"] == 2.0
+
+
+def test_compute_staged_targets_short_prices_fall():
+    tiers = compute_staged_targets(
+        entry=100.0, side="short", final_target_pct=0.20, final_stop_pct=0.10,
+    )
+    prices = [t["price"] for t in tiers]
+    # For a short, tier prices step DOWN toward the profit target.
+    assert prices == sorted(prices, reverse=True)
+    assert prices[-1] == 80.0
+
+
+def test_staged_targets_empty_when_no_valid_target():
+    assert compute_staged_targets(
+        entry=100.0, side="long", final_target_pct=None, final_stop_pct=0.10,
+    ) == []
+    assert compute_staged_targets(
+        entry=0.0, side="long", final_target_pct=0.2, final_stop_pct=0.1,
+    ) == []
+    assert compute_staged_targets(
+        entry=100.0, side="flat", final_target_pct=0.2, final_stop_pct=0.1,
+    ) == []
+
+
+def test_assess_stop_emits_staged_targets():
+    a = assess_stop(
+        action="BUY", entry=100.0, stop=90.0, target=120.0,
+        horizon_days=90, current_price=100.0, atr=2.0, ann_vol=0.30,
+    )
+    assert a.assessable
+    assert len(a.staged_targets) == 3
+    # Final tier price equals the (possibly validated) target price.
+    assert a.staged_targets[-1]["price"] == a.target
+    # A HOLD carries no staged targets.
+    flat = assess_stop(
+        action="HOLD", entry=100.0, stop=0.0, target=0.0,
+        horizon_days=90, current_price=100.0, atr=2.0, ann_vol=0.30,
+    )
+    assert flat.staged_targets == []
 
 
 def test_reasonable_long_stop_passes_unchanged():
@@ -130,8 +189,9 @@ def test_wrong_side_target_is_set_to_default():
     assert a.target_adjusted
     assert a.target > a.entry
     assert "wrong-side" in a.target_reason or "degenerate" in a.target_reason
-    # expected_return recomputed to match the corrected target
-    assert a.expected_return_pct == round((a.target - a.entry) / a.entry * 100, 1)
+    # expected_return recomputed to match the corrected target — canonical
+    # DECIMAL fraction convention (0.05 = +5%), not percent points.
+    assert a.expected_return_pct == round((a.target - a.entry) / a.entry, 4)
 
 
 def test_degenerate_target_is_set():
@@ -174,6 +234,18 @@ def test_reasonable_target_passes_unchanged():
     assert not a.target_adjusted
     assert a.target == 140.0
     assert not a.any_adjusted  # neither stop nor target changed
+
+
+def test_entry_needs_grounding_ntnx_placeholder_100():
+    """NTNX ~67.6 vs LLM placeholder 100 is 1.48× — inside the old 2×
+    band, so the card kept ENTRY=100. ±20% of spot must snap it."""
+    spot = 67.64
+    assert entry_needs_grounding(100.0, spot)
+    assert entry_needs_grounding(1.04, 105.0)
+    assert entry_needs_grounding(0.0, spot)
+    assert not entry_needs_grounding(66.50, spot)
+    assert not entry_needs_grounding(72.00, spot)
+    assert not entry_needs_grounding(100.0, 0.0)
 
 
 def test_as_tag_reports_both_adjustments():

@@ -3,11 +3,13 @@
 .env
 .env.local
 .env.*.local
+!.env.example
 *.pem
 *.key
 .secrets/
 secrets.json
 credentials.json
+*.zip
 
 # -- python ----------------------------------------------------------------
 __pycache__/
@@ -21,6 +23,8 @@ dist/
 .eggs/
 pip-wheel-metadata/
 .python-version
+# `.venv` may be a directory or a symlink to another tree's venv.
+.venv
 .venv/
 venv/
 env/
@@ -54,6 +58,8 @@ analyst_cache/
 *.log
 *.log.*
 logs/
+.server.pid
+*.pkl
 
 # -- editor / OS scratch ---------------------------------------------------
 .DS_Store
@@ -71,6 +77,10 @@ node_modules/
 .benchmarks/
 prof/
 *.prof
+
+# -- generated local reports -----------------------------------------------
+reports/*.json
+reports/*.md
 
 # -- jupyter notebook checkpoints ------------------------------------------
 .ipynb_checkpoints/

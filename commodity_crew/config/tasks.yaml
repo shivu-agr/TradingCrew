@@ -233,6 +233,11 @@ trader_task:
       5. If the past-episodes tool surfaces a closely-comparable trade,
          cite its realised return and what was learned.
 
+    Learning clock vs thesis: the desk scores a 30-calendar-day review
+    against desk_strategy.yaml.  Do not shrink a structural curve thesis
+    to 30 days.  Cite the curve (backwardation/contango) before COT or
+    seasonality.
+
     Cite analyst reports by name in your rationale; do not invent
     numbers.
 
@@ -254,27 +259,52 @@ risk_aggressive_round:
   description: >
     Risk round {round_num} of {total_rounds} (AGGRESSIVE turn). Argue
     for higher conviction sizing on the {ticker} futures trade or a
-    more proactive execution path. Reference the trader's plan and the
-    prior risk turns directly. Reason in vol-target / Kelly terms, not
-    gross notional.
+    more proactive execution path. Reason in vol-target / Kelly terms,
+    not gross notional.
+
+    Round-{round_num} discipline (REQUIRED — same contract as equity
+    bull/bear):
+      * If round_num == 1: this is your OPENING, run in parallel with
+        Conservative. Write an independent first size-up case. Do NOT
+        open with ``REBUTTAL:`` and do NOT wait for or attack a
+        conservative turn.
+      * If round_num > 1: open with "REBUTTAL:" pasting the
+        Conservative bullet you are countering (with ``[source: …]``),
+        introduce at least one NEW size-up driver, and end with
+        "Conviction vs prior round: ↑ / → / ↓ — <reason>".
 
     PROVENANCE: keep every ``[source: …]`` tag on the figures you cite.
   expected_output: >
-    Aggressive risk argument round {round_num} (bulleted, every numeric
-    claim carries an inline ``[source: …]`` tag).
+    Aggressive risk argument round {round_num} (for round_num == 1
+    an independent opening with no ``REBUTTAL:`` line; for
+    round_num > 1 starts with ``REBUTTAL:``). Every numeric claim
+    carries an inline ``[source: …]`` tag.
 
 risk_conservative_round:
   description: >
     Risk round {round_num} of {total_rounds} (CONSERVATIVE turn).
     Argue for tighter stops, smaller size, or skipping the {ticker}
-    futures trade. Rebut the AGGRESSIVE turn that just ran. Be
-    specific about tail risks (USDA/EIA surprise reports, geopolitical
-    headlines, OPEC actions) and roll-yield drag.
+    futures trade. Be specific about tail risks (USDA/EIA surprise
+    reports, geopolitical headlines, OPEC actions) and roll-yield
+    drag.
+
+    Round-{round_num} discipline (REQUIRED — same contract as equity
+    bull/bear):
+      * If round_num == 1: this is your OPENING, run in parallel with
+        Aggressive. Write an independent first size-down / skip case.
+        Do NOT open with ``REBUTTAL:`` and do NOT wait for or attack
+        an aggressive turn.
+      * If round_num > 1: open with "REBUTTAL:" pasting the Aggressive
+        bullet you are countering (with ``[source: …]``), introduce at
+        least one NEW size-down driver, and end with
+        "Conviction vs prior round: ↑ / → / ↓ — <reason>".
 
     PROVENANCE: keep every ``[source: …]`` tag on the figures you cite.
   expected_output: >
-    Conservative risk argument round {round_num} (bulleted, every
-    numeric claim carries an inline ``[source: …]`` tag).
+    Conservative risk argument round {round_num} (for round_num == 1
+    an independent opening with no ``REBUTTAL:`` line; for
+    round_num > 1 starts with ``REBUTTAL:``). Every numeric claim
+    carries an inline ``[source: …]`` tag.
 
 risk_neutral_round:
   description: >

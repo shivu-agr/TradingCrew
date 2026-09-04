@@ -11,6 +11,12 @@ import pytest
 from trading_crew import llm_presets
 
 
+def test_hosted_vllm_preset_is_in_catalog() -> None:
+    presets = {p["id"]: p for p in llm_presets.list_presets()}
+    assert "hosted-vllm" in presets
+    assert presets["hosted-vllm"]["provider"] == "hosted_vllm"
+
+
 def test_builtin_presets_have_required_fields() -> None:
     for pid, preset in llm_presets.BUILTIN_PRESETS.items():
         assert preset.id == pid, f"{pid!r} id field mismatch"
@@ -34,6 +40,86 @@ def test_list_presets_marks_local_configured_when_model_set(monkeypatch: pytest.
     monkeypatch.delenv("LOCAL_LLM_MODEL", raising=False)
     presets = {p["id"]: p for p in llm_presets.list_presets()}
     assert presets["local-vllm"]["api_key_configured"] is False
+
+
+def test_llamacpp_preset_is_env_driven_open_source() -> None:
+    """The llama.cpp preset must be open-source and env-driven (its model /
+    base_url come from ``LLAMACPP_LLM_*`` at import time, not a static name)."""
+    preset = llm_presets.BUILTIN_PRESETS["llamacpp-deepseek-v4"]
+    assert preset.kind == "open-source"
+    assert preset.provider == "hosted_vllm"
+    assert preset.api_env == "LLAMACPP_LLM_API_KEY"
+    assert preset.id == "llamacpp-deepseek-v4"
+    # Default base_url points at the conventional llama-server port.
+    assert preset.base_url == "http://localhost:8001/v1"
+
+
+def test_list_presets_marks_llamacpp_configured_when_pointed_at(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The llama.cpp preset lights up in the dropdown once the operator
+    sets either the server URL or the loaded-model label."""
+    monkeypatch.delenv("LLAMACPP_LLM_MODEL", raising=False)
+    monkeypatch.delenv("LLAMACPP_LLM_BASE_URL", raising=False)
+    presets = {p["id"]: p for p in llm_presets.list_presets()}
+    assert presets["llamacpp-deepseek-v4"]["api_key_configured"] is False
+
+    monkeypatch.setenv("LLAMACPP_LLM_BASE_URL", "http://localhost:8001/v1")
+    presets = {p["id"]: p for p in llm_presets.list_presets()}
+    assert presets["llamacpp-deepseek-v4"]["api_key_configured"] is True
+
+
+def test_get_llm_falls_through_to_llamacpp_when_vllm_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no VLLM_LLM_* / LOCAL_LLM_* vars, ``get_llm()`` must route at
+    the llama.cpp endpoint (DeepSeek-V4 on port 8001)."""
+    captured: dict[str, object] = {}
+
+    class _FakeLLM:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("crewai.LLM", _FakeLLM, raising=False)
+    monkeypatch.delenv("VLLM_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("VLLM_LLM_MODEL", raising=False)
+    monkeypatch.delenv("VLLM_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("LOCAL_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LOCAL_LLM_MODEL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("LLAMACPP_LLM_BASE_URL", "http://localhost:8001/v1")
+    monkeypatch.setenv("LLAMACPP_LLM_MODEL", "deepseek-v4-flash")
+    monkeypatch.setenv("LLAMACPP_LLM_API_KEY", "dummy")
+
+    from trading_crew._common import get_llm
+
+    llm_presets.clear_active()
+    get_llm()
+    assert captured["base_url"] == "http://localhost:8001/v1"
+    assert captured["model"].endswith("/deepseek-v4-flash")
+
+
+def test_get_llm_prefers_vllm_over_llamacpp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The vLLM endpoint keeps priority — llama.cpp only wins when the
+    vLLM / local endpoints are unset or a preset override points at it."""
+    captured: dict[str, object] = {}
+
+    class _FakeLLM:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("crewai.LLM", _FakeLLM, raising=False)
+    monkeypatch.setenv("VLLM_LLM_BASE_URL", "http://localhost:8000/v1")
+    monkeypatch.setenv("VLLM_LLM_MODEL", "oss-120b")
+    monkeypatch.setenv("VLLM_LLM_API_KEY", "dummy")
+    monkeypatch.delenv("LOCAL_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LOCAL_LLM_MODEL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("LLAMACPP_LLM_BASE_URL", "http://localhost:8001/v1")
+    monkeypatch.setenv("LLAMACPP_LLM_MODEL", "deepseek-v4-flash")
+
+    from trading_crew._common import get_llm
+
+    llm_presets.clear_active()
+    get_llm()
+    assert captured["base_url"] == "http://localhost:8000/v1"
+    assert captured["model"].endswith("/oss-120b")
 
 
 def test_list_presets_marks_closed_source_unconfigured_when_no_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -76,7 +162,7 @@ def test_set_active_applies_overrides_to_get_llm_chain(monkeypatch: pytest.Monke
     assert llm_presets.get_active_preset_id() is None
 
 
-def test_set_active_is_thread_local() -> None:
+def test_set_active_is_isolated_per_thread() -> None:
     """Concurrent WS sessions on different threads must each see their own
     preset.  This is the invariant that lets two crews run on two different
     LLMs in the same process."""
@@ -95,6 +181,61 @@ def test_set_active_is_thread_local() -> None:
     t1.start(); t2.start()
     t1.join(); t2.join()
     assert results == {"t1": "local-vllm", "t2": "hosted-vllm-oss"}
+
+
+def test_thread_pool_worker_inherits_preset_via_copy() -> None:
+    """Graph analysts run on a ThreadPoolExecutor. A bare submit drops the
+    ContextVar and ``get_llm()`` would hit ``VLLM_LLM_*``. Copied submit
+    keeps the selected preset."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    llm_presets.set_active("local-vllm")
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            bare = pool.submit(llm_presets.get_active_preset_id).result()
+            copied = llm_presets.submit_in_active_context(
+                pool, llm_presets.get_active_preset_id
+            ).result()
+        assert bare is None
+        assert copied == "local-vllm"
+    finally:
+        llm_presets.clear_active()
+
+
+def test_get_llm_on_copied_worker_uses_selected_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tool summarize on a graph worker must use the UI preset, not
+    the .env VLLM default."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    captured: dict[str, object] = {}
+
+    class _FakeLLM:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("crewai.LLM", _FakeLLM, raising=False)
+    monkeypatch.setenv("VLLM_LLM_BASE_URL", "https://stage-rtx-nai.example/v1")
+    monkeypatch.setenv("VLLM_LLM_MODEL", "stage-rtx-oss")
+    monkeypatch.setenv("VLLM_LLM_API_KEY", "hosted-key")
+    monkeypatch.setenv("OPENAI_PROD_API_KEY", "sk-real")
+
+    from trading_crew._common import get_llm
+
+    def _build():
+        captured.clear()
+        get_llm()
+        return dict(captured)
+
+    llm_presets.set_active("openai-gpt-4o-mini")
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            built = llm_presets.submit_in_active_context(pool, _build).result()
+        assert built.get("model") == "openai/gpt-4o-mini"
+        assert "base_url" not in built
+    finally:
+        llm_presets.clear_active()
 
 
 def test_set_active_unknown_id_clears() -> None:
@@ -357,3 +498,92 @@ def test_get_llm_handles_invalid_env_timeout_gracefully(
     llm_presets.clear_active()
     get_llm()
     assert captured.get("timeout") == 720.0
+
+
+def test_report_process_llm_uses_env_even_when_preset_is_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class _FakeLLM:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("crewai.LLM", _FakeLLM, raising=False)
+    monkeypatch.setenv("VLLM_LLM_BASE_URL", "http://desk.local/v1")
+    monkeypatch.setenv("VLLM_LLM_MODEL", "desk-model")
+    monkeypatch.setenv("VLLM_LLM_API_KEY", "desk-key")
+    monkeypatch.setenv("REPORT_PROCESS_BASE_URL", "http://report.local/v1")
+    monkeypatch.setenv("REPORT_PROCESS_MODEL", "report-model")
+    monkeypatch.setenv("REPORT_PROCESS_API_KEY", "report-key")
+    monkeypatch.setenv("LLM_PROVIDER_PREFIX", "hosted_vllm")
+
+    from trading_crew._common import get_report_process_llm
+
+    llm_presets.set_active("hosted-vllm")
+    try:
+        get_report_process_llm()
+    finally:
+        llm_presets.clear_active()
+
+    assert captured["model"] == "hosted_vllm/report-model"
+    assert captured["base_url"] == "http://report.local/v1"
+    assert captured["api_key"] == "report-key"
+
+
+def test_report_process_llm_uses_env_when_no_preset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class _FakeLLM:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("crewai.LLM", _FakeLLM, raising=False)
+    monkeypatch.setenv("REPORT_PROCESS_BASE_URL", "http://report.local/v1")
+    monkeypatch.setenv("REPORT_PROCESS_MODEL", "stage-rtx-oss")
+    monkeypatch.setenv("REPORT_PROCESS_API_KEY", "report-key")
+    monkeypatch.setenv("LLM_PROVIDER_PREFIX", "hosted_vllm")
+
+    from trading_crew._common import get_report_process_llm
+
+    llm_presets.clear_active()
+    get_report_process_llm()
+
+    assert captured["model"] == "hosted_vllm/stage-rtx-oss"
+    assert captured["base_url"] == "http://report.local/v1"
+    assert captured["api_key"] == "report-key"
+
+
+def test_report_process_llm_disables_thinking_when_env_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeLLM:
+        def __init__(self, **kwargs):
+            self.model = kwargs.get("model")
+            self.additional_params = {}
+
+    monkeypatch.setattr("crewai.LLM", _FakeLLM, raising=False)
+    monkeypatch.setenv("REPORT_PROCESS_BASE_URL", "http://report.local/v1")
+    monkeypatch.setenv("REPORT_PROCESS_MODEL", "Qwen/Qwen3-test")
+    monkeypatch.setenv("REPORT_PROCESS_API_KEY", "report-key")
+    monkeypatch.setenv("LLM_PROVIDER_PREFIX", "hosted_vllm")
+    monkeypatch.setenv("REPORT_PROCESS_DISABLE_THINKING", "1")
+
+    from trading_crew._common import get_report_process_llm
+
+    llm = get_report_process_llm()
+    extra = (llm.additional_params or {}).get("extra_body") or {}
+    assert extra["chat_template_kwargs"]["enable_thinking"] is False
+
+
+def test_report_process_llm_requires_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("REPORT_PROCESS_BASE_URL", raising=False)
+    monkeypatch.delenv("REPORT_PROCESS_MODEL", raising=False)
+    monkeypatch.delenv("REPORT_PROCESS_API_KEY", raising=False)
+
+    from trading_crew._common import get_report_process_llm
+
+    with pytest.raises(RuntimeError, match="REPORT_PROCESS_"):
+        get_report_process_llm()

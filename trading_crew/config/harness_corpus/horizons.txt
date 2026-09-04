@@ -1,0 +1,25 @@
+Horizon evidence standards (generic).
+
+SHORT (up to about 60 trading days)
+Needs a catalyst clock (earnings, corporate action, policy effective date)
+and a tape that can actually move on that clock. Options crowding and
+event proximity are first-class. A multi-year compounder story is not a
+short-horizon reason to buy. If the only evidence is a long-term CAGR
+line, the short stance should be mixed or sit-out.
+
+MEDIUM (about one quarter to one year)
+Needs a path from the next few prints to the thesis: guidance versus
+actuals, forward estimates and revisions, peer relative value, and a
+macro basket that actually applies to the home country and industry.
+A single headline does not set a medium stance.
+
+LONG (one year and beyond; narrative may run to several years)
+Needs multi-year cash-flow quality, reinvestment returns, balance-sheet
+trajectory, and ownership stability. Policy and industry structure can
+dominate. Outcome accounting is still bounded; do not pretend a ten-year
+path is already measured. If long-term data is missing, say so and do
+not fill the gap with the short-term tape.
+
+Disagreement across tiers is expected. A name can be a short-horizon fade
+and a long-horizon compounder, or the reverse. Copying one stance into
+all three is a process failure, not conviction.

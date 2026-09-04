@@ -78,6 +78,10 @@ class RunSession:
     run_id: str
     ticker: str
     cfg: Dict[str, Any]
+    # Session trace id for log group-by + per-session search metrics.  A batch
+    # passes its ``job_id`` here (all its tickers share it); a standalone run
+    # falls back to its own ``run_id`` (set in ``SessionManager.start``).
+    trace_id: str = ""
     status: RunStatus = RunStatus.QUEUED
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: Optional[datetime] = None
@@ -100,6 +104,7 @@ class RunSession:
         """Serializable snapshot for /api/runs/active."""
         return {
             "run_id": self.run_id,
+            "trace_id": self.trace_id,
             "ticker": self.ticker,
             "status": self.status.value,
             "started_at": self.started_at.isoformat(),
@@ -114,7 +119,7 @@ class RunSession:
             "task_count": self.task_count,
             "cfg": {
                 k: v for k, v in self.cfg.items()
-                if k in ("debate_rounds", "risk_rounds", "asset_class", "llm_preset", "embedding_preset", "book", "trade_date", "decision_ts")
+                if k in ("debate_rounds", "risk_rounds", "asset_class", "run_mode", "quality_review", "compliance", "llm_preset", "embedding_preset", "book", "trade_date", "decision_ts")
             },
         }
 
@@ -159,7 +164,10 @@ class SessionManager:
         vLLM's decode batch.
         """
         run_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
-        session = RunSession(run_id=run_id, ticker=ticker, cfg=cfg)
+        # A batch tags every ticker with the shared job_id (via cfg["trace_id"])
+        # so search metrics + logs group per batch; a lone run traces to itself.
+        trace_id = str(cfg.get("trace_id") or run_id)
+        session = RunSession(run_id=run_id, ticker=ticker, cfg=cfg, trace_id=trace_id)
         self._sessions[run_id] = session
         self._evict()
         session.run_task = asyncio.create_task(
@@ -228,6 +236,13 @@ class SessionManager:
     # ---- internals ---------------------------------------------------------
     async def _drive(self, session: RunSession) -> None:
         """Own the full life-cycle of one session."""
+        from trading_crew.observability.trace import reset_trace_id, set_trace_id
+
+        # Bind the trace id on THIS task's context before any child task /
+        # thread is spawned — asyncio.create_task (dispatcher), asyncio.to_thread
+        # (kickoff) and CrewAI's Task.execute_async all copy the context, so the
+        # id rides all the way down to the analyst search calls for free.
+        _trace_token = set_trace_id(session.trace_id or session.run_id)
         try:
             async with self._semaphore:
                 if session.status == RunStatus.CANCELLED:
@@ -266,6 +281,7 @@ class SessionManager:
                         )
                         session.dispatcher_task.cancel()
         finally:
+            reset_trace_id(_trace_token)
             self._finalize(session)
 
     async def _dispatch(self, session: RunSession) -> None:
@@ -324,6 +340,14 @@ class SessionManager:
             except Exception:
                 pass
         session.done_event.set()
+        # Hand this run's freed heap back to the OS so a long batch's RSS
+        # doesn't creep upward run-after-run (see trading_crew.memutil).
+        try:
+            from trading_crew.memutil import release_memory
+
+            release_memory()
+        except Exception:  # noqa: BLE001 - cleanup must never break a run
+            pass
 
     def _finalize_no_run(self, session: RunSession) -> None:
         """Cancelled-before-start path — no runner, no dispatcher."""

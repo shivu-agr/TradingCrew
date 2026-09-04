@@ -26,9 +26,11 @@ from trading_crew.agentic.reflection import (
     ReflectionResponse,
     ResolutionRecord,
     _max_drawdown_over_holding,
+    _price_at_or_after,
     _signed_realised_return,
     resolve_pending_episodes,
 )
+from trading_crew.agentic.resolve_investigate import InvestigationPlan, ToolCallSpec
 
 
 # ---------------------------------------------------------------------------
@@ -47,9 +49,61 @@ class _StubLLM:
             key_lesson_tag="stop_too_loose",
         )
 
-    def call(self, messages, response_format):
+    def call(self, messages, response_format=None, **kwargs):
         self.calls.append({"messages": messages, "response_format": response_format})
+        if response_format is InvestigationPlan:
+            return InvestigationPlan(need_tools=False, calls=[])
         return self.response
+
+
+class _NoResponseFormatLLM:
+    """Mimics a provider that rejects ``response_format`` and returns JSON text."""
+
+    def __init__(self, payload: str):
+        self.payload = payload
+        self.calls: List[dict] = []
+
+    def call(self, messages, **kwargs):
+        if "response_format" in kwargs:
+            raise TypeError("call() got an unexpected keyword argument 'response_format'")
+        self.calls.append({"messages": messages})
+        return self.payload
+
+
+def test_generate_reflection_compat_path_parses_json_text():
+    """When the LLM rejects response_format we retry with a JSON hint + parse."""
+    from trading_crew.agentic.reflection import _generate_reflection
+
+    payload = (
+        'Here you go:\n```json\n'
+        '{"summary": "News catalyst was mispriced.", '
+        '"confidence_score": 0.7, "key_lesson_tag": "news_overweight", '
+        '"desks": ["news_analyst"], "error_class": "missed_catalyst", '
+        '"recommended_change": "Discount faded catalysts."}\n```'
+    )
+    llm = _NoResponseFormatLLM(payload)
+    ep = Episode(
+        episode_id="X-1", symbol="X", decision_ts="2023-01-01T00:00:00+00:00",
+        state_summary="tech breakout + news catalyst", regime=Regime.UNKNOWN,
+        action_proposal={"side": "BUY", "target_weight": 0.1, "conviction_score": 0.6, "horizon_days": 90},
+        outcome_ts="2023-04-01T00:00:00+00:00", outcome_status=OutcomeStatus.PENDING,
+    )
+    resp = _generate_reflection(ep, 0.05, 0.02, -0.03, 0.01, llm)
+    assert "News catalyst" in resp.summary
+    assert resp.confidence_score == 0.7
+    assert resp.key_lesson_tag == "news_overweight"
+    assert resp.desks == ["news_analyst"]
+    assert resp.error_class == "missed_catalyst"
+    # The JSON hint must have been appended to the retried prompt.
+    assert "JSON object" in llm.calls[0]["messages"][0]["content"]
+
+
+def test_extract_json_object_handles_prose_and_fences():
+    from trading_crew.agentic.reflection import _extract_json_object
+
+    assert _extract_json_object('noise {"a": 1} tail') == {"a": 1}
+    assert _extract_json_object('```json\n{"a": {"b": 2}}\n```') == {"a": {"b": 2}}
+    assert _extract_json_object("no json here") is None
 
 
 def _ohlcv_stub_factory(symbol_returns: dict[str, float]):
@@ -157,6 +211,27 @@ def test_resolve_skips_future_outcomes(tmp_path):
     assert mem.all_episodes()[0].outcome_status == OutcomeStatus.PENDING
 
 
+def test_resolve_stores_tape_reason(tmp_path):
+    mem = EpisodicMemory(tmp_path / "ep.jsonl")
+    mem.add(_episode(side="BUY"))
+
+    def fake_reason(ticker, outcome_date, market_return, side):
+        assert ticker == "NTNX"
+        return "Guidance cut [source: https://example.com/8k]"
+
+    records = resolve_pending_episodes(
+        memory=mem,
+        now=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        fetch_ohlcv=_ohlcv_stub_factory({"NTNX": 0.10, "SPY": 0.03}),
+        skip_llm=True,
+        skip_tape_reason=False,
+        tape_reason_fn=fake_reason,
+    )
+    assert records[0].market_reason.startswith("Guidance cut")
+    persisted = mem.all_episodes()[0]
+    assert persisted.market_reason.startswith("Guidance cut")
+
+
 def test_resolve_writes_outcome_without_llm(tmp_path):
     mem = EpisodicMemory(tmp_path / "ep.jsonl")
     mem.add(_episode(side="BUY"))
@@ -174,6 +249,8 @@ def test_resolve_writes_outcome_without_llm(tmp_path):
     assert r.reflection is None  # skip_llm
     persisted = mem.all_episodes()[0]
     assert persisted.outcome_status == OutcomeStatus.RESOLVED
+    assert persisted.outcome_label == "WIN"
+    assert persisted.market_return is not None
 
 
 def test_resolve_calls_llm_and_persists_reflection(tmp_path):
@@ -185,13 +262,18 @@ def test_resolve_calls_llm_and_persists_reflection(tmp_path):
         now=datetime(2026, 8, 1, tzinfo=timezone.utc),
         fetch_ohlcv=_ohlcv_stub_factory({"NTNX": 0.10, "SPY": 0.03}),
         llm=llm,
+        skip_tape_reason=True,
     )
-    assert len(llm.calls) == 1
-    # Prompt must reference the actual realised number, not a placeholder.
-    prompt_text = llm.calls[0]["messages"][0]["content"]
+    assert len(llm.calls) >= 2
+    reflect_calls = [
+        c for c in llm.calls if c["response_format"] is ReflectionResponse
+    ]
+    assert reflect_calls
+    prompt_text = reflect_calls[0]["messages"][0]["content"]
     assert "Realised return on the position:" in prompt_text
     assert "Benchmark (SPY) return" in prompt_text
     assert "NTNX" in prompt_text
+    assert "Outcome label" in prompt_text
 
     r = records[0]
     assert r.status == "RESOLVED"
@@ -201,6 +283,48 @@ def test_resolve_calls_llm_and_persists_reflection(tmp_path):
     assert r.reflection.startswith("[stop_too_loose")
     persisted = mem.all_episodes()[0]
     assert persisted.reflection == r.reflection
+    assert persisted.outcome_label == "WIN"
+
+
+def test_resolve_persists_structured_reflection_meta(tmp_path):
+    """The structured reflection (desks / error_class) is written to the
+    episode so cross-desk feedback routing can use it."""
+    mem = EpisodicMemory(tmp_path / "ep.jsonl")
+    mem.add(_episode(side="BUY"))
+    llm = _StubLLM(response=ReflectionResponse(
+        summary="Sizing was too large for the realised volatility.",
+        confidence_score=0.7,
+        key_lesson_tag="oversized",
+        desks=["risk"],
+        error_class="sizing_too_large",
+        recommended_change="Halve size when ATR is elevated.",
+    ))
+    records = resolve_pending_episodes(
+        memory=mem,
+        now=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        fetch_ohlcv=_ohlcv_stub_factory({"NTNX": 0.10, "SPY": 0.03}),
+        llm=llm,
+        skip_tape_reason=True,
+    )
+    meta = records[0].reflection_meta
+    assert meta is not None
+    assert meta["desks"] == ["risk"]
+    assert meta["error_class"] == "sizing_too_large"
+    persisted = mem.all_episodes()[0]
+    assert persisted.reflection_meta["error_class"] == "sizing_too_large"
+    # Round-trips through the JSONL store.
+    assert persisted.reflection_meta["desks"] == ["risk"]
+
+
+def test_reflection_response_drops_unknown_desks():
+    """The validator keeps only canonical desk tags (never invents a desk)."""
+    resp = ReflectionResponse(
+        summary="x", confidence_score=0.5, key_lesson_tag="t",
+        desks=["news_analyst", "not_a_desk", "RISK"], error_class="bogus",
+    )
+    assert resp.desks == ["news_analyst", "risk"]
+    # An out-of-vocab error_class coerces to 'noise'.
+    assert resp.error_class == "noise"
 
 
 def test_resolve_sell_inverts_pnl(tmp_path):
@@ -290,6 +414,142 @@ def test_max_drawdown_short_position_inverts():
     mdd = _max_drawdown_over_holding(df, "2026-05-01", "2026-05-10", "SELL")
     # Short on a falling series = no drawdown
     assert mdd == pytest.approx(0.0, abs=1e-6)
+
+
+def test_price_at_or_after_uses_calendar_day_not_intraday_clock():
+    """A Friday 02:54Z review must still hit that Friday's midnight bar."""
+    dates = pd.date_range("2026-08-17", periods=5, freq="D")  # Mon–Fri
+    df = pd.DataFrame({
+        "Date": dates,
+        "Open": [100.0] * 5,
+        "Close": [101.0] * 5,
+        "High": [102.0] * 5,
+    })
+    hit = _price_at_or_after(df, "2026-08-21T02:54:39+00:00")
+    assert hit is not None
+    assert hit[0] == "2026-08-21"
+    assert _price_at_or_after(df, "2026-08-21T23:59:59+00:00")[0] == "2026-08-21"
+
+
+def test_skip_llm_still_attributes_wrong_desk(tmp_path):
+    """Even without an LLM, a LOSS is labelled and routed to the desk whose
+    lean disagreed with the tape."""
+    mem = EpisodicMemory(tmp_path / "ep.jsonl")
+    ep = _episode(side="BUY")
+    ep.desk_leans = {"news_analyst": "bullish", "macro_analyst": "bearish"}
+    mem.add(ep)
+    records = resolve_pending_episodes(
+        memory=mem,
+        now=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        # Negative name return → BUY is a LOSS; tape is bearish.
+        fetch_ohlcv=_ohlcv_stub_factory({"NTNX": -0.12, "SPY": 0.0}),
+        skip_llm=True,
+    )
+    r = records[0]
+    assert r.status == "RESOLVED"
+    assert r.outcome_label == "LOSS"
+    meta = r.reflection_meta or {}
+    assert "news_analyst" in meta.get("desks", [])
+    by_desk = {d["desk"]: d for d in meta.get("desk_lessons") or []}
+    assert by_desk["news_analyst"]["verdict"] == "hurt"
+    assert by_desk["macro_analyst"]["verdict"] == "helped"
+    persisted = mem.all_episodes()[0]
+    assert persisted.outcome_label == "LOSS"
+
+
+def test_short_review_resolves_while_thesis_stays_pending(tmp_path):
+    """A 180-day thesis can still teach at 30 days."""
+    mem = EpisodicMemory(tmp_path / "ep.jsonl")
+    mem.add(_episode(
+        decision_ts="2026-05-01T00:00:00+00:00",
+        outcome_ts="2026-11-01T00:00:00+00:00",
+        side="BUY",
+    ))
+    records = resolve_pending_episodes(
+        memory=mem,
+        now=datetime(2026, 6, 10, tzinfo=timezone.utc),
+        fetch_ohlcv=_ohlcv_stub_factory({"NTNX": 0.04, "SPY": 0.01}),
+        skip_llm=True,
+    )
+    assert any(r.status == "REVIEW_RESOLVED" for r in records)
+    assert not any(r.status == "RESOLVED" for r in records)
+    persisted = mem.all_episodes()[0]
+    assert persisted.outcome_status == OutcomeStatus.PENDING
+    assert persisted.review_status == "RESOLVED"
+    assert persisted.review is not None
+    assert persisted.horizon_scores and "short" in persisted.horizon_scores
+    lessons = (persisted.review.get("reflection_meta") or {}).get("desk_lessons") or []
+    assert isinstance(lessons, list)
+
+
+def test_resolve_investigation_writes_review_lessons(tmp_path, monkeypatch):
+    """Resolve LLM may call tools, then write why-wrong fields for Hermes."""
+    calls = []
+
+    def _fake_tool(name, arguments):
+        calls.append((name, arguments))
+        return "Guidance cut in the 8-K [source: https://example.com/8k]"
+
+    monkeypatch.setattr(
+        "trading_crew.agentic.resolve_investigate._invoke_tool", _fake_tool,
+    )
+
+    class _InvestigateLLM:
+        def __init__(self):
+            self.prompts: List[str] = []
+
+        def call(self, messages, response_format=None, **kwargs):
+            text = messages[0]["content"]
+            self.prompts.append(text)
+            if response_format is InvestigationPlan:
+                return InvestigationPlan(
+                    need_tools=True,
+                    tape_question="Why did NTNX fall after the call?",
+                    calls=[ToolCallSpec(
+                        tool="research_web",
+                        arguments={"query": "NTNX guidance cut"},
+                        why="catalyst",
+                    )],
+                )
+            return ReflectionResponse(
+                summary="Reports over-weighted a stale 10-Q; the 8-K cut guidance.",
+                confidence_score=0.7,
+                key_lesson_tag="filings_overweight",
+                desks=["reports_analyst"],
+                error_class="missed_catalyst",
+                recommended_change="Discount stale filings vs the latest 8-K.",
+                market_reason="Guidance cut in the 8-K.",
+                unhelpful_tools=["get_report_insights"],
+                overemphasized=["filings"],
+                suggested_playbook="skip_reports",
+            )
+
+    mem = EpisodicMemory(tmp_path / "ep.jsonl")
+    ep = _episode(
+        decision_ts="2026-05-01T00:00:00+00:00",
+        outcome_ts="2026-11-01T00:00:00+00:00",
+        side="BUY",
+    )
+    ep.desk_leans = {"reports_analyst": "bullish", "macro_analyst": "bearish"}
+    mem.add(ep)
+    llm = _InvestigateLLM()
+    records = resolve_pending_episodes(
+        memory=mem,
+        now=datetime(2026, 6, 10, tzinfo=timezone.utc),
+        fetch_ohlcv=_ohlcv_stub_factory({"NTNX": -0.12, "SPY": 0.0}),
+        llm=llm,
+        skip_tape_reason=True,
+    )
+    assert any(r.status == "REVIEW_RESOLVED" for r in records)
+    assert calls == [("research_web", {"query": "NTNX guidance cut"})]
+    assert any("Investigation briefing" in p and "Guidance cut" in p for p in llm.prompts)
+    persisted = mem.all_episodes()[0]
+    meta = (persisted.review or {}).get("reflection_meta") or {}
+    assert meta.get("unhelpful_tools") == ["get_report_insights"]
+    assert meta.get("overemphasized") == ["filings"]
+    assert meta.get("suggested_playbook") == "skip_reports"
+    assert "Guidance cut" in (meta.get("market_reason") or "")
+    assert (meta.get("investigation") or {}).get("need_tools") is True
 
 
 def test_resolution_record_dict_roundtrip():

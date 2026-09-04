@@ -1,0 +1,248 @@
+# Harness plugins — every key is required. Missing ids are an error.
+# loop / session / planner names must match the in-process registry.
+# tools must be exactly tool_allowlist ∪ {query_knowledge}.
+# skills must include every catalog desk plus generic_investigator.
+
+loop: conductor_v1
+session: harness_state
+planner: spawn_v1
+
+tools:
+  - get_market_context
+  - get_stock_data
+  - get_indicators
+  - get_options_summary
+  - get_analyst_recommendations
+  - get_crowd_positioning
+  - get_news
+  - get_global_news
+  - get_corporate_actions
+  - get_insider_transactions
+  - research_web
+  - get_fundamentals
+  - get_balance_sheet
+  - get_cashflow
+  - get_income_statement
+  - get_shareholding_pattern
+  - get_long_term_thesis
+  - get_forward_estimates
+  - get_sector_peers
+  - get_report_insights
+  - get_macro_data
+  - get_geopolitical_news
+  - get_supply_chain_risk
+  - get_event_proximity
+  - query_knowledge
+
+skills:
+  market_analyst:
+    required_tools:
+      - get_stock_data
+    success: >
+      Cited tape lean or named blocker; price/volume/options figures
+      carry [source: …]; last line DESK_BIAS.
+    return_to_parent:
+      - TLDR of the tape and positioning
+      - DESK_BIAS last line
+      - tools actually called
+      - what you could not verify
+    hints: >
+      Pull live price and indicators before citing a move. Do not
+      assume an earlier market brief is still current.
+
+  news_analyst:
+    required_tools:
+      - get_news
+    success: >
+      Cited catalyst lean or named blocker; every headline figure
+      tagged; last line DESK_BIAS.
+    return_to_parent:
+      - TLDR of catalysts / corporate actions
+      - DESK_BIAS last line
+      - tools actually called
+      - what you could not verify
+    hints: >
+      Write every search query from the market brief and the conductor
+      gap. Do not reuse canned regional phrases.
+
+  fundamentals_analyst:
+    required_tools:
+      - get_fundamentals
+    success: >
+      Cited fundamental lean or named blocker; ratios and thesis
+      figures tagged; last line DESK_BIAS.
+    return_to_parent:
+      - TLDR of quality, growth, leverage
+      - DESK_BIAS last line
+      - tools actually called
+      - what you could not verify
+    hints: >
+      Prefer get_fundamentals plus get_long_term_thesis or
+      get_forward_estimates when the gap is multi-year.
+
+  reports_analyst:
+    required_tools:
+      - get_report_insights
+    success: >
+      get_report_insights was called; cited filings lean or named
+      blocker with the tool source line; last line DESK_BIAS.
+    return_to_parent:
+      - TLDR of guidance / target-vs-actual
+      - DESK_BIAS last line
+      - tools actually called
+      - what you could not verify
+    hints: >
+      Call get_report_insights first. Do not skip it because another
+      desk already wrote ratios. If the tool returns no filings, say
+      so with its source line.
+
+  macro_analyst:
+    required_tools:
+      - get_macro_data
+    success: >
+      Cited regime / geo lean or named blocker; last line DESK_BIAS.
+    return_to_parent:
+      - TLDR of macro and supply-chain transmission
+      - DESK_BIAS last line
+      - tools actually called
+      - what you could not verify
+    hints: >
+      Write geo / supply-chain queries from facts already in context.
+      Skip a tool that cannot answer the gap.
+
+  debate:
+    required_tools:
+      - research_web
+    success: >
+      Both sides argued in one crew with cited bullets; each side
+      ends DESK_BIAS; mid-exchange fetch when a claim lacks a source.
+    return_to_parent:
+      - Combined bull open / bear rebut / bull close
+      - What would flip each side
+      - tools actually called
+      - what you could not verify
+    hints: >
+      Fetch evidence mid-exchange. Separate one-shot sides do not
+      replace this bundle.
+
+  bull_researcher:
+    required_tools:
+      - research_web
+    success: >
+      Cited bull case or named blocker; last line DESK_BIAS.
+    return_to_parent:
+      - Bull case and flip conditions
+      - DESK_BIAS last line
+      - tools actually called
+      - what you could not verify
+    hints: >
+      Rebut the bear text if it is in context. Call tools for claims
+      you do not already have sourced.
+
+  bear_researcher:
+    required_tools:
+      - research_web
+    success: >
+      Cited bear / falsifying case or named blocker; last line DESK_BIAS.
+    return_to_parent:
+      - Bear case and flip conditions
+      - DESK_BIAS last line
+      - tools actually called
+      - what you could not verify
+    hints: >
+      Attack the strongest cited bull bullets. Fetch the data that
+      proves the point.
+
+  research_manager:
+    required_tools: []
+    success: >
+      Locked directional thesis or honest MIXED-with-conviction from
+      the briefs handed; last line DESK_BIAS.
+    return_to_parent:
+      - Locked thesis
+      - DESK_BIAS last line
+      - what you could not verify
+    hints: >
+      Do not average desks into a placeholder hold. Neutrals do not
+      create a split.
+
+  trader:
+    required_tools: []
+    success: >
+      One sized plan from the locked lean, or an explicit sit-out
+      on a true split.
+    return_to_parent:
+      - Size / hedge plan
+      - DESK_BIAS last line
+      - what you could not verify
+    hints: >
+      MIXED on a directional majority is a smaller or hedged plan,
+      not an automatic sit-out.
+
+  risk:
+    required_tools:
+      - get_stock_data
+    success: >
+      Three wings wrote independent opinions then debated; size
+      path is cited; last lines DESK_BIAS.
+    return_to_parent:
+      - Combined aggressive / conservative / neutral exchange
+      - Size recommendation
+      - tools actually called
+      - what you could not verify
+    hints: >
+      Call tools when a size claim needs a source. Separate wings
+      alone do not replace this bundle.
+
+  risk_aggressive:
+    required_tools:
+      - get_stock_data
+    success: >
+      Cited size-up pressure test; last line DESK_BIAS.
+    return_to_parent:
+      - Size-up case
+      - DESK_BIAS last line
+      - tools actually called
+      - what you could not verify
+    hints: >
+      Pressure-test the plan. Do not rubber-stamp a missing debate.
+
+  risk_conservative:
+    required_tools:
+      - get_stock_data
+    success: >
+      Cited size-down / kill case; last line DESK_BIAS.
+    return_to_parent:
+      - Size-down case
+      - DESK_BIAS last line
+      - tools actually called
+      - what you could not verify
+    hints: >
+      Name the path that kills the book. Fetch a source if the
+      claim is not already cited.
+
+  risk_neutral:
+    required_tools:
+      - get_stock_data
+    success: >
+      Cited mid-size / path-balance read; last line DESK_BIAS.
+    return_to_parent:
+      - Mid-size case
+      - DESK_BIAS last line
+      - tools actually called
+      - what you could not verify
+    hints: >
+      Weigh both other wings. Do not split the difference without
+      a cited reason.
+
+  generic_investigator:
+    required_tools: []
+    success: >
+      The assigned brief is answered with cited facts only; no
+      extra desks invented.
+    return_to_parent:
+      - Answer to the assigned brief
+      - tools actually called
+      - what you could not verify
+    hints: >
+      Use only the tools the conductor listed. You cannot spawn.

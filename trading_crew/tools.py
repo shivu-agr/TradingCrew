@@ -34,9 +34,9 @@ distinguish real fetches from hallucinated numbers.
 
 from __future__ import annotations
 
-import concurrent.futures as _cf
 import datetime as _dt
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -44,7 +44,9 @@ import random
 import re
 import threading
 import time
-from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Callable, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -56,11 +58,16 @@ from trading_crew.data_sources import (
     get_config as get_data_sources_config,
     is_indian_ticker,
 )
-from trading_crew.data_sources import screener_source, upstox_source
+from trading_crew.data_sources import screener_source, sec_edgar_source, upstox_source
 from trading_crew.data_sources.screener_source import (
     ScreenerError,
     ScreenerRateLimitError,
     ScreenerNotFoundError,
+)
+from trading_crew.data_sources.sec_edgar_source import (
+    EdgarError,
+    EdgarNotFoundError,
+    EdgarRateLimitError,
 )
 from trading_crew.data_sources.upstox_source import (
     UpstoxError,
@@ -102,6 +109,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _TOOL_CACHE_TTL_DEFAULT = 600.0
+# Hard cap on live entries.  Without this the cache is unbounded: a 200-name
+# batch calls ~10 tools/name and every distinct (tool, args) result — some of
+# them large (report text, indicator panels) — lingers here until the SAME key
+# is read again, so expired entries are never freed and RSS climbs for hours.
+# Cap + purge-on-write keeps it bounded regardless of batch size.
+_TOOL_CACHE_MAX_ENTRIES_DEFAULT = 512
 _tool_cache_lock = threading.Lock()
 _tool_cache: dict[str, tuple[float, object]] = {}
 
@@ -111,6 +124,31 @@ def _tool_cache_ttl() -> float:
         return float(os.environ.get("TRADINGCREW_TOOL_CACHE_TTL_SECONDS", _TOOL_CACHE_TTL_DEFAULT))
     except ValueError:
         return _TOOL_CACHE_TTL_DEFAULT
+
+
+def _tool_cache_max_entries() -> int:
+    try:
+        return int(os.environ.get("TRADINGCREW_TOOL_CACHE_MAX_ENTRIES", _TOOL_CACHE_MAX_ENTRIES_DEFAULT))
+    except ValueError:
+        return _TOOL_CACHE_MAX_ENTRIES_DEFAULT
+
+
+def _prune_tool_cache_locked(now: float, ttl: float) -> None:
+    """Evict expired entries, then oldest-first down to the size cap.
+
+    Caller must hold ``_tool_cache_lock``.  Cheap: only walks the dict when it
+    is over cap or has expired entries, which for a batch is at most once per
+    tool call."""
+    # 1) drop everything past its TTL (frees the bulk on a long batch).
+    expired = [k for k, (ts, _) in _tool_cache.items() if (now - ts) >= ttl]
+    for k in expired:
+        _tool_cache.pop(k, None)
+    # 2) if still over cap, evict oldest-first (dict preserves insertion order
+    #    and we only ever append on write, so iteration order ~= age order).
+    cap = _tool_cache_max_entries()
+    if cap > 0 and len(_tool_cache) > cap:
+        for k in list(_tool_cache.keys())[: len(_tool_cache) - cap]:
+            _tool_cache.pop(k, None)
 
 
 def _memoize_tool(fn):
@@ -157,9 +195,35 @@ def _memoize_tool(fn):
         result = fn(*args, **kwargs)
         with _tool_cache_lock:
             _tool_cache[key] = (now, result)
+            _prune_tool_cache_locked(now, ttl)
         return result
 
     return wrapper
+
+
+_QUOTA_MARKERS = (
+    "usage limit",
+    "exceeds this api key",
+    "quota exceeded",
+    "insufficient_quota",
+    "rate limit exceeded",
+    "ratelimit",
+)
+
+
+def _is_hard_quota(exc: BaseException) -> bool:
+    """True when the provider is out of quota / hard-rate-limited.
+
+    These are not transient — retrying the same key just burns wall time
+    (Tavily quota exceeded was 3 sleeps per call on the NTNX run).
+    """
+    code = getattr(exc, "status_code", None) or getattr(exc, "http_status", None)
+    if code == 429:
+        return True
+    msg = str(exc).lower()
+    if any(m in msg for m in _QUOTA_MARKERS):
+        return True
+    return "429" in msg and any(k in msg for k in ("rate", "quota", "limit", "tavily"))
 
 
 def _with_retry(
@@ -178,6 +242,9 @@ def _with_retry(
     keep the implementation dependency-free (no ``tenacity``) — plain
     ``time.sleep`` + ``random.uniform`` so the failure mode stays
     deterministic enough to debug.
+
+    Quota / 429 errors are not retried — they will not succeed on the
+    same key later in the same process.
     """
     last_exc: Exception | None = None
     for i in range(attempts):
@@ -185,7 +252,7 @@ def _with_retry(
             return fn(*args, **kwargs)
         except Exception as exc:
             last_exc = exc
-            if i == attempts - 1:
+            if _is_hard_quota(exc) or i == attempts - 1:
                 break
             delay = min(max_delay, base_delay * (2 ** i)) + random.uniform(0, base_delay)
             logger.warning(
@@ -196,9 +263,22 @@ def _with_retry(
     # Re-raise the last exception once attempts are exhausted.
     raise last_exc  # type: ignore[misc]
 
+
+# Process-level: once every configured Tavily key reports quota, later
+# news pulls skip Tavily entirely until the process restarts.
+_tavily_quota_tripped = False
+
+
+def reset_tavily_quota_flag() -> None:
+    """Test helper — clear the process-level Tavily quota trip."""
+    global _tavily_quota_tripped
+    _tavily_quota_tripped = False
+
 from trading_crew.market_context import (
+    PeerRow,
+    discover_peers,
+    format_peer_comparison,
     get_market_profile,
-    peer_basket,
     resolve_ticker,
 )
 
@@ -259,6 +339,29 @@ def _load_price_history(ticker: str, *, period: str = "5y") -> tuple[pd.DataFram
     Returns ``(df, identifier)`` where ``identifier`` is the string the
     tool should embed in its ``Source:`` footer.
     """
+    from trading_crew.data_sources import pit
+
+    cutoff = pit.cutoff()
+    if cutoff is not None:
+        # Point-in-time backfill: only bars public on/before ``as_of`` may
+        # be used.  yfinance start/end gives an exact cutoff; the upstox
+        # "recent candles" path can't be bounded that way, so in backfill we
+        # deliberately route through the date-bounded yfinance path (a
+        # mode-based routing choice, not a hidden fallback).
+        import datetime as _dt
+
+        lookback = {
+            "max": 20 * 365, "15y": 15 * 365, "10y": 10 * 365, "5y": 5 * 365,
+            "2y": 2 * 365, "1y": 365, "2mo": 60,
+        }.get(period, 5 * 365)
+        end = cutoff.date()
+        start = end - _dt.timedelta(days=lookback)
+        df = _with_retry(
+            yf.Ticker(ticker).history,
+            start=start, end=end,
+            label=f"yfinance.history({ticker}, {start}->{end} PIT)",
+        )
+        return df, f"yfinance OHLCV {ticker} (PIT as_of {end})"
     if upstox_source.is_indian_and_upstox_available(ticker):
         # Map yfinance-style period strings to a lookback-days number.
         # ``"max"`` on upstox means "as much history as the exchange
@@ -313,11 +416,44 @@ _PLACEHOLDER_URL_HOSTS: tuple[str, ...] = (
 
 
 def _tavily() -> TavilyClient:
-    global _tavily_client
-    if _tavily_client is None:
-        api_key = os.environ["TAVILY_API_KEY"]
-        _tavily_client = TavilyClient(api_key=api_key)
-    return _tavily_client
+    """Return a Tavily client using the next rotated key.
+
+    Reads ``TAVILY_API_KEYS`` (round-robin) with a fallback to the singular
+    ``TAVILY_API_KEY``.  Built fresh per call so rotation actually advances;
+    the client is cheap to construct.  Kept as a seam so tests can
+    monkeypatch the whole factory.
+    """
+    from trading_crew.data_sources import news_providers
+
+    api_key = news_providers.next_key("tavily") or os.environ["TAVILY_API_KEY"]
+    return TavilyClient(api_key=api_key)
+
+
+def _coerce_absolute_http_url(url: str) -> str:
+    """Turn a scheme-less host/path into ``https://…``.
+
+    Search backends sometimes emit ``www.reuters.com/…`` without a
+    scheme. Treating that as a relative placeholder dropped the row
+    and the desk lost a real article. Relative paths (``/company/x``)
+    and bare words (``not-a-url``) stay unchanged and still fail the
+    placeholder check.
+    """
+    if not url or not isinstance(url, str):
+        return ""
+    u = url.strip()
+    if not u:
+        return ""
+    if u.startswith("//"):
+        return "https:" + u
+    if u.startswith("http://") or u.startswith("https://"):
+        return u
+    if u.startswith("/") or " " in u:
+        return u
+    head = u.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    host = head.split(":", 1)[0]
+    if host.count(".") < 1 or not re.search(r"[A-Za-z]", host):
+        return u
+    return "https://" + u.lstrip("/")
 
 
 def _is_placeholder_url(url: str) -> bool:
@@ -325,9 +461,10 @@ def _is_placeholder_url(url: str) -> bool:
     placeholder host — i.e. a fabricated citation rather than a real one."""
     if not url or not isinstance(url, str):
         return True
-    u = url.strip().lower()
+    u = _coerce_absolute_http_url(url).strip().lower()
+    if not u:
+        return True
     if not (u.startswith("http://") or u.startswith("https://")):
-        # Relative or scheme-less "URLs" are never real article links.
         return True
     host = u.split("://", 1)[1].split("/", 1)[0]
     host = host.split("?", 1)[0].split("#", 1)[0].split(":", 1)[0]
@@ -342,14 +479,70 @@ def _is_placeholder_url(url: str) -> bool:
 
 
 def _reject_placeholder_urls(rows: list[dict]) -> list[dict]:
-    """Drop any row whose ``url`` is a placeholder / fabricated link, so a
-    fake citation can never leave the tool layer."""
-    return [r for r in rows if not _is_placeholder_url(r.get("url", ""))]
+    """Drop fabricated links; rewrite scheme-less real hosts to https."""
+    out: list[dict] = []
+    for row in rows:
+        url = _coerce_absolute_http_url(row.get("url", "") or "")
+        if _is_placeholder_url(url):
+            continue
+        kept = dict(row)
+        kept["url"] = url
+        out.append(kept)
+    return out
 
 
 # Matches an inline provenance tag ``[source: <identifier>]`` (the tag the
 # whole workflow uses to attribute a claim to a tool output).
 _SOURCE_TAG_RE = re.compile(r"\[source:\s*([^\]]+?)\s*\]", re.IGNORECASE)
+
+# Compound tags: ``url1; url2`` or ``url1, https://url2``. Do not split on
+# a comma inside a query string — only when the next token starts a new
+# citation (scheme, www., or host.tld).
+_CITATION_PART_SPLIT_RE = re.compile(
+    r"\s*;\s*|,\s+(?=(?:https?://|www\.|(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/|\s|$)))",
+    re.IGNORECASE,
+)
+
+
+def _split_citation_payload(identifier: str) -> list[str]:
+    raw = (identifier or "").strip()
+    if not raw:
+        return []
+    parts = [
+        p.strip().rstrip(",")
+        for p in _CITATION_PART_SPLIT_RE.split(raw)
+        if p.strip()
+    ]
+    return parts or [raw]
+
+
+def _placeholder_host_in_identifier(ident: str) -> bool:
+    """Placeholder host as a host token, not a substring of a real host.
+
+    ``contest.com`` must not match ``test.com``; ``subdomain.com`` must
+    not match ``domain.com``. A substring ``bad in ident`` check was
+    rewriting those real citations to ``[analyst judgement]``.
+    """
+    ident_l = (ident or "").strip().lower()
+    if not ident_l:
+        return False
+    for bad in _PLACEHOLDER_URL_HOSTS:
+        if re.search(r"(?<![a-z0-9-])" + re.escape(bad) + r"(?![a-z0-9-])", ident_l):
+            return True
+    return False
+
+
+def _is_fabricated_part(part: str) -> bool:
+    ident = (part or "").strip()
+    if not ident:
+        return False
+    low = ident.lower()
+    if low.startswith("http://") or low.startswith("https://"):
+        return _is_placeholder_url(ident)
+    coerced = _coerce_absolute_http_url(ident)
+    if coerced.startswith("http://") or coerced.startswith("https://"):
+        return _is_placeholder_url(coerced)
+    return _placeholder_host_in_identifier(ident)
 
 
 def _is_fabricated_identifier(identifier: str) -> bool:
@@ -362,18 +555,18 @@ def _is_fabricated_identifier(identifier: str) -> bool:
     preserved.  Only two shapes are fabricated:
 
       1. an ``http(s)://`` URL that resolves to a placeholder host, or
-      2. any string containing a known placeholder host token
-         (``example.com`` etc.) even without a scheme.
+      2. a host-token match on a known placeholder (``example.com`` etc.)
+         even without a scheme.
+
+    A compound tag is fabricated only when every part is. Mixed tags
+    keep the real part (see ``sanitize_citations``).
     """
     if not identifier or not isinstance(identifier, str):
         return False
-    ident = identifier.strip().lower()
-    if ident.startswith("http://") or ident.startswith("https://"):
-        return _is_placeholder_url(ident)
-    for bad in _PLACEHOLDER_URL_HOSTS:
-        if bad in ident:
-            return True
-    return False
+    parts = _split_citation_payload(identifier)
+    if not parts:
+        return False
+    return all(_is_fabricated_part(p) for p in parts)
 
 
 def sanitize_citations(text: str) -> str:
@@ -387,18 +580,293 @@ def sanitize_citations(text: str) -> str:
     cause: a model-invented URL is relabelled as the honest qualitative
     judgement it actually is, so a genuine claim keeps its weight while
     the fake link is removed.  Real URLs and real tool identifiers are
-    left untouched.
+    left untouched.  A mixed tag (real URL + ``example.com``) keeps
+    only the real part so a valid figure is not stripped.
     """
     if not text or not isinstance(text, str):
         return text
 
     def _repl(m: "re.Match[str]") -> str:
         identifier = m.group(1)
-        if _is_fabricated_identifier(identifier):
+        parts = _split_citation_payload(identifier)
+        kept = [p for p in parts if not _is_fabricated_part(p)]
+        if not kept:
             return "[analyst judgement]"
-        return m.group(0)
+        if kept == parts:
+            return m.group(0)
+        return "[source: " + "; ".join(kept) + "]"
 
     return _SOURCE_TAG_RE.sub(_repl, text)
+
+
+# ---------------------------------------------------------------------------
+# Source-provider normalization
+# ---------------------------------------------------------------------------
+# A ``[source: profit-loss]`` / ``[source: eps_revisions]`` tag names the
+# section/field a number came from but hides the DATA PROVIDER the desk
+# actually pulled it from.  These maps let us rewrite such a tag to a
+# provider-led form — ``[source: screener.in · profit-loss]`` /
+# ``[source: yahoo · eps_revisions]`` — deterministically, so the UI (and the
+# critic's evidence list) reads the real origin rather than a bare section id.
+
+# Section/field id -> data provider (unambiguous origin).
+_SECTION_PROVIDER: dict[str, str] = {
+    # screener.in financial-statement sections
+    "profit-loss": "screener.in",
+    "balance-sheet": "screener.in",
+    "cash-flow": "screener.in",
+    "ratios": "screener.in",
+    "quarters": "screener.in",
+    "shareholding": "screener.in",
+    "shareholding_pattern": "screener.in",
+    # yfinance / Yahoo Finance fields
+    "eps_revisions": "yahoo",
+    "analyst_price_targets": "yahoo",
+    "earnings_estimate": "yahoo",
+    "revenue_estimate": "yahoo",
+    "recommendations_summary": "yahoo",
+    "forward-estimates": "yahoo",
+    "forward estimates": "yahoo",
+    "insider_transactions": "yahoo",
+    "option_chain": "yahoo",
+    "sector_peers": "yahoo",
+    "ohlcv": "yahoo",
+    "info": "yahoo",
+}
+
+# Section/field ids whose PROVIDER is genuinely ambiguous (both an Indian
+# screener.in path and a yfinance path exist).  We only supply the ``detail``
+# and require an explicit provider token in the tag to attribute it.
+_AMBIGUOUS_SECTIONS: set[str] = {"long_term_thesis"}
+
+# Substring -> canonical provider label (explicit provider tokens win).
+_PROVIDER_TOKENS: tuple[tuple[str, str], ...] = (
+    ("screener.in", "screener.in"),
+    ("screener", "screener.in"),
+    ("yfinance", "yahoo"),
+    ("yahoo", "yahoo"),
+    ("upstox", "upstox"),
+    ("tavily", "tavily"),
+    ("serpapi", "serpapi"),
+    ("firecrawl", "firecrawl"),
+    ("nseindia", "nseindia"),
+    ("moneycontrol", "moneycontrol"),
+)
+
+
+def normalize_source_identifier(identifier: str) -> str:
+    """Rewrite a single ``[source: …]`` payload to a provider-led form.
+
+    ``profit-loss`` → ``screener.in · profit-loss``; ``yfinance eps_revisions
+    RELIANCE.NS`` → ``yahoo · eps_revisions``.  Real URLs and identifiers whose
+    provider can't be determined are returned unchanged (idempotent).
+    """
+    if not identifier or not isinstance(identifier, str):
+        return identifier
+    raw = identifier.strip()
+    low = raw.lower()
+    # Real URLs are already provenance-complete.
+    if low.startswith("http://") or low.startswith("https://"):
+        return raw
+    # Already provider-normalized (``screener.in · profit-loss, ratios``) —
+    # return verbatim so re-normalization is idempotent and lossless.
+    _canonical = {name for _, name in _PROVIDER_TOKENS}
+    if " · " in raw and raw.split(" · ", 1)[0].strip().lower() in _canonical:
+        return raw
+
+    # Explicit provider token anywhere in the tag wins.
+    provider: Optional[str] = None
+    for token, name in _PROVIDER_TOKENS:
+        if token in low:
+            provider = name
+            break
+
+    # Find the section/field detail (prefer an explicit ``#section`` anchor).
+    detail: Optional[str] = None
+    inferred: Optional[str] = None
+    if "#" in raw:
+        seg = raw.split("#", 1)[1].strip().split()[0].strip().lower() if raw.split("#", 1)[1].strip() else ""
+        if seg in _SECTION_PROVIDER:
+            detail, inferred = seg, _SECTION_PROVIDER[seg]
+        elif seg in _AMBIGUOUS_SECTIONS:
+            detail = seg
+    if detail is None:
+        for token, prov in _SECTION_PROVIDER.items():
+            if re.search(r"(?<![\w-])" + re.escape(token) + r"(?![\w-])", low):
+                detail, inferred = token, prov
+                break
+    if detail is None:
+        for token in _AMBIGUOUS_SECTIONS:
+            if re.search(r"(?<![\w-])" + re.escape(token) + r"(?![\w-])", low):
+                detail = token
+                break
+
+    provider = provider or inferred
+    if provider is None:
+        # Unknown origin — leave the identifier untouched.
+        return raw
+    if not detail or detail == provider:
+        return provider
+    return f"{provider} · {detail}"
+
+
+def _normalize_source_payload(payload: str) -> str:
+    """Normalize a (possibly ``;``-joined) ``[source: …]`` payload, collapsing
+    consecutive same-provider entries (``a · x; a · y`` → ``a · x, y``)."""
+    parts = [p.strip() for p in payload.split(";") if p.strip()]
+    if not parts:
+        return payload
+    out: list[str] = []
+    for part in parts:
+        norm = normalize_source_identifier(part)
+        if " · " in norm and out and " · " in out[-1] and \
+                out[-1].split(" · ", 1)[0] == norm.split(" · ", 1)[0]:
+            out[-1] = out[-1] + ", " + norm.split(" · ", 1)[1]
+        else:
+            out.append(norm)
+    return "; ".join(out)
+
+
+def normalize_source_providers(text: str) -> str:
+    """Rewrite every inline ``[source: <section>]`` tag in ``text`` to the
+    provider-led ``[source: <provider> · <section>]`` form.  Deterministic and
+    idempotent; URLs and unknown identifiers pass through unchanged."""
+    if not text or not isinstance(text, str):
+        return text
+
+    def _repl(m: "re.Match[str]") -> str:
+        return "[source: " + _normalize_source_payload(m.group(1)) + "]"
+
+    return _SOURCE_TAG_RE.sub(_repl, text)
+
+
+# ---------------------------------------------------------------------------
+# Stamp [source: …] on numeric lines the LLM left bare
+# ---------------------------------------------------------------------------
+# Quality Review treats an untagged number as UNSUPPORTED. Map/reduce and
+# custom-crawl summaries often emit real figures with a prose "Source"
+# column ("Annual report", "Q1 call") instead of ``[source: <url>]``.
+# This pass attaches the matching filing/article URL — or the tool id —
+# so a valid number is not lost downstream.
+
+_HAS_NUMBER_RE = re.compile(
+    r"(?<![A-Za-z./])(?:\d{1,3}(?:,\d{2,3})+(?:\.\d+)?|\d+\.\d+|\d{2,}|\d\s*%|\d%)"
+)
+_PROVENANCE_TAG_RE = re.compile(r"\[(?:source|analyst judgement)\s*:", re.IGNORECASE)
+_SIGNAL_INSUFFICIENT_RE = re.compile(
+    r"^\s*SIGNAL\s*\|[^|\n]*\|\s*INSUFFICIENT_DATA\b", re.IGNORECASE
+)
+_MD_SEP_RE = re.compile(r"^\s*\|?[\s:|-]+\|?\s*$")
+
+_KIND_HINTS: dict[str, tuple[str, ...]] = {
+    "concall": (
+        "concall", "earnings call", "transcript",
+        "q1 fy", "q2 fy", "q3 fy", "q4 fy",
+        "q1-fy", "q2-fy", "q3-fy", "q4-fy",
+        "fy26 call", "fy-26 call", "fy 26 call",
+    ),
+    "earnings": ("earnings", "8-k", "press release", "ex-99", "exhibit 99"),
+    "annual_report": ("annual report",),
+    "quarterly_report": ("quarterly report", "10-q"),
+    "credit_rating": (
+        "crisil", "care rating", "rating update", "rating note", "rating docs",
+    ),
+    "announcement": ("sebi", "lodr", "announcement"),
+}
+
+
+def _host_labels(url: str) -> list[str]:
+    host = (url or "").split("://", 1)[-1].split("/", 1)[0].lower()
+    host = host.split(":", 1)[0]
+    if host.startswith("www."):
+        host = host[4:]
+    if not host or "." not in host:
+        return []
+    labels = [host, host.split(".")[0]]
+    if host.startswith("care"):
+        labels.append("care")
+    return labels
+
+
+def _citation_for_line(
+    line: str, default_source: str, citations: list[dict],
+) -> str:
+    if not citations:
+        return default_source
+    low = line.lower()
+    scored: list[tuple[int, str]] = []
+    for cite in citations:
+        url = (cite.get("url") or "").strip()
+        if not url:
+            continue
+        kind = (cite.get("kind") or "").strip().lower()
+        title = (cite.get("title") or "").strip().lower()
+        score = 0
+        for hint in _KIND_HINTS.get(kind, ()):
+            if hint in low:
+                score += 2
+                break
+        if title and len(title) >= 12 and title[:24] in low:
+            score += 2
+        for label in _host_labels(url):
+            if re.search(
+                r"(?<![a-z0-9])" + re.escape(label) + r"(?![a-z0-9])", low,
+            ):
+                score += 3
+                break
+        if score:
+            scored.append((score, url))
+    if not scored:
+        return default_source
+    best = max(s for s, _ in scored)
+    urls: list[str] = []
+    seen_kind: set[str] = set()
+    # Preserve catalog order (newest first); one URL per kind at best score.
+    for cite in citations:
+        url = (cite.get("url") or "").strip()
+        kind = (cite.get("kind") or "").strip().lower()
+        score = next((s for s, u in scored if u == url), 0)
+        if score != best or not url:
+            continue
+        key = kind or url
+        if key in seen_kind:
+            continue
+        seen_kind.add(key)
+        urls.append(url)
+    return "; ".join(urls) if urls else default_source
+
+
+def _retag_numeric_claims(
+    text: str,
+    *,
+    default_source: str,
+    citations: Optional[list] = None,
+) -> str:
+    """Append ``[source: …]`` to numeric lines the tool left untagged.
+
+    Already-tagged lines and INSUFFICIENT_DATA signals are unchanged.
+    """
+    if not text or not isinstance(text, str) or not default_source:
+        return text
+    cites = citations or []
+    out: list[str] = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if (
+            not stripped
+            or _PROVENANCE_TAG_RE.search(line)
+            or _SIGNAL_INSUFFICIENT_RE.match(stripped)
+            or _MD_SEP_RE.match(stripped)
+            or not _HAS_NUMBER_RE.search(line)
+        ):
+            out.append(line)
+            continue
+        src = _citation_for_line(line, default_source, cites)
+        if not src:
+            out.append(line)
+            continue
+        out.append(line.rstrip() + f" [source: {src}]")
+    return "\n".join(out)
 
 
 def _normalize_url(url: str) -> str:
@@ -417,18 +885,55 @@ def _normalize_title(title: str) -> str:
 
 def _tavily_news_rows(query: str, max_results: int = 8) -> list[dict]:
     """Fetch news rows from Tavily using ADVANCED search depth for richer
-    coverage.  Returns ``[]`` (never raises) so the merge always proceeds."""
-    try:
-        res = _with_retry(
-            _tavily().search,
-            query,
-            max_results=max_results,
-            topic="news",
-            search_depth="advanced",
-            label=f"tavily.search({query!r})",
-        )
-    except Exception as exc:  # noqa: BLE001 — merge must survive one provider
-        logger.warning("tavily news failed for %r: %s", query, exc)
+    coverage.  Returns ``[]`` (never raises) so the merge always proceeds.
+
+    Key rotation happens inside :func:`_tavily` (``TAVILY_API_KEYS`` round-
+    robin, falling back to the singular ``TAVILY_API_KEY``).  When a backfill
+    ``AsOfContext`` is active the search is bounded server-side via
+    ``end_date`` and each row carries the ``published_date`` for the
+    downstream PIT filter.
+    """
+    from trading_crew.data_sources import news_providers, pit
+
+    global _tavily_quota_tripped
+    if _tavily_quota_tripped:
+        return []
+
+    # Try each configured key in round-robin order: a rate-limited / invalid
+    # key rolls over to the next rather than failing the whole provider.
+    # ``_tavily()`` rotates internally on each call (and stays monkeypatchable
+    # as a no-arg factory for the test-suite).
+    n_attempts = max(1, len(news_providers.read_keys("tavily")))
+    res = None
+    quota_hits = 0
+    for _ in range(n_attempts):
+        try:
+            kwargs = dict(max_results=max_results, topic="news", search_depth="advanced")
+            cutoff = pit.cutoff()
+            if cutoff is not None:
+                kwargs["end_date"] = cutoff.strftime("%Y-%m-%d")
+            try:
+                res = _with_retry(_tavily().search, query, label=f"tavily.search({query!r})", **kwargs)
+            except TypeError:
+                kwargs.pop("end_date", None)
+                res = _with_retry(_tavily().search, query, label=f"tavily.search({query!r})", **kwargs)
+            break
+        except Exception as exc:  # noqa: BLE001 — try the next key, then give up
+            if _is_hard_quota(exc):
+                quota_hits += 1
+                logger.warning("tavily quota/rate-limit for %r: %s", query, exc)
+            else:
+                logger.warning("tavily news failed for %r: %s", query, exc)
+            res = None
+            continue
+    if res is None:
+        if quota_hits >= n_attempts:
+            _tavily_quota_tripped = True
+            logger.warning(
+                "tavily quota exhausted on all %s key(s); skipping remaining "
+                "tavily calls this process",
+                n_attempts,
+            )
         return []
     rows: list[dict] = []
     for r in res.get("results", []):
@@ -438,6 +943,7 @@ def _tavily_news_rows(query: str, max_results: int = 8) -> list[dict]:
                 "url": (r.get("url") or "").strip(),
                 "snippet": (r.get("content") or "").strip().replace("\n", " ")[:240],
                 "provider": "tavily",
+                "published": r.get("published_date"),
             }
         )
     return rows
@@ -445,28 +951,46 @@ def _tavily_news_rows(query: str, max_results: int = 8) -> list[dict]:
 
 def _serpapi_news(query: str, max_results: int = 8) -> list[dict]:
     """Fetch news rows from SerpAPI's Google News engine.  Returns ``[]``
-    when the key is unset or the call fails (merge must survive)."""
-    api_key = os.environ.get("SERPAPI_API_KEY")
-    if not api_key:
+    when the key is unset or the call fails (merge must survive).
+
+    Uses key rotation (``SERPAPI_API_KEYS`` round-robin, falling back to the
+    singular ``SERPAPI_API_KEY``) and carries the per-result ``date`` for
+    the downstream point-in-time filter."""
+    from trading_crew.data_sources import news_providers
+
+    # Round-robin across every configured SerpAPI key, rolling over to the
+    # next one when a key is rate-limited / invalid (falls back to the
+    # singular ``SERPAPI_API_KEY`` when no plural list is set).
+    keys = news_providers.ordered_keys("serpapi")
+    if not keys:
+        solo = os.environ.get("SERPAPI_API_KEY")
+        keys = [solo] if solo else []
+    if not keys:
         return []
-    try:
-        resp = _with_retry(
-            requests.get,
-            "https://serpapi.com/search.json",
-            params={
-                "engine": "google_news",
-                "q": query,
-                "api_key": api_key,
-                "hl": "en",
-                "gl": "us",
-            },
-            timeout=20,
-            label=f"serpapi.google_news({query!r})",
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:  # noqa: BLE001 — merge must survive one provider
-        logger.warning("serpapi news failed for %r: %s", query, exc)
+    data = None
+    for api_key in keys:
+        try:
+            resp = _with_retry(
+                requests.get,
+                "https://serpapi.com/search.json",
+                params={
+                    "engine": "google_news",
+                    "q": query,
+                    "api_key": api_key,
+                    "hl": "en",
+                    "gl": "us",
+                },
+                timeout=20,
+                label=f"serpapi.google_news({query!r})",
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except Exception as exc:  # noqa: BLE001 — try the next key, then give up
+            logger.warning("serpapi news failed for %r: %s", query, exc)
+            data = None
+            continue
+    if data is None:
         return []
 
     def _row(r: dict) -> dict | None:
@@ -477,7 +1001,7 @@ def _serpapi_news(query: str, max_results: int = 8) -> list[dict]:
         src = r.get("source") or {}
         src_name = src.get("name") if isinstance(src, dict) else str(src)
         snippet = (r.get("snippet") or src_name or "").strip().replace("\n", " ")[:240]
-        return {"title": title, "url": url, "snippet": snippet, "provider": "serpapi"}
+        return {"title": title, "url": url, "snippet": snippet, "provider": "serpapi", "published": r.get("date")}
 
     rows: list[dict] = []
     for r in data.get("news_results", []):
@@ -495,19 +1019,29 @@ def _serpapi_news(query: str, max_results: int = 8) -> list[dict]:
     return rows[:max_results]
 
 
-def _web_news_rows(query: str, max_results: int = 6) -> list[dict]:
-    """Query Tavily AND SerpAPI in parallel and return the merged,
-    de-duplicated, placeholder-free rows (no formatting)."""
-    rows: list[dict] = []
-    with _cf.ThreadPoolExecutor(max_workers=2) as pool:
-        fut_tav = pool.submit(_tavily_news_rows, query, max_results + 4)
-        fut_serp = pool.submit(_serpapi_news, query, max_results + 4)
-        for fut in (fut_tav, fut_serp):
-            try:
-                rows.extend(fut.result())
-            except Exception as exc:  # noqa: BLE001 — defensive; providers already guard
-                logger.warning("news provider future failed for %r: %s", query, exc)
+def _firecrawl_news(query: str, max_results: int = 8) -> list[dict]:
+    """Fetch news rows from Firecrawl web-search (with key rotation).
 
+    Returns ``[]`` when no Firecrawl key is set or the call fails, so the
+    merge always proceeds.  Rotation + the HTTP call live in
+    :mod:`trading_crew.data_sources.news_providers`.
+    """
+    from trading_crew.data_sources import news_providers
+
+    try:
+        return news_providers.firecrawl_rows(query, max_results)
+    except Exception as exc:  # noqa: BLE001 — merge must survive one provider
+        logger.warning("firecrawl news failed for %r: %s", query, exc)
+        return []
+
+
+def _pit_and_dedupe_news_rows(rows: list[dict], max_results: int) -> list[dict]:
+    """PIT-filter, drop fabricated links, and de-duplicate a provider's rows."""
+    from trading_crew.data_sources import pit
+
+    # Point-in-time gate — no-op in live mode; in backfill drops anything
+    # published after the as_of cutoff (and unknown-date rows in strict mode).
+    rows = pit.filter_before_cutoff(rows, key="published")
     rows = _reject_placeholder_urls(rows)
 
     seen_url: set[str] = set()
@@ -522,35 +1056,218 @@ def _web_news_rows(query: str, max_results: int = 6) -> list[dict]:
         if nt:
             seen_title.add(nt)
         merged.append(row)
-
-    # Two providers deliberately widen breadth, so keep a bit more than a
-    # single-provider search would.
     return merged[: max_results * 2]
 
 
-def _web_news(query: str, max_results: int = 6) -> str:
-    """Query Tavily AND SerpAPI in parallel, merge + de-duplicate, and
-    render a markdown digest with real article URLs.
+# News providers, tried in a FALLBACK SEQUENCE (not a parallel merge): the
+# first provider that returns any usable, PIT-valid rows wins, so we spend the
+# cheaper / higher-quota providers first and only reach the next one when the
+# prior yields nothing.  Each provider internally rotates its own key list.
+# Stored as (label, row-builder attribute name) and resolved on the module at
+# call time so the seam stays monkeypatchable in tests.
+_NEWS_PROVIDER_SEQUENCE: tuple[tuple[str, str], ...] = (
+    ("tavily", "_tavily_news_rows"),
+    ("serpapi", "_serpapi_news"),
+    ("firecrawl", "_firecrawl_news"),
+)
 
-    Each row carries an inline ``[source: <url>]`` tag so the analyst can
-    cite the concrete article instead of inventing a placeholder link.
+
+def _web_news_rows(query: str, max_results: int = 6) -> list[dict]:
+    """Return news rows from the first provider in the fallback SEQUENCE that
+    yields usable, PIT-valid, de-duplicated rows.
+
+    Order: **Tavily → SerpAPI → Firecrawl** (each with its own key rotation).
+    This is a fallback chain, not a breadth merge: SerpAPI is only hit when
+    Tavily comes back empty, and so on — conserving each provider's quota.
     """
-    merged = _web_news_rows(query, max_results)
+    for label, fn_name in _NEWS_PROVIDER_SEQUENCE:
+        fn: "Callable[[str, int], list[dict]]" = globals()[fn_name]
+        try:
+            rows = fn(query, max_results + 4)
+        except Exception as exc:  # noqa: BLE001 — defensive; providers already guard
+            logger.warning("news provider %s failed for %r: %s", label, query, exc)
+            rows = []
+        merged = _pit_and_dedupe_news_rows(rows, max_results)
+        if merged:
+            return merged
+    return []
 
-    if merged:
+
+def _web_news_rows_free(query: str, max_results: int = 6) -> list[dict]:
+    """FREE news rows via the custom link-search backends (no paid API).
+
+    Uses :func:`web_research.search_links` (websearch.sh → ddg/brave/mojeek —
+    all keyless) and normalises the hits into the same row shape the paid
+    providers return, so callers that expect ``[{title,url,snippet,provider}]``
+    (e.g. :func:`get_corporate_actions`) can consume it interchangeably.  The
+    SearXNG backend supplies a per-result snippet (carried through here);
+    scraper backends don't, so those rows have an empty snippet and no publish
+    date, and are PIT-filtered fail-closed in strict backfill (kept in live
+    mode).  Runs the same placeholder-URL rejection + de-dupe as the paid tier.
+    """
+    from trading_crew.data_sources import web_research
+
+    try:
+        links = web_research.search_links(query, max_results=max_results + 4)
+    except Exception as exc:  # noqa: BLE001 — free tier must never raise
+        logger.warning("free news search failed for %r: %s", query, exc)
+        return []
+    rows = [
+        {
+            "title": (l.get("title") or l.get("url") or "").strip(),
+            "url": (l.get("url") or "").strip(),
+            # SearXNG supplies a per-result snippet; scraper backends don't, so
+            # this is best-effort and may be empty.
+            "snippet": (l.get("snippet") or "").strip().replace("\n", " ")[:240],
+            "provider": "websearch",
+        }
+        for l in links
+    ]
+    return _pit_and_dedupe_news_rows(rows, max_results)
+
+
+def _corporate_action_rows(query: str, max_results: int = 4) -> list[dict]:
+    """Fetch corporate-action rows honouring TRADINGCREW_PREFER_CUSTOM_CRAWL.
+
+    Custom-first (default): try the FREE link-search tier first so a
+    large-scale run doesn't burn Tavily/SerpAPI/Firecrawl quota, and only fall
+    through to the paid APIs when the free tier is empty.  API-first when the
+    toggle is off (better publish-date PIT for historical backfill).
+    """
+    if _prefer_custom_crawl():
+        return _web_news_rows_free(query, max_results) or _web_news_rows(query, max_results)
+    return _web_news_rows(query, max_results) or _web_news_rows_free(query, max_results)
+
+
+def _web_news_via_research(query: str, *, crawler: str = "http") -> str:
+    """Custom websearch pipeline (free search → crawl → LLM-summarize).
+    Returns a source-cited summary string, or "" on failure.
+
+    ``crawler`` defaults to ``"http"`` (keyless requests+BeautifulSoup) so the
+    custom tier consumes NO paid credits — the link search already uses only
+    free backends.  Pass ``crawler="auto"`` to allow Firecrawl as the crawler.
+
+    PIT-aware via :func:`web_research` (the search is date-bounded and the
+    summarizer is told to ignore post-cutoff info when an ``AsOfContext`` is
+    active).  See ``web_research`` for the residual crawl-freshness caveat.
+    """
+    from trading_crew.data_sources import web_research
+
+    try:
+        res = web_research.research_and_summarize(query, max_links=5, crawler=crawler)
+    except Exception as exc:  # noqa: BLE001 — last-resort provider must not raise
+        logger.warning("websearch news fallback failed for %r: %s", query, exc)
+        return ""
+    summary = (res.get("summary") or "").strip()
+    if not summary:
+        # Don't fail silently — record WHY the fallback came back empty so a
+        # degraded run is traceable in the logs (search vs. crawl failure).
+        logger.warning(
+            "websearch news fallback empty for %r (status=%s)",
+            query, res.get("status", "unknown"),
+        )
+        return ""
+    citations = [
+        {"url": (s.get("url") or "").strip(), "kind": "", "title": s.get("title") or ""}
+        for s in (res.get("sources") or [])
+        if (s.get("url") or "").strip()
+    ]
+    return _retag_numeric_claims(
+        summary,
+        default_source=f"Web News (custom crawl) · q='{query}'",
+        citations=citations,
+    )
+
+
+def _prefer_custom_crawl() -> bool:
+    """Whether to try the FREE custom-crawl tier before the paid news APIs.
+
+    Default ON (``TRADINGCREW_PREFER_CUSTOM_CRAWL=1``): with limited
+    Tavily/SerpAPI/Firecrawl credits, spend the free tier (free link search +
+    keyless HTTP crawl + one LLM summarize) first and only fall through to the
+    paid APIs when it comes back empty.  Set to ``0`` to restore the old
+    API-first order (which carries stronger publish-date PIT metadata for
+    backfill).
+    """
+    return os.getenv("TRADINGCREW_PREFER_CUSTOM_CRAWL", "1").strip().lower() not in (
+        "0", "false", "no", "off", ""
+    )
+
+
+# When the free custom-crawl tier crawls generic pages (its keyless HTTP
+# crawler is 403-blocked by bot-protected news sites), the summarizer
+# correctly reports that the sources are irrelevant — but that self-report is
+# itself a *non-empty* string.  Without this check the custom tier would ship
+# a "no relevant info" digest and the configured paid news APIs (Tavily /
+# SerpAPI / Firecrawl) would never be reached.  So we treat a summary that
+# explicitly says the sources are irrelevant/empty as an empty result and fall
+# through to the paid tier.
+# Whole-digest emptiness only. Bare "irrelevant" / "no news" also match
+# a useful crawl that says "ignored irrelevant Wikipedia pages" or
+# "no news of a tariff change, but supply strains delayed revenue" —
+# those used to discard the digest and fall through to an empty API
+# (NTNX get_geopolitical_news → "No news found").
+_IRRELEVANCE_MARKERS: tuple[str, ...] = (
+    "do not contain any",
+    "does not contain any",
+    "not contain any information",
+    "no relevant information",
+    "no relevant recent news found",
+    "no factual briefing",
+    "cannot be compiled",
+    "no articles found",
+    "no headlines found",
+)
+
+
+def _is_degraded_news_summary(summary: str) -> bool:
+    """True when a custom-crawl summary self-reports that its crawled sources
+    were irrelevant / empty, so ``_web_news`` can fall through to the paid
+    news APIs instead of shipping a 'no relevant info' digest."""
+    low = (summary or "").lower()
+    return any(m in low for m in _IRRELEVANCE_MARKERS)
+
+
+def _web_news(query: str, max_results: int = 6) -> str:
+    """Fetch news and render a markdown digest with real article URLs.
+
+    Two clearly-separated tiers:
+
+    * **Custom crawl (free)** — free link search + keyless HTTP crawl +
+      one LLM summarize.  No paid API credits.
+    * **News APIs (paid)** — Tavily → SerpAPI → Firecrawl fallback sequence,
+      each row carrying an inline ``[source: <url>]`` tag and publish date.
+
+    Order is controlled by ``TRADINGCREW_PREFER_CUSTOM_CRAWL`` (default ON =
+    free tier first, to conserve API credits).  Each tier is only reached
+    when the earlier one comes back empty.
+    """
+
+    def _custom() -> str:
+        summary = _web_news_via_research(query)
+        if summary and not _is_degraded_news_summary(summary):
+            return summary + _source_line(f"Web News (custom crawl) · q='{query}'")
+        return ""
+
+    def _apis() -> str:
+        merged = _web_news_rows(query, max_results)
+        if not merged:
+            return ""
         body = "\n".join(
             f"- {r['title']}\n  {r['url']}\n  {r['snippet']}\n  [source: {r['url']}]"
             for r in merged
         )
-        providers = sorted({r["provider"] for r in merged})
-    else:
-        body = "No news found."
-        providers = []
+        provider_tag = "+".join(sorted({r["provider"] for r in merged}))
+        return body + _source_line(f"Web News ({provider_tag}) · q='{query}'")
 
-    provider_tag = "+".join(providers) if providers else "none"
-    return body + _source_line(
-        f"Web News ({provider_tag}) · q='{query}'"
-    )
+    stages = (_custom, _apis) if _prefer_custom_crawl() else (_apis, _custom)
+    for stage in stages:
+        out = stage()
+        if out:
+            return out
+
+    logger.warning("all news tiers empty for %r", query[:180])
+    return "No news found." + _source_line(f"Web News (none) · q='{query}'")
 
 
 # ---------------------------------------------------------------------------
@@ -644,27 +1361,28 @@ def get_stock_data(ticker: str) -> str:
     )
     monthly.index = monthly.index.strftime("%Y-%m")
 
+    cite = f" [source: {source_id} · monthly + recent daily]"
     summary_lines = [
         f"5-YEAR OVERVIEW for {ticker}",
-        f"  Current price: {last_px:.2f}  (as of {last_date})",
-        f"  52-week high : {hi_val:.2f}  on {hi_date}",
-        f"  52-week low  : {lo_val:.2f}  on {lo_date}",
+        f"  Current price: {last_px:.2f}  (as of {last_date}){cite}",
+        f"  52-week high : {hi_val:.2f}  on {hi_date}{cite}",
+        f"  52-week low  : {lo_val:.2f}  on {lo_date}{cite}",
         (
             f"  Returns: 1m={_ret_n_days(21)}  3m={_ret_n_days(63)}  "
             f"6m={_ret_n_days(126)}  1y={_ret_n_days(252)}  "
-            f"3y={_ret_n_days(252*3)}  5y={ret_5y_pct:+.1f}%"
+            f"3y={_ret_n_days(252*3)}  5y={ret_5y_pct:+.1f}%{cite}"
         ),
-        f"  Annualised volatility (1y trailing): {vol_str}",
-        f"  Max drawdown (5y): {max_dd:.1f}%  (trough {max_dd_date})",
+        f"  Annualised volatility (1y trailing): {vol_str}{cite}",
+        f"  Max drawdown (5y): {max_dd:.1f}%  (trough {max_dd_date}){cite}",
     ]
 
     daily_tail = df[["Open", "High", "Low", "Close", "Volume"]].tail(30).round(2)
 
     return (
         "\n".join(summary_lines)
-        + f"\n\nMONTHLY OHLCV ({len(monthly)} months, 5y window):\n"
+        + f"\n\nMONTHLY OHLCV ({len(monthly)} months, 5y window):{cite}\n"
         + monthly.round(2).to_string()
-        + f"\n\nDAILY OHLCV (last {len(daily_tail)} sessions):\n"
+        + f"\n\nDAILY OHLCV (last {len(daily_tail)} sessions):{cite}\n"
         + daily_tail.to_string()
         + _source_line(f"{source_id} · monthly + recent daily")
     )
@@ -728,13 +1446,30 @@ def get_indicators(ticker: str) -> str:
     def _fmt_pct(val: float) -> str:
         return f"{val:.2f}%" if pd.notna(val) else "n/a"
 
-    return (
+    base = (
         f"{ticker} indicators: price={close.iloc[-1]:.2f}, "
         f"SMA20={_fmt(sma20)}, SMA50={_fmt(sma50)}, SMA200={_fmt(sma200)}, "
         f"RSI14={_fmt(rsi)}, "
         f"60d_return={_fmt_pct(ret60)}, 1y_return={_fmt_pct(ret252)}"
+        f" [source: {source_id} · indicators]"
         + _source_line(f"{source_id} · indicators")
     )
+
+    # Append the deterministic PRICE STRUCTURE SIGNALS card (vol-state /
+    # regime-age / oversold-dip / Hurst).  These are probe-validated
+    # risk/entry signals (see ``trading_crew.price_structure``) that inform
+    # SIZE and flag a mean-reversion ENTRY setup — never a direction vote.
+    # Best-effort: a failure here must not lose the base indicator panel.
+    try:
+        from trading_crew.price_structure import compute_price_structure
+
+        ps = compute_price_structure(df, source=f"{source_id} · price-structure (computed)")
+        card = ps.render_card() if ps is not None else ""
+        if card:
+            return base + "\n\n" + card
+    except Exception:  # noqa: BLE001 — price-structure card is additive
+        logger.warning("get_indicators: price-structure card failed for %s", ticker, exc_info=True)
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -744,47 +1479,45 @@ def get_indicators(ticker: str) -> str:
 
 @tool("get_news")
 @_memoize_tool
-def get_news(ticker: str) -> str:
-    """Retrieve recent news data for a given ticker symbol (company-specific
-    headlines plus social-style sentiment cues).
+def get_news(ticker: str, query: str = "") -> str:
+    """Retrieve recent company news.
 
-    The search query is built from the ticker's *long name* (e.g.
-    "Mazagon Dock Shipbuilders Ltd") rather than just the symbol, so we
-    don't lose hits to ambiguous tickers (e.g. ``MAZDOCK`` returning
-    German-investor-confidence headlines).
+    After ``get_market_context``, pass ``query`` you wrote from the
+    brief + your catalyst remit + any gap (6-12 words). If omitted,
+    the tool searches the company name only — it does not carry an
+    industry phrasebook.
     """
+    from trading_crew.market_context import compose_search_query
+
     canonical = resolve_ticker(ticker)
     profile = get_market_profile(canonical)
-    name = profile.long_name or canonical
-    return _web_news(f"{name} {canonical} stock news sentiment last week", max_results=6)
+    return _web_news(
+        compose_search_query(profile, lens="company", agent_query=query),
+        max_results=6,
+    )
 
 
 @tool("get_global_news")
 @_memoize_tool
 def get_global_news(ticker: str = "", query: str = "") -> str:
-    """Retrieve global / macro news in the **ticker's own country**.
+    """Retrieve home-country macro news.
 
-    Prefer calling with the ticker symbol so the search is grounded in
-    the right macro regime — for a US name we surface Fed / UST / DXY
-    headlines; for an Indian name we surface RBI / INR / Union Budget /
-    crude-import headlines.
-
-    ``query`` is an optional override; when set it takes precedence
-    over the ticker-derived themes. Use it only when the analyst
-    layer has a specific catalyst in mind ("OPEC meeting", "FOMC dots").
+    Pass ``query`` you wrote from the brief (country, currency, macro
+    basket) + your remit. If omitted, searches ``{country} central bank
+    inflation currency`` — not a canned Fed/RBI headline list.
     """
+    from trading_crew.market_context import compose_search_query
+
     if query:
         return _web_news(query, max_results=6)
     if not ticker:
-        # No ticker, no override → return a *neutral* global query rather
-        # than silently defaulting to US Fed terms.
         return _web_news(
             "global markets macro overview central bank policy currencies",
             max_results=6,
         )
     canonical = resolve_ticker(ticker)
     profile = get_market_profile(canonical)
-    return _web_news(profile.country_news_query(), max_results=6)
+    return _web_news(compose_search_query(profile, lens="macro"), max_results=6)
 
 
 @tool("get_insider_transactions")
@@ -801,8 +1534,9 @@ def get_insider_transactions(ticker: str) -> str:
 
 
 # Corporate-action search themes for ``get_corporate_actions``.  Targeted
-# enough that a generic "stock news sentiment last week" query
-# (``get_news`` above) would routinely miss them — buybacks, dividends,
+# enough that a generic "latest stock news headlines earnings analyst
+# ratings" query (``get_news`` above) would routinely miss them — buybacks,
+# dividends,
 # splits, M&A and board changes have specific vocabulary the model needs
 # to be steered toward.  Each theme is a SHORT phrase the Tavily ranker
 # can match without burning the per-query budget.
@@ -859,7 +1593,7 @@ def get_corporate_actions(ticker: str) -> str:
     for theme, query_seeds in _CORPORATE_ACTION_THEMES:
         query = f"{name} {canonical} {query_seeds}"
         try:
-            results = _web_news_rows(query, max_results=4)
+            results = _corporate_action_rows(query, max_results=4)
         except Exception as exc:
             logger.warning(
                 "get_corporate_actions: %s theme %s failed: %s",
@@ -867,10 +1601,14 @@ def get_corporate_actions(ticker: str) -> str:
             )
             sections.append(f"### {theme}\n  (search failed: {exc})")
             continue
-        rows = [
-            f"- {r['title']}\n  {r['url']}\n  {(r['snippet'] or '')[:200]}\n  [source: {r['url']}]"
-            for r in results
-        ]
+        rows = []
+        for r in results:
+            snippet = (r.get("snippet") or "").strip()[:280]
+            line = f"- {r['title']}\n  {r['url']}"
+            if snippet:
+                line += f"\n  {snippet}"
+            line += f"\n  [source: {r['url']}]"
+            rows.append(line)
         if rows:
             sections.append(f"### {theme}\n" + "\n".join(rows))
         else:
@@ -902,7 +1640,10 @@ def get_corporate_actions(ticker: str) -> str:
                 canonical, exc,
             )
         else:
-            docs_block = screener_source.render_announcements_report(page, limit=12)
+            # Grouped, dated primary sources (announcements + annual reports +
+            # concall transcripts + credit-rating actions).  PIT-filtered in
+            # backfill so only filings public as-of the decision date show.
+            docs_block = screener_source.render_documents_report(page, limit_per_kind=8)
             body += "\n\n" + docs_block
 
     return body + _source_line(
@@ -928,6 +1669,905 @@ def _screener_available_for(ticker: str) -> bool:
     return bool(is_indian_ticker(ticker) and get_data_sources_config().screener_enabled)
 
 
+# ---------------------------------------------------------------------------
+# Primary-filing report insights (guidance / target-vs-actual)
+# ---------------------------------------------------------------------------
+#
+# The fundamentals desk reads restated *ratio* tables; nobody in the workflow
+# reads the company's own PRIMARY filings (earnings-call / concall transcripts,
+# investor presentations, annual-report MD&A, credit-rating rationales) where
+# management states explicit forward TARGETS and where a prior target can be
+# compared to what was actually DELIVERED.  ``get_report_insights`` fills that
+# gap market-aware: Indian (NSE/BSE) names via screener.in's dated
+# ``#documents`` feed, and US (SEC-registered) names via the SEC EDGAR
+# submissions feed (10-K / 10-Q + earnings 8-Ks).  It crawls the (large)
+# documents and LLM-summarises them before the digest reaches the agent (so the
+# analyst never ingests a 200-page filing), returning a compact guidance /
+# target-vs-actual / outlook digest.  It is PIT-safe: filings are first
+# date-filtered to on/before the decision cutoff, and the summariser is told to
+# ignore anything dated after it.
+#
+# BIG PDFs are NOT truncated.  Chunk size is derived from
+# ``REPORT_PROCESS_CONTEXT_TOKENS`` (128k or 256k) so a filing is split
+# only when it will not fit the model — not into many small slices.
+# MAP keeps guidance AND the broader briefing (actuals, order book, risks,
+# MD&A, operations). REDUCE consolidates that into the digest. The
+# newest annual report is enough (prior years are inside it); concalls
+# still keep multiple vintages for target-vs-actual.
+
+# Guidance-rich documents first: concall transcripts + investor decks carry the
+# most explicit forward targets, then earnings press releases (US 8-K item
+# 2.02 — results + guidance), annual reports the MD&A / outlook, quarterly
+# reports the interim MD&A, credit ratings the agency's forward view; generic
+# announcements are the fallback.  Screener (India) emits concall /
+# annual_report / credit_rating / announcement; SEC EDGAR (US) emits earnings /
+# annual_report / quarterly_report — the union is ordered here.
+_REPORT_DOC_PRIORITY = (
+    "concall",
+    "earnings",
+    "annual_report",
+    "quarterly_report",
+    "credit_rating",
+    "announcement",
+)
+
+_REPORT_INSIGHT_PROMPT = (
+    "You are an equity analyst briefing a prediction desk from a company's "
+    "OWN primary filings (earnings-call / concall transcripts, investor "
+    "presentations, annual-report MD&A, credit-rating rationales) for "
+    "{name} ({ticker}).\n\n"
+    "Read the source excerpts below and produce a briefing the desk can "
+    "trade on — guidance AND the broader operating picture (actuals, "
+    "order book, risks, strategy, operations). Put an inline "
+    "[source: <url>] tag on EVERY concrete figure, using the source's "
+    "URL.\n\n"
+    "FIRST, emit a machine-readable TREND SIGNAL CARD. This is the headline "
+    "deliverable: a short set of DIRECTIONAL, confidence-scored signals a "
+    "trader can act on — each derived ONLY from the filings, comparing the "
+    "LATEST statement to the PRIOR period wherever the sources allow (that is "
+    "what makes it a TREND, not a snapshot). Output this block EXACTLY in this "
+    "format, one line per signal, no extra prose:\n\n"
+    "## REPORT TREND SIGNALS\n"
+    "SIGNAL | <NAME> | <DIRECTION> | conf=<0.00-1.00> | <one-line rationale> "
+    "[source: <url>]\n\n"
+    "Emit these signals IN THIS ORDER (skip a line only if the filings truly "
+    "say nothing about it — then emit DIRECTION=INSUFFICIENT_DATA, conf=0.0, "
+    "and NO source):\n"
+    "- OUTLOOK_TONE: BULLISH | CAUTIOUS | DEFENSIVE — management's forward "
+    "tone/confidence.\n"
+    "- REVENUE_GUIDANCE: RAISED | MAINTAINED | CUT — latest revenue/topline "
+    "guidance vs the prior guide (or vs last year if that's the only compare).\n"
+    "- MARGIN_GUIDANCE: EXPANDING | STABLE | CONTRACTING — margin / "
+    "profitability guidance direction.\n"
+    "- DELIVERY_TRACK_RECORD: BEAT | IN_LINE | MISS — how recent actuals came "
+    "in vs prior guidance (note the streak, e.g. 'beat 3 of last 4').\n"
+    "- DEMAND_MOMENTUM: ACCELERATING | STABLE | DECELERATING — order-book / "
+    "deal-pipeline / demand-commentary trend.\n"
+    "- CREDIT_TRAJECTORY: IMPROVING | STABLE | DETERIORATING — rating action / "
+    "outlook direction (skip if no rating info).\n"
+    "- NET_GUIDANCE_BIAS: POSITIVE | NEUTRAL | NEGATIVE — your synthesis of the "
+    "above into ONE actionable bias, with the confidence you'd stand behind.\n\n"
+    "THEN the supporting evidence. Keep material facts — do not drop a "
+    "number, risk, or operating detail just because it is not a forward "
+    "target:\n\n"
+    "1. MANAGEMENT GUIDANCE / TARGETS — explicit forward targets with NUMBER "
+    "and PERIOD: revenue / earnings growth, margin, order book / TCV / "
+    "book-to-bill, capex, capacity, dividend / payout, debt / net-cash.\n"
+    "2. TARGET vs ACTUAL — prior guide vs delivered, labelled BEAT / MISS / "
+    "IN-LINE.\n"
+    "3. REPORTED ACTUALS & SEGMENTS — latest-period revenue, PAT, EBITDA, "
+    "margins, YoY, and segment / geography splits (shipbuilding vs repair, "
+    "defence vs commercial, etc.).\n"
+    "4. ORDER BOOK / PIPELINE / OPERATIONS — backlog, new orders, "
+    "deliveries, capacity, dry-dock / facility status, execution commentary.\n"
+    "5. FORWARD OUTLOOK, MD&A & RISKS — demand tone plus named risks, "
+    "litigation, contingencies, commodity / forex exposure, strategy "
+    "(horizon plans, capex programmes).\n"
+    "6. CREDIT / BALANCE-SHEET — rating action + rationale, cash, gearing, "
+    "interest cover, working-capital notes if present.\n\n"
+    "Rules:\n"
+    "- Every concrete figure MUST carry an inline [source: <exact URL from "
+    "SOURCES>]. Do not replace that URL with a prose label (Annual report, "
+    "Q1 call, CRISIL). Table cells that are numbers need the tag on the "
+    "same row.\n"
+    "- Use ONLY facts present in the sources. NEVER invent a target, number, "
+    "period, or a direction the filings don't support — an unsupported signal "
+    "MUST be DIRECTION=INSUFFICIENT_DATA, conf=0.0.\n"
+    "- Confidence reflects EVIDENCE STRENGTH: an explicit quantified statement "
+    "with a clean prior-period compare = high (0.7-0.9); a qualitative-only or "
+    "single-period read = low/medium (0.2-0.5).\n"
+    '- If the sources contain no explicit guidance/target, say exactly: "No '
+    'explicit management guidance/target found in the available filings." Do '
+    "not manufacture one (the signal card is then all INSUFFICIENT_DATA). "
+    "Still report actuals / risks / order book if those are present.\n"
+    "- Omit a section only if truly absent. Most material first. Keep the "
+    "whole briefing under ~8000 chars — prefer keeping a fact over cutting "
+    "it for brevity.\n"
+)
+
+# MAP step: pull the important facts out of ONE excerpt of a big filing.  Kept
+# deliberately extractive (verbatim numbers, no synthesis) so nothing material
+# is lost before the REDUCE consolidation.
+_REPORT_MAP_PROMPT = (
+    "You are extracting facts from PART {idx} of {total} of the filing "
+    '"{title}" ({kind}) for {name} ({ticker}). Source URL: {url}\n\n'
+    "From THIS EXCERPT ONLY, extract verbatim every material fact a "
+    "prediction desk would use. That includes — and is not limited to — "
+    "all of the following when present:\n"
+    "- management guidance / forward target (number AND period)\n"
+    "- prior target vs actual delivery (beat / miss / in-line)\n"
+    "- reported actuals: revenue, PAT, EBITDA, margins, YoY, segment splits\n"
+    "- order book / backlog / new orders / pipeline / book-to-bill\n"
+    "- operations: deliveries, capacity, dry-dock / facility status, capex\n"
+    "- MD&A / strategy / multi-year plans\n"
+    "- material risks, litigation, contingencies, impairments\n"
+    "- credit-rating action + rationale; cash, gearing, interest cover\n"
+    "Keep concrete numbers, periods and segment names.\n"
+    "- Reply with terse bullet points; preserve figures exactly.\n"
+    "- End every bullet that contains a number with [source: {url}].\n"
+    "- Reply NONE only if the excerpt is truly empty of substance "
+    "(cover letter, contents page, signature block, page numbers). "
+    "Accounting notes, risk factors, related-party, and segment tables "
+    "ARE substance — extract them.\n"
+    "- Do NOT invent anything not present in the excerpt.\n\n"
+    "EXCERPT:\n{chunk}"
+)
+
+
+# A crawl returning fewer than this many chars is treated as a failed/gated
+# fetch (e.g. a PDF cover stub), not a real document — skipped so it doesn't
+# waste a doc slot or dilute the summary.
+_REPORT_MIN_DOC_CHARS = 400
+
+
+def _report_max_docs() -> int:
+    """Cap the number of filing PDFs crawled + summarised per call (latency /
+    LLM-cost bound).  Override with ``TRADINGCREW_REPORT_MAX_DOCS``."""
+    try:
+        return max(1, int(os.environ.get("TRADINGCREW_REPORT_MAX_DOCS", "4")))
+    except ValueError:
+        return 4
+
+
+def _report_context_chunk_chars(tokens: int) -> int:
+    """Map-chunk size so the excerpt plus prompt and completion still fit.
+
+    Assumes ~4 chars/token. Reserve is prompt + completion headroom
+    (``min(24000, tokens // 6)``). Set ``REPORT_PROCESS_CONTEXT_TOKENS`` to
+    the model's window (128000 or 256000).
+    """
+    if tokens < 8000:
+        raise ValueError(
+            f"REPORT_PROCESS_CONTEXT_TOKENS={tokens} is below 8000"
+        )
+    reserve = min(24000, max(4000, tokens // 6))
+    return max(8000, (tokens - reserve) * 4)
+
+
+def _report_doc_chars() -> int:
+    """Chars per LLM map pass. A filing larger than this is chunked, not
+    truncated. ``TRADINGCREW_REPORT_DOC_CHARS`` is an explicit size override
+    (tests). Otherwise ``REPORT_PROCESS_CONTEXT_TOKENS`` sizes the chunk
+    from the report-process window. If neither is set, 20000."""
+    raw_chars = (os.environ.get("TRADINGCREW_REPORT_DOC_CHARS") or "").strip()
+    if raw_chars:
+        return max(2000, int(raw_chars))
+    raw_tok = (os.environ.get("REPORT_PROCESS_CONTEXT_TOKENS") or "").strip()
+    if raw_tok:
+        return _report_context_chunk_chars(int(raw_tok))
+    return 20000
+
+
+def _report_max_per_kind() -> int:
+    """Cap how many filings of the SAME kind (e.g. concall) may be selected, so
+    a name with dozens of concalls doesn't spend the whole per-call doc budget
+    on one kind (and misses the annual report / credit rating).  The budget is
+    then spread across kinds and back-filled if slots remain.  Override with
+    ``TRADINGCREW_REPORT_MAX_PER_KIND`` (default 3)."""
+    try:
+        return max(1, int(os.environ.get("TRADINGCREW_REPORT_MAX_PER_KIND", "3")))
+    except ValueError:
+        return 3
+
+
+def _report_max_annual_reports() -> int:
+    """Newest annual report is enough — prior years already sit in its
+    comparatives / MD&A. Override with ``TRADINGCREW_REPORT_MAX_ANNUAL_REPORTS``
+    (default 1). Do not set ``MAX_PER_KIND=1`` globally; that would also
+    collapse concall vintages."""
+    try:
+        return max(1, int(os.environ.get("TRADINGCREW_REPORT_MAX_ANNUAL_REPORTS", "1")))
+    except ValueError:
+        return 1
+
+
+def _report_max_for_kind(kind: str) -> int:
+    if kind == "annual_report":
+        return _report_max_annual_reports()
+    return _report_max_per_kind()
+
+
+def _chunk_report_text(text: str, size: int) -> list:
+    """Split ``text`` into ``size``-char chunks. Every chunk is kept."""
+    if len(text) <= size:
+        return [text]
+    return [text[i : i + size] for i in range(0, len(text), size)]
+
+
+def _select_report_documents(documents: list, max_docs: int) -> list:
+    """Pick up to ``max_docs`` guidance-rich filings, DE-DUPED by URL and
+    DIVERSIFIED across kinds, keeping the source's (reverse-chronological) order
+    within each kind so the newest filing of each kind is preferred.
+
+    Two passes:
+      1. take up to ``_report_max_for_kind()`` of each kind in priority order
+         (concall → earnings → annual → quarterly → credit → announcement), so
+         the budget is spread across kinds instead of being consumed by a name
+         with dozens of near-identical concalls. Annual reports default to 1
+         (the newest); concalls keep the shared per-kind cap.
+      2. if slots remain, back-fill with leftover filings in the same
+         priority order. ``_try_add`` still enforces the per-kind cap, so
+         older annual reports cannot consume leftover slots.
+
+    De-duping is by URL (a screener feed routinely lists the SAME concall PDF
+    under several dated titles — without this the doc budget is wasted on
+    repeats and the annual report / credit rating never gets read)."""
+    selected: list = []
+    seen_urls: set = set()
+
+    def _try_add(d) -> bool:
+        url = (getattr(d, "url", "") or "").strip()
+        if not url or url in seen_urls:
+            return False
+        kind = getattr(d, "kind", "") or ""
+        already = sum(1 for s in selected if getattr(s, "kind", "") == kind)
+        if already >= _report_max_for_kind(kind):
+            return False
+        seen_urls.add(url)
+        selected.append(d)
+        return True
+
+    # Pass 1 — diversify: cap per kind.
+    for kind in _REPORT_DOC_PRIORITY:
+        taken = 0
+        cap = _report_max_for_kind(kind)
+        for d in documents:
+            if d.kind != kind:
+                continue
+            if taken >= cap:
+                break
+            if _try_add(d):
+                taken += 1
+                if len(selected) >= max_docs:
+                    return selected
+    # Pass 2 — back-fill remaining budget with leftovers (still priority order).
+    for kind in _REPORT_DOC_PRIORITY:
+        for d in documents:
+            if d.kind == kind and _try_add(d):
+                if len(selected) >= max_docs:
+                    return selected
+    return selected
+
+
+# A doc shorter than this is fed to the REDUCE step verbatim; anything larger
+# is condensed by the MAP step first.  This is deliberately DECOUPLED from the
+# (much larger) chunk size: with a big chunk a typical filing is a single map
+# call, but if we let a whole 250k-char filing through raw, several such docs
+# would blow past the LLM context window in the reduce prompt.  Keeping the
+# raw-passthrough small bounds the reduce input regardless of chunk size.
+_REPORT_RAW_PASSTHROUGH_CHARS = 8000
+
+
+def _map_reduce_report_doc(llm, name: str, ticker: str, doc: dict) -> str:
+    """Condense ONE (possibly huge) filing into a compact extract without a
+    head-only truncation.
+
+    A small filing is returned as-is (the reduce step reads it whole).  A larger
+    filing is chunked and each chunk is summarised extractively (map); the
+    concatenated per-chunk extracts become the doc's condensed representation,
+    so the whole document — not just its head — feeds the final consolidation.
+    With a large chunk size a typical filing is a single map call, yet the
+    reduce input stays bounded because only SMALL docs bypass the map step.
+    """
+    content = doc["content"]
+    chunk_size = _report_doc_chars()
+    if len(content) <= _REPORT_RAW_PASSTHROUGH_CHARS:
+        return content
+    chunks = _chunk_report_text(content, chunk_size)
+    logger.info(
+        "get_report_insights: mapping %d chunks (%d chars) for %s",
+        len(chunks), len(content), doc.get("url"),
+    )
+    notes: list[str] = []
+    for i, chunk in enumerate(chunks, 1):
+        prompt = _REPORT_MAP_PROMPT.format(
+            idx=i, total=len(chunks), title=doc["title"], kind=doc["kind"],
+            name=name, ticker=ticker, chunk=chunk,
+            url=doc.get("url") or "",
+        )
+        try:
+            raw = (llm.call(messages=[{"role": "user", "content": prompt}]) or "").strip()
+        except Exception as exc:  # noqa: BLE001 — a bad chunk must not kill the doc
+            logger.warning(
+                "get_report_insights: map chunk %d/%d failed for %s: %s",
+                i, len(chunks), doc["url"], exc,
+            )
+            continue
+        if raw and raw.strip().upper() != "NONE":
+            notes.append(raw)
+    # If every chunk came back empty/NONE (or all map calls failed), fall back
+    # to the head of the document so the reduce still has raw material to work
+    # with rather than nothing (bounded so the reduce prompt stays in-context).
+    return "\n".join(notes) if notes else content[:_REPORT_RAW_PASSTHROUGH_CHARS]
+
+
+def _summarize_report_docs(name: str, ticker: str, crawled: list) -> str:
+    """Consolidate the crawled filing texts into a guidance / target-vs-actual
+    digest via map-reduce: each big PDF is chunk-summarised (map) so nothing in
+    its tail is lost, then all condensed docs are consolidated into the
+    briefing (guidance, actuals, order book, risks/MD&A, credit).  PIT-aware:
+    when a cutoff is active the model is told to ignore anything dated after it.
+
+    Uses ``REPORT_PROCESS_*`` (not the desk preset / ``VLLM_LLM_*``). A
+    crawled item may already carry ``condensed`` from a prior unchanged
+    hash — those skip the map step.
+    """
+    from trading_crew._common import get_report_process_llm
+
+    try:
+        llm = get_report_process_llm(temperature=0.2)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("get_report_insights: report-process LLM unavailable: %s", exc)
+        return ""
+
+    blocks = []
+    for d in crawled:
+        condensed = (d.get("condensed") or "").strip()
+        if not condensed:
+            condensed = _map_reduce_report_doc(llm, name, ticker, d)
+            d["condensed"] = condensed
+        blocks.append(
+            f"URL: {d['url']}\nDOC TYPE: {d['kind']}\nTITLE: {d['title']}\n"
+            f"CONTENT:\n{condensed}"
+        )
+    prompt = (
+        _REPORT_INSIGHT_PROMPT.format(name=name, ticker=ticker)
+        + "\nSOURCES:\n"
+        + "\n\n---\n\n".join(blocks)
+    )
+    try:
+        from trading_crew.data_sources import pit
+
+        cutoff = pit.cutoff()
+    except Exception:  # noqa: BLE001
+        cutoff = None
+    if cutoff is not None:
+        as_of = cutoff.strftime("%Y-%m-%d")
+        prompt += (
+            f"\n\nPOINT-IN-TIME CONSTRAINT: Treat 'today' as {as_of}. IGNORE "
+            f"and do NOT report anything announced, published, or dated after "
+            f"{as_of}, even if it appears in the sources."
+        )
+    try:
+        raw = llm.call(messages=[{"role": "user", "content": prompt}])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("get_report_insights: reduce LLM call failed: %s", exc)
+        return ""
+    return (raw or "").strip()
+
+
+def _computed_trend_block(ticker: str, screener_quarters) -> str:
+    """Render the deterministic financial-trend signal block for ``ticker``.
+
+    Returns an empty string when nothing decisive can be computed OR when a
+    point-in-time backfill is active — the computed trends read CURRENT
+    quarterly numbers (screener/yfinance today), which are not point-in-time,
+    so including them in a historical decision would leak the future.
+    """
+    try:
+        from trading_crew.data_sources import pit as _pit
+
+        if _pit.is_backfill():
+            return ""
+    except Exception:  # noqa: BLE001 — absence of PIT context = live mode
+        pass
+    try:
+        from trading_crew import report_signals as _rs
+
+        signals = _rs.compute_financial_trend_signals(ticker, screener_quarters)
+        return _rs.render_computed_block(signals)
+    except Exception as exc:  # noqa: BLE001 — deterministic block is best-effort
+        logger.info("get_report_insights: computed trend block failed for %s: %s", ticker, exc)
+        return ""
+
+
+def _report_insights_cache_enabled() -> bool:
+    raw = os.environ.get("TRADINGCREW_REPORT_INSIGHTS_CACHE", "1")
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+# First ~3 PDF pages of extracted text — enough to detect a replaced
+# file at the same URL without paying for a full map-reduce.
+_REPORT_HEAD_HASH_CHARS = 12000
+
+
+def _report_insights_snapshot_path(ticker: str) -> Path:
+    root = Path(os.environ.get("TRADINGCREW_CACHE_DIR") or os.path.expanduser("~/.trading_crew"))
+    suffix = ""
+    try:
+        from trading_crew.data_sources import pit
+
+        if pit.is_backfill():
+            cutoff = pit.cutoff()
+            if cutoff is not None:
+                suffix = "_" + cutoff.strftime("%Y-%m-%d")
+    except Exception:  # noqa: BLE001 — live path has no PIT cutoff
+        pass
+    return root / "report_insights" / f"{ticker}{suffix}.json"
+
+
+def _report_catalog_entries(selected: list, resolve_url) -> list[dict]:
+    """Listing metadata for the selected filings (url + kind + title).
+
+    Screener embeds the filing date in the title (``24 Jun 2024`` or
+    ``15h``); EDGAR titles carry ``filed YYYY-MM-DD``. The raw title is
+    the website metadata — we do not rewrite relative dates to ``now``.
+    """
+    entries: list[dict] = []
+    for d in selected:
+        entries.append(
+            {
+                "url": resolve_url(d.url),
+                "kind": d.kind,
+                "title": d.title,
+            }
+        )
+    return entries
+
+
+def _report_catalog_fingerprint(entries: list[dict]) -> str:
+    payload = [
+        {"url": e.get("url") or "", "kind": e.get("kind") or "", "title": e.get("title") or ""}
+        for e in entries
+    ]
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _report_head_sha256(text: str) -> str:
+    head = (text or "")[:_REPORT_HEAD_HASH_CHARS]
+    if not head.strip():
+        return ""
+    return hashlib.sha256(head.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _report_same_head_hashes(entries: list[dict], prev_docs: list) -> bool:
+    prev = {
+        (d.get("url") or ""): (d.get("head_sha256") or "")
+        for d in prev_docs
+        if isinstance(d, dict)
+    }
+    now_urls = {e.get("url") or "" for e in entries}
+    if not now_urls or now_urls != set(prev):
+        return False
+    for e in entries:
+        sha = e.get("head_sha256") or ""
+        old = prev.get(e.get("url") or "") or ""
+        if not sha or not old or sha != old:
+            return False
+    return True
+
+
+def _load_report_insights_snapshot(ticker: str) -> Optional[dict]:
+    if not _report_insights_cache_enabled():
+        return None
+    path = _report_insights_snapshot_path(ticker)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("get_report_insights: snapshot read failed %s: %s", path, exc)
+        return None
+    if not isinstance(data, dict) or not (data.get("llm_body") or "").strip():
+        return None
+    return data
+
+
+def _store_report_insights_snapshot(ticker: str, payload: dict) -> None:
+    if not _report_insights_cache_enabled():
+        return
+    if not (payload.get("llm_body") or "").strip():
+        return
+    path = _report_insights_snapshot_path(ticker)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("get_report_insights: snapshot write failed %s: %s", path, exc)
+
+
+def _render_report_insights(
+    name: str,
+    canonical: str,
+    llm_body: str,
+    filings: list[dict],
+    computed_block: str,
+    source_tag: str,
+    how: str,
+) -> str:
+    read_list = "\n".join(
+        f"- [{d['kind']}] {d['title']} — {d['url']}" for d in filings
+    )
+    tagged_body = _retag_numeric_claims(
+        llm_body,
+        default_source=f"get_report_insights · {canonical}",
+        citations=filings,
+    )
+    parts = [
+        f"# Management guidance & filings — {name} ({canonical})",
+        "",
+        tagged_body,
+    ]
+    if computed_block:
+        parts.extend(["", computed_block])
+    parts.extend(
+        [
+            "",
+            "## Filings read (LLM-summarised primary sources)",
+            read_list,
+        ]
+    )
+    return "\n".join(parts) + _source_line(
+        f"{source_tag} ({how}, {len(filings)} filings) · {canonical}"
+    )
+
+
+def _fetch_one_report_doc(
+    index: int,
+    n_selected: int,
+    kind: str,
+    crawl_url: str,
+    fetch_doc,
+) -> tuple[int, Optional[str]]:
+    """Download + extract one filing. Safe to run on a worker thread."""
+    t0 = time.monotonic()
+    logger.info(
+        "get_report_insights: crawling %d/%d [%s] %s",
+        index, n_selected, kind, crawl_url,
+    )
+    try:
+        content = fetch_doc(crawl_url)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("get_report_insights: crawl failed for %s: %s", crawl_url, exc)
+        content = None
+    logger.info(
+        "get_report_insights: crawled %d/%d [%s] %d chars in %.1fs",
+        index, n_selected, kind, len((content or "").strip()), time.monotonic() - t0,
+    )
+    return index, content
+
+
+def _fetch_report_docs_parallel(selected, catalog, fetch_doc) -> list[tuple]:
+    """Extract every selected filing at once (annual reports are the slow ones).
+
+    Same HTTP + pdfplumber path as the sequential loop — only the wall-clock
+    overlaps. Returned rows stay in ``selected`` order.
+    """
+    n = len(selected)
+    if n == 0:
+        return []
+    logger.info("get_report_insights: extracting %d filings in parallel", n)
+    slots: list[Optional[str]] = [None] * n
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        futs = [
+            pool.submit(
+                _fetch_one_report_doc, i, n, d.kind, entry["url"], fetch_doc,
+            )
+            for i, (d, entry) in enumerate(zip(selected, catalog), 1)
+        ]
+        for fut in as_completed(futs):
+            index, content = fut.result()
+            slots[index - 1] = content
+    return [
+        (d, entry, entry["url"], slots[i])
+        for i, (d, entry) in enumerate(zip(selected, catalog))
+    ]
+
+
+@tool("get_report_insights")
+@_memoize_tool
+def get_report_insights(ticker: str) -> str:
+    """Read the company's OWN primary filings — concall / earnings-call
+    transcripts, investor presentations, annual reports and credit-rating
+    rationales — and extract MANAGEMENT GUIDANCE, TARGET-vs-ACTUAL delivery,
+    reported actuals, order book / operations, MD&A risks, and credit.
+
+    The digest LEADS with a Firefly-style **REPORT TREND SIGNALS** card —
+    directional, confidence-scored signals derived only from the filings and
+    (where the sources allow) compared latest-vs-prior period so they read as
+    TRENDS, not snapshots: OUTLOOK_TONE (bullish/cautious/defensive),
+    REVENUE_GUIDANCE (raised/maintained/cut), MARGIN_GUIDANCE, DELIVERY_TRACK_
+    RECORD (beat/in-line/miss), DEMAND_MOMENTUM, CREDIT_TRAJECTORY, and a
+    synthesised NET_GUIDANCE_BIAS (positive/neutral/negative). Each signal is a
+    single line: ``SIGNAL | NAME | DIRECTION | conf=0.00-1.00 | rationale
+    [source: url]`` — the desk's headline, actionable read.
+
+    Why this exists
+    ---------------
+    The fundamentals desk reads restated ratio tables; nothing else in the
+    workflow reads the primary filings where management commits to explicit
+    forward targets (revenue / margin / order-book / capex guidance) and where
+    a prior target can be checked against what was actually delivered.  That is
+    exactly the "target / target-vs-actual" signal missing from predictions.
+
+    How it works
+    ------------
+    Market-aware.  For Indian (NSE/BSE) names the dated primary-filing feed is
+    screener.in's ``#documents`` list (concalls, annual reports, credit
+    ratings).  For US (SEC-registered) names it is **SEC EDGAR** — the official,
+    free, keyless submissions feed: 10-K / 10-Q annual & quarterly reports
+    (MD&A / outlook) and earnings 8-Ks (item 2.02 — results + guidance press
+    releases, whose numbers live in the Exhibit 99.1 we resolve to before
+    crawling).      Either way the tool selects the most guidance-rich recent
+    filings (newest annual report only — prior years are already inside it;
+    multiple concalls for guidance vintages), downloads those PDFs over HTTP
+    in parallel (no Firecrawl), extracts text and tables from every page of
+    each filing, and LLM-summarises the WHOLE document in context-sized
+    chunks (map-reduce) so broader briefing (actuals, order book, risks)
+    is kept, not dropped.  Point-in-time-safe:
+    filings are date-filtered to on/before the decision cutoff and the
+    summariser is told to ignore anything dated after it.
+
+    Reprocessing is change-gated, not day-gated: the listing metadata
+    (url + title + kind, which carry the website filing date) is compared
+    to the last snapshot. Unchanged listing → reuse the digest. If titles
+    drift but the URL set is the same, the first pages are hashed and
+    compared; only changed filings are mapped again.     The map-reduce LLM
+    is ``REPORT_PROCESS_*`` from the environment.
+
+    For names in neither feed (e.g. a London / HK listing) the tool returns a
+    short not-available note and the desk leans on get_forward_estimates /
+    get_analyst_recommendations.
+    """
+    canonical = resolve_ticker(ticker)
+
+    # Route to the market's primary-filing feed.  ``docs`` is a uniform list of
+    # DocumentLink; ``resolve_url`` maps a link to the URL to actually crawl
+    # (identity for screener; earnings-8-K -> Ex-99.1 press release for EDGAR);
+    # ``source_tag`` names the provenance on the final source line.  ``name`` is
+    # taken from whichever feed we land on (so the no-feed path stays offline).
+    resolve_url = lambda u: u  # noqa: E731 — trivial default (screener path)
+    # Deterministic financial-trend signals are computed from hard quarterly
+    # numbers and appended to the digest.  For Indian names we reuse the
+    # screener ``#quarters`` table fetched here (no extra request); otherwise
+    # the computer reads yfinance.  ``screener_quarters`` stays None off the
+    # screener path so the computer falls through to yfinance.
+    screener_quarters = None
+    if _screener_available_for(canonical):
+        try:
+            page = screener_source.fetch_company(canonical)
+        except (ScreenerRateLimitError, ScreenerNotFoundError, ScreenerError) as exc:
+            return (
+                f"Report insights unavailable — screener.in fetch failed for "
+                f"{canonical}: {exc}."
+                + _source_line(f"Report insights (screener fetch failed, {canonical})")
+            )
+        name = get_market_profile(canonical).long_name or canonical
+        # PIT-filter (drops filings published after the cutoff in backfill).
+        docs = screener_source.pit_filter_documents(page.documents)
+        screener_quarters = page.quarters
+        source_kinds = "concalls / annual reports / credit ratings"
+        source_tag = "screener.in #documents"
+    elif sec_edgar_source.is_edgar_ticker(canonical):
+        try:
+            company = sec_edgar_source.fetch_filings(canonical)
+        except (EdgarRateLimitError, EdgarNotFoundError, EdgarError) as exc:
+            return (
+                f"Report insights unavailable — SEC EDGAR fetch failed for "
+                f"{canonical}: {exc}."
+                + _source_line(f"Report insights (EDGAR fetch failed, {canonical})")
+            )
+        company = sec_edgar_source.pit_filter_documents(company)
+        name = company.name or canonical
+        docs = sec_edgar_source.to_document_links(company)
+        resolve_url = sec_edgar_source.resolve_text_url
+        source_kinds = "10-K / 10-Q reports & earnings 8-Ks"
+        source_tag = "SEC EDGAR"
+    else:
+        # No primary-filing feed — but the deterministic financial-trend
+        # signals only need quarterly numbers (yfinance), so surface those
+        # rather than a bare not-available note.
+        computed_block = _computed_trend_block(canonical, None)
+        note = (
+            f"Report insights read a company's OWN primary filings — sourced from "
+            f"screener.in for Indian (NSE/BSE) names and SEC EDGAR for US names. "
+            f"{canonical} is in neither feed, so no primary filings (annual / "
+            f"quarterly reports, earnings releases, concalls) are available here "
+            f"— rely on get_forward_estimates and get_analyst_recommendations for "
+            f"the forward/guidance view."
+        )
+        if computed_block:
+            note = f"{computed_block}\n\n{note}"
+        return note + _source_line(
+            f"Report insights (no filing feed for {canonical}; computed trends only)"
+            if computed_block
+            else f"Report insights (n/a — no filing feed for {canonical})"
+        )
+
+    # Deterministic financial-trend card (hard numbers) — appended to every
+    # remaining return so a US name whose filings won't crawl still ships the
+    # revenue/earnings/margin trend read.
+    computed_block = _computed_trend_block(canonical, screener_quarters)
+
+    if not docs:
+        body = (
+            f"No dated primary filings ({source_kinds}) available for {name} "
+            f"({canonical}) at this point in time."
+        )
+        if computed_block:
+            body = f"{computed_block}\n\n{body}"
+        return body + _source_line(f"Report insights (no filings, {canonical})")
+
+    selected = _select_report_documents(docs, _report_max_docs())
+    catalog = _report_catalog_entries(selected, resolve_url)
+    catalog_fp = _report_catalog_fingerprint(catalog)
+    prev = _load_report_insights_snapshot(canonical)
+
+    if (
+        prev
+        and prev.get("catalog_fp") == catalog_fp
+        and prev.get("filings")
+    ):
+        logger.info("get_report_insights: catalog-hit for %s (no crawl / LLM)", canonical)
+        return _render_report_insights(
+            name, canonical, prev["llm_body"], prev["filings"],
+            computed_block, source_tag, "catalog-hit, digest reused",
+        )
+
+    from trading_crew.data_sources import web_research
+
+    # Screener filings are BSE/NSE PDFs. Local HTTP + pdfplumber, whole
+    # document (text + tables on every page). No Firecrawl. SEC EDGAR
+    # gates the shared crawler (403), so those docs use its client.
+    if source_tag == "SEC EDGAR":
+        def _fetch_doc(u: str) -> str:
+            return sec_edgar_source.fetch_document_text(u, max_chars=None)
+    else:
+        def _fetch_doc(u: str) -> str:
+            return web_research.crawl(
+                u,
+                crawler="http",
+                max_chars=None,
+                extract_tables_pages=None,
+                timeout=300,
+            )
+
+    crawled: list[dict] = []
+    for d, entry, crawl_url, content in _fetch_report_docs_parallel(
+        selected, catalog, _fetch_doc,
+    ):
+        # Skip near-empty crawls (a gated/blocked PDF often returns a ~100-char
+        # cover stub) so a junk fetch doesn't consume a doc slot / dilute the
+        # summary with nothing.
+        if content and len(content.strip()) >= _REPORT_MIN_DOC_CHARS:
+            entry["head_sha256"] = _report_head_sha256(content)
+            crawled.append(
+                {
+                    "title": d.title,
+                    "url": crawl_url,
+                    "kind": d.kind,
+                    "content": content,
+                    "head_sha256": entry["head_sha256"],
+                }
+            )
+        elif content and content.strip():
+            logger.info(
+                "get_report_insights: skipping near-empty crawl (%d chars) for %s",
+                len(content.strip()), crawl_url,
+            )
+
+    if not crawled:
+        listed = "\n".join(
+            f"- [{d.kind}] {d.title} — {resolve_url(d.url)}" for d in selected
+        )
+        body = (
+            f"Could not extract text from the available filings (the crawler "
+            f"returned nothing — the links may be gated or a crawler key unset). "
+            f"Filings on record:\n{listed}"
+        )
+        if computed_block:
+            body = f"{computed_block}\n\n{body}"
+        return (
+            f"# Primary filings — {name} ({canonical})\n\n{body}"
+            + _source_line(f"Report insights (crawl empty, {canonical})")
+        )
+
+    prev_docs = (prev or {}).get("docs") or []
+    prev_by_url = {
+        (p.get("url") or ""): p
+        for p in prev_docs
+        if isinstance(p, dict)
+    }
+    if prev and (prev.get("llm_body") or "").strip() and _report_same_head_hashes(catalog, prev_docs):
+        logger.info("get_report_insights: head-hash-hit for %s (skip LLM)", canonical)
+        snapshot = {
+            "catalog_fp": catalog_fp,
+            "llm_body": prev["llm_body"],
+            "filings": [
+                {"kind": c["kind"], "title": c["title"], "url": c["url"]}
+                for c in crawled
+            ],
+            "docs": [
+                {
+                    "url": c["url"],
+                    "kind": c["kind"],
+                    "title": c["title"],
+                    "head_sha256": c["head_sha256"],
+                    "condensed": (prev_by_url.get(c["url"]) or {}).get("condensed") or "",
+                }
+                for c in crawled
+            ],
+        }
+        _store_report_insights_snapshot(canonical, snapshot)
+        return _render_report_insights(
+            name, canonical, prev["llm_body"], snapshot["filings"],
+            computed_block, source_tag, "head-hash-hit, digest reused",
+        )
+
+    reused = 0
+    for c in crawled:
+        prior = prev_by_url.get(c["url"]) or {}
+        prior_sha = prior.get("head_sha256") or ""
+        prior_condensed = (prior.get("condensed") or "").strip()
+        if prior_sha and prior_sha == c.get("head_sha256") and prior_condensed:
+            c["condensed"] = prior_condensed
+            reused += 1
+    if reused:
+        logger.info(
+            "get_report_insights: reusing %d/%d unchanged filing extracts for %s",
+            reused, len(crawled), canonical,
+        )
+
+    logger.info(
+        "get_report_insights: map-reduce starting for %s (%d crawled docs)",
+        canonical, len(crawled),
+    )
+    summary = _summarize_report_docs(name, canonical, crawled)
+    if not summary:
+        return _render_report_insights(
+            name, canonical,
+            "(LLM summarisation was unavailable — see the primary filings listed "
+            "below and read them directly.)",
+            [{"kind": c["kind"], "title": c["title"], "url": c["url"]} for c in crawled],
+            computed_block, source_tag, "crawl, LLM unavailable",
+        )
+
+    filings = [{"kind": c["kind"], "title": c["title"], "url": c["url"]} for c in crawled]
+    _store_report_insights_snapshot(
+        canonical,
+        {
+            "catalog_fp": catalog_fp,
+            "llm_body": summary,
+            "filings": filings,
+            "docs": [
+                {
+                    "url": c["url"],
+                    "kind": c["kind"],
+                    "title": c["title"],
+                    "head_sha256": c.get("head_sha256") or "",
+                    "condensed": (c.get("condensed") or "").strip(),
+                }
+                for c in crawled
+            ],
+        },
+    )
+    return _render_report_insights(
+        name, canonical, summary, filings,
+        computed_block, source_tag, "crawl + LLM-summarise",
+    )
+
+
 @tool("get_fundamentals")
 @_memoize_tool
 def get_fundamentals(ticker: str) -> str:
@@ -942,7 +2582,23 @@ def get_fundamentals(ticker: str) -> str:
     pros/cons, all wrapped with an inline ``[source: <screener URL>]``
     tag.  Non-Indian tickers fall through to the yfinance path
     unchanged.
+
+    In a backfill ``AsOfContext`` the current fundamentals snapshot
+    (screener.in restated ratios / yfinance ``.info``) is **not**
+    point-in-time — it reflects today's restated figures, not what was
+    public as of the historical decision date — so it is deliberately
+    withheld to avoid leakage.  Dated primary sources (filings /
+    announcements via ``get_corporate_actions``) remain available and are
+    PIT-filtered.
     """
+    from trading_crew.data_sources import pit as _pit
+
+    if _pit.is_backfill():
+        return (
+            f"Point-in-time backfill: current fundamentals snapshot for {ticker} "
+            "withheld (restated figures are not as-of-safe). Rely on dated filings "
+            "and price/technical evidence for this historical decision."
+        ) + _source_line(f"PIT guard (as_of {_pit.cutoff().date() if _pit.cutoff() else 'n/a'})")
     if _screener_available_for(ticker):
         try:
             page = screener_source.fetch_company(ticker)
@@ -963,7 +2619,9 @@ def get_fundamentals(ticker: str) -> str:
         "debtToEquity", "freeCashflow", "totalRevenue",
         "earningsGrowth", "revenueGrowth", "dividendYield",
     ]
-    return json.dumps({k: info.get(k) for k in keys}, default=str, indent=2) + _source_line(
+    cite = f" [source: yfinance .info {ticker} (fundamentals)]"
+    lines = [f"{k}: {info.get(k)}{cite}" for k in keys]
+    return "\n".join(lines) + _source_line(
         f"yfinance .info {ticker} (fundamentals)"
     )
 
@@ -1007,7 +2665,8 @@ def get_balance_sheet(ticker: str) -> str:
     if _screener_available_for(ticker):
         return _render_indian_statement(ticker, "balance-sheet")
     return (
-        f"Balance sheet for {ticker} (latest period):\n"
+        f"Balance sheet for {ticker} (latest period) "
+        f"[source: yfinance balance_sheet {ticker} (latest period)]:\n"
         + _latest_column(yf.Ticker(ticker).balance_sheet)
         + _source_line(f"yfinance balance_sheet {ticker} (latest period)")
     )
@@ -1022,7 +2681,8 @@ def get_cashflow(ticker: str) -> str:
     if _screener_available_for(ticker):
         return _render_indian_statement(ticker, "cash-flow")
     return (
-        f"Cash flow for {ticker} (latest period):\n"
+        f"Cash flow for {ticker} (latest period) "
+        f"[source: yfinance cashflow {ticker} (latest period)]:\n"
         + _latest_column(yf.Ticker(ticker).cashflow)
         + _source_line(f"yfinance cashflow {ticker} (latest period)")
     )
@@ -1038,7 +2698,8 @@ def get_income_statement(ticker: str) -> str:
     if _screener_available_for(ticker):
         return _render_indian_statement(ticker, "profit-loss")
     return (
-        f"Income statement for {ticker} (latest period):\n"
+        f"Income statement for {ticker} (latest period) "
+        f"[source: yfinance income_stmt {ticker} (latest period)]:\n"
         + _latest_column(yf.Ticker(ticker).income_stmt)
         + _source_line(f"yfinance income_stmt {ticker} (latest period)")
     )
@@ -1485,40 +3146,125 @@ def get_macro_data(ticker: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 
-@tool("get_sector_peers")
-@_memoize_tool
-def get_sector_peers(ticker: str) -> str:
-    """Compare a ticker to its sector peers across YTD price return,
-    market cap, and trailing P/E.
+def _peer_returns(hist) -> Tuple[Optional[float], Optional[float]]:
+    """YTD and ~6-month percent returns from a daily Close series."""
+    if hist is None or getattr(hist, "empty", True) or "Close" not in hist:
+        return None, None
+    close = hist["Close"].dropna()
+    if close.empty:
+        return None, None
+    last = float(close.iloc[-1])
+    ytd: Optional[float] = None
+    try:
+        year = close.index[-1].year
+        ytd_close = close[close.index.year == year]
+        if len(ytd_close) >= 2:
+            ytd = (last / float(ytd_close.iloc[0]) - 1.0) * 100.0
+    except Exception:
+        ytd = None
+    ret_6m: Optional[float] = None
+    if len(close) >= 126:
+        ret_6m = (last / float(close.iloc[-126]) - 1.0) * 100.0
+    return ytd, ret_6m
 
-    Peer baskets come from :mod:`trading_crew.market_context` and now
-    include Indian (NSE) and other non-US clusters (shipbuilders,
-    Indian banks, Indian IT, oil & gas) on top of the original US
-    sets.  If no curated basket exists for the symbol we degrade
-    gracefully to a single-line "no peers configured" entry rather
-    than hide the gap.
+
+def _resolve_run_ticker(ticker: str) -> str:
+    """Use an explicit ticker, else the kickoff symbol on this run.
+
+    CrewAI marks ``ticker`` required even when the desk only wants the
+    default live screen (``{}`` or ``{peers: ""}``). That is a schema
+    mismatch, not a missing name — AXISBANK and BHARATFORG both burned
+    a tool turn this way. The blackboard / scratch pad already hold the
+    run symbol. An empty result is fail-closed: we do not invent a
+    ticker.
     """
-    canonical = resolve_ticker(ticker)
-    peers = peer_basket(canonical)
-    rows = ["Sector peer comparison:"]
-    for sym in peers:
-        t = yf.Ticker(sym)
-        hist = t.history(period="ytd")
-        if hist is None or hist.empty:
-            rows.append(f"- {sym}: no data")
-            continue
-        ytd = (hist["Close"].iloc[-1] / hist["Close"].iloc[0] - 1) * 100
-        try:
-            info = t.info or {}
-        except Exception:
-            info = {}
-        mcap = info.get("marketCap")
-        pe = info.get("trailingPE")
-        marker = "  <-- focus" if sym == canonical else ""
-        rows.append(f"- {sym}: YTD={ytd:+.2f}%, mcap={mcap}, PE={pe}{marker}")
-    return "\n".join(rows) + _source_line(
-        f"yfinance OHLCV + .info peer basket [{', '.join(peers)}] (YTD)"
+    written = (ticker or "").strip()
+    if written:
+        return written
+    try:
+        from trading_crew.agentic.graph.blackboard import current as bb_current
+
+        bb = bb_current()
+        if bb is not None and (bb.ticker or "").strip():
+            return bb.ticker.strip()
+    except Exception:
+        pass
+    try:
+        from trading_crew.agentic.graph.scratchpad import current as pad_current
+
+        pad = pad_current()
+        if pad is not None and (pad.ticker or "").strip():
+            return pad.ticker.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _fetch_peer_row(sym: str) -> PeerRow:
+    t = yf.Ticker(sym)
+    try:
+        hist = t.history(period="1y")
+    except Exception:
+        hist = None
+    ytd, ret_6m = _peer_returns(hist)
+    try:
+        info = t.info or {}
+    except Exception:
+        info = {}
+    raw_mcap = info.get("marketCap")
+    raw_pe = info.get("trailingPE")
+    try:
+        mcap = float(raw_mcap) if raw_mcap is not None else None
+    except (TypeError, ValueError):
+        mcap = None
+    try:
+        pe = float(raw_pe) if raw_pe is not None else None
+    except (TypeError, ValueError):
+        pe = None
+    return PeerRow(
+        symbol=sym,
+        ytd_pct=ytd,
+        ret_6m_pct=ret_6m,
+        market_cap=mcap,
+        pe=pe,
+        industry=str(info.get("industry") or "").strip(),
+        country=str(info.get("country") or "").strip(),
     )
+
+
+@_memoize_tool
+def _get_sector_peers_impl(ticker: str, peers: str = "") -> str:
+    canonical = resolve_ticker(ticker)
+    profile = get_market_profile(canonical)
+    universe = discover_peers(canonical, extra_peers=peers, profile=profile)
+    rows = [_fetch_peer_row(sym) for sym in universe.symbols]
+    body = format_peer_comparison(canonical, universe, rows)
+    return body + _source_line(
+        f"yfinance OHLCV + .info live peer screen "
+        f"[{', '.join(universe.symbols)}] method={universe.method}"
+    )
+
+
+@tool("get_sector_peers")
+def get_sector_peers(ticker: str = "", peers: str = "") -> str:
+    """Compare a ticker to a live industry universe (same country).
+
+    Always pass ``ticker`` (this run's symbol). ``peers`` is optional:
+    omit it for the live Yahoo industry + country screen. If that set
+    is the wrong industry or country, pass ``peers`` as space-separated
+    yfinance tickers you already saw in a filing or tool output. Do not
+    invent tickers.
+
+    The tool prints median YTD / 6m / PE and focus alpha vs the median.
+    Quote those lines — do not recompute them.
+    """
+    resolved = _resolve_run_ticker(ticker)
+    if not resolved:
+        return (
+            "get_sector_peers needs ticker. Pass ticker=<this run's symbol> "
+            "(the kickoff name). No peer screen was run."
+        )
+    return _get_sector_peers_impl(resolved, peers)
 
 
 # ---------------------------------------------------------------------------
@@ -1528,35 +3274,42 @@ def get_sector_peers(ticker: str) -> str:
 
 @tool("get_geopolitical_news")
 @_memoize_tool
-def get_geopolitical_news(ticker: str) -> str:
-    """Retrieve geopolitical news (tariffs, export controls, sanctions,
-    regulatory action, regional conflict) relevant to the ticker.
+def get_geopolitical_news(ticker: str, query: str = "") -> str:
+    """Retrieve geopolitical / regulatory news for the ticker.
 
-    The query is built dynamically from the ticker's country + industry
-    seeds — an Indian shipbuilder gets "Strait of Hormuz Red Sea naval
-    procurement" instead of the previous hard-coded "China Taiwan
-    export controls".
+    You write ``query`` (6-12 words) from get_market_context facts +
+    your remit (tariffs, export controls, sanctions, chokepoints that
+    actually apply to THIS country and industry) + any gap on the
+    blackboard. Example: ``Nutanix US China AI hardware export controls``.
+    There is no canned industry seed list.
     """
+    from trading_crew.market_context import compose_search_query
+
     canonical = resolve_ticker(ticker)
     profile = get_market_profile(canonical)
-    return _web_news(profile.geopolitical_query(), max_results=6)
+    return _web_news(
+        compose_search_query(profile, lens="geo", agent_query=query),
+        max_results=6,
+    )
 
 
 @tool("get_supply_chain_risk")
 @_memoize_tool
-def get_supply_chain_risk(ticker: str) -> str:
-    """Retrieve supply-chain and customer-concentration risk for a given
-    ticker — top customers, supplier dependencies, geographic revenue
-    concentration, and any disclosed concentration risks.
+def get_supply_chain_risk(ticker: str, query: str = "") -> str:
+    """Retrieve supply-chain and customer-concentration news.
 
-    Query terms are derived from the ticker's industry profile rather
-    than a single hard-coded "TSMC China dependency" string.  A semis
-    name still picks up TSMC + ASML; a shipbuilder picks up naval
-    contract pipeline + ship-insurance war-risk premia instead.
+    You write ``query`` from the brief + your remit (suppliers, OEMs,
+    shortages, concentration). Example:
+    ``Nutanix hardware appliance OEM NAND SSD shortage``.
     """
+    from trading_crew.market_context import compose_search_query
+
     canonical = resolve_ticker(ticker)
     profile = get_market_profile(canonical)
-    return _web_news(profile.supply_chain_query(), max_results=6)
+    return _web_news(
+        compose_search_query(profile, lens="supply", agent_query=query),
+        max_results=6,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1567,24 +3320,18 @@ def get_supply_chain_risk(ticker: str) -> str:
 @tool("get_market_context")
 @_memoize_tool
 def get_market_context(ticker: str) -> str:
-    """One-shot research brief for ``ticker`` — country, sector, peer
-    basket, macro basket, and country/industry news seeds.
+    """One-shot FACTS brief for ``ticker`` — country, sector, industry,
+    market cap, and country macro-ticker symbols.
 
-    Call this FIRST so downstream analyst queries are grounded in the
-    right country and industry.  The brief deliberately includes the
-    yfinance symbols of the macro basket and peers so subsequent tool
-    calls (``get_macro_data``, ``get_sector_peers``) hit the same
-    sources you cite in the analyst report.
-
-    For a non-US name the brief makes the country-specific themes
-    explicit (e.g. RBI policy, INR/USD, Strait of Hormuz, Make-in-India
-    defence orders for an Indian shipbuilder) so the news / macro
-    analysts don't fall back to US-centric defaults.
+    Call this FIRST, then WRITE your own 6-12 word search queries from
+    these facts + your desk remit + any gap. The brief does not ship a
+    canned Hormuz / TSMC / Fed phrase list, and it does not ship a
+    per-ticker peer dictionary — peers come from get_sector_peers.
     """
     canonical = resolve_ticker(ticker)
     profile = get_market_profile(canonical)
     return profile.to_brief() + _source_line(
-        f"yfinance .info {canonical} + curated profile"
+        f"yfinance .info {canonical}"
     )
 
 
@@ -1696,6 +3443,219 @@ def get_analyst_recommendations(ticker: str) -> str:
         f"high: {target_high}, low: {target_low}\n"
         f"- Recent rating distribution:\n{rec_text}"
         + _source_line(f"yfinance recommendations_summary {ticker}")
+    )
+
+
+def _gather_crowd_inputs(ticker: str):
+    """Fetch the crowd-positioning inputs for ``ticker`` from yfinance.
+
+    Returns ``(CrowdInputs, notes)``.  Each component is wrapped in its own
+    try/except so a missing feed simply omits that signal (honest absence,
+    never an invented value).  Shared by the ``get_crowd_positioning`` tool
+    and the episode-logging path in the runner.
+    """
+    from trading_crew.agentic.swarm.crowd import CrowdInputs
+
+    inputs = CrowdInputs()
+    notes: list[str] = []
+
+    # --- options: put/call ratio + IV skew ---------------------------------
+    try:
+        t = yf.Ticker(ticker)
+        expiries = t.options
+        if expiries:
+            expiry = expiries[0]
+            chain = t.option_chain(expiry)
+            spot = float(t.history(period="5d")["Close"].iloc[-1])
+            calls, puts = chain.calls, chain.puts
+            call_oi = int(calls["openInterest"].fillna(0).sum())
+            put_oi = int(puts["openInterest"].fillna(0).sum())
+            if call_oi > 0:
+                inputs.put_call_ratio = put_oi / call_oi
+                notes.append(f"put/call={inputs.put_call_ratio:.2f}")
+            atm_call = calls.iloc[(calls["strike"] - spot).abs().argsort()[:1]]
+            atm_put = puts.iloc[(puts["strike"] - spot).abs().argsort()[:1]]
+            call_iv = float(atm_call["impliedVolatility"].iloc[0])
+            put_iv = float(atm_put["impliedVolatility"].iloc[0])
+            inputs.iv_skew = put_iv - call_iv
+            notes.append(f"IV skew={inputs.iv_skew:+.2%}")
+    except Exception:  # noqa: BLE001 — missing options data is fine, just omit
+        pass
+
+    # --- insiders: net buy/sell ratio --------------------------------------
+    try:
+        t = yf.Ticker(ticker)
+        df = getattr(t, "insider_transactions", None)
+        if df is not None and len(df) > 0 and "Transaction" in df.columns:
+            txt = df["Transaction"].astype(str).str.lower()
+            buys = int(txt.str.contains("buy|purchase").sum())
+            sells = int(txt.str.contains("sale|sell").sum())
+            if buys + sells > 0:
+                inputs.insider_net_ratio = (buys - sells) / (buys + sells)
+                notes.append(f"insider net={inputs.insider_net_ratio:+.2f} ({buys}B/{sells}S)")
+    except Exception:  # noqa: BLE001
+        pass
+
+    # --- analysts: bullish fraction ----------------------------------------
+    try:
+        t = yf.Ticker(ticker)
+        rec = t.recommendations
+        if rec is not None and len(rec) > 0:
+            row = rec.iloc[0]
+            sb = float(row.get("strongBuy", 0) or 0)
+            b = float(row.get("buy", 0) or 0)
+            h = float(row.get("hold", 0) or 0)
+            s = float(row.get("sell", 0) or 0)
+            ss = float(row.get("strongSell", 0) or 0)
+            total = sb + b + h + s + ss
+            if total > 0:
+                inputs.analyst_bullish_frac = (sb + b) / total
+                notes.append(f"bullish analysts={inputs.analyst_bullish_frac:.0%}")
+    except Exception:  # noqa: BLE001
+        pass
+
+    return inputs, notes
+
+
+def crowd_signal_for(ticker: str):
+    """Return the full :class:`CrowdSignal` for ``ticker`` (or ``None`` when no
+    positioning data is available).
+
+    Uses the *learned* crowd weights when a fitted weights file exists (see
+    :mod:`trading_crew.agentic.swarm.crowd_fit`), otherwise the module default.
+    Used by the runner to stamp episodes with the crowd score **and** its
+    per-component breakdown at decision time.
+    """
+    from trading_crew.agentic.swarm.crowd import compute_crowd_signal
+    from trading_crew.agentic.swarm.crowd_fit import load_crowd_config
+
+    inputs, _notes = _gather_crowd_inputs(ticker)
+    signal = compute_crowd_signal(inputs, load_crowd_config())
+    return signal if signal.n_components > 0 else None
+
+
+def crowd_score_for(ticker: str):
+    """Return the fused crowd-positioning score for ``ticker`` (or ``None``
+    when no positioning data is available).  Thin wrapper used by the
+    runner to stamp episodes with the crowd regime at decision time."""
+    signal = crowd_signal_for(ticker)
+    return signal.score if signal is not None else None
+
+
+@tool("get_crowd_positioning")
+@_memoize_tool
+def get_crowd_positioning(ticker: str) -> str:
+    """Swarm-intelligence crowd-positioning read for a ticker.
+
+    Fuses three positioning signals into a single **crowding score** in
+    ``[-1, +1]`` (``+`` = the crowd is positioned *long / bullish*, ``-``
+    = *short / bearish*):
+
+    - Options put/call ratio + IV skew (downside-demand / fear).
+    - Net insider buying vs selling.
+    - The sell-side analyst rating distribution (buy-side herding).
+
+    Read it against your trade idea: siding *with* an already-crowded
+    consensus means a thinner marginal edge and higher unwind risk;
+    going *against* an extreme crowd is the contrarian probability-edge
+    play.  Only the components that have real data are used — missing
+    signals are omitted, never invented.
+    """
+    from trading_crew.agentic.swarm.crowd import compute_crowd_signal
+
+    inputs, notes = _gather_crowd_inputs(ticker)
+    signal = compute_crowd_signal(inputs)
+    src = _source_line(f"get_crowd_positioning({ticker}) yfinance options/insider/analyst")
+    if signal.n_components == 0:
+        return (
+            f"Crowd positioning for {ticker}: no positioning data available "
+            f"(no options / insider / analyst coverage)." + src
+        )
+    comp_lines = "\n".join(
+        f"  - {name}: {val:+.2f}" for name, val in sorted(signal.components.items())
+    )
+    return (
+        f"Crowd positioning for {ticker}:\n"
+        f"- Crowding score: {signal.score:+.2f} ({signal.label}, "
+        f"intensity {signal.intensity:.2f})\n"
+        f"- Inputs: {', '.join(notes)}\n"
+        f"- Component contributions ({signal.n_components} signals):\n{comp_lines}\n"
+        f"- Reading: a score near +1 = crowd is heavily long (thin edge for new longs); "
+        f"near -1 = crowd is heavily short (contrarian long may have edge)."
+        + src
+    )
+
+
+@tool("research_web")
+@_memoize_tool
+def research_web(query: str) -> str:
+    """Deep open-web research: search → crawl → LLM-summarize.
+
+    Unlike ``get_news`` (which returns ranked headline snippets), this runs
+    a full research pipeline for an arbitrary ``query``:
+
+    1. searches the open web: Vertex Gemini + Google Search first when
+       ``GEMINI_WEB_SEARCH=1``, otherwise (or on Gemini miss/error) the
+       SearXNG ring (websearch.sh / yahoo / optional google-headless),
+    2. crawls each page's main content (Firecrawl scrape → raw markdown),
+    3. consolidates the raw text into a concise, source-cited briefing via
+       the workflow's own LLM.
+
+    Use it when you need the *substance* of what sources say (e.g. "why did
+    <company> guidance disappoint in Q2", "read-through of the RBI policy
+    for auto lenders") rather than just a list of headlines.  Every claim
+    carries an inline ``[source: <URL>]`` tag; missing data is stated
+    plainly rather than invented.
+    """
+    from trading_crew.data_sources import pit, web_research
+
+    # PIT guard: crawled live web pages carry no reliable publish date and
+    # routinely contain post-decision information, so this pipeline is
+    # unsafe during a historical backfill.  Fail closed rather than leak.
+    if pit.is_backfill():
+        return (
+            f"Web research for {query!r}: skipped in point-in-time / backfill "
+            f"mode (crawled pages are not date-bounded). Use the dated news "
+            f"providers instead."
+        )
+
+    result = web_research.research_and_summarize(query, max_links=5)
+    src = _source_line(f"research_web({query!r}) search+crawl+summarize")
+    if not result.get("summary"):
+        status = result.get("status", "")
+        if status == "no_search_results":
+            reason = (
+                "the search backends returned nothing (likely rate-limited "
+                "or offline) — this is a search-infrastructure gap, not an "
+                "absence of news"
+            )
+        elif status == "crawl_blocked":
+            reason = (
+                "links were found but every page blocked the crawler, so no "
+                "content could be read"
+            )
+        else:
+            reason = "search or crawl returned nothing"
+        logger.warning("research_web empty for %r (status=%s)", query, status or "unknown")
+        return f"Web research for {query!r}: no usable sources — {reason}." + src
+    sources = "\n".join(
+        f"  - {s.get('title') or s.get('url')}: {s.get('url')}"
+        for s in result.get("sources", [])
+    )
+    citations = [
+        {"url": (s.get("url") or "").strip(), "kind": "", "title": s.get("title") or ""}
+        for s in (result.get("sources") or [])
+        if (s.get("url") or "").strip()
+    ]
+    briefing = _retag_numeric_claims(
+        result["summary"],
+        default_source=f"research_web({query!r}) search+crawl+summarize",
+        citations=citations,
+    )
+    return (
+        f"Web research briefing for {query!r} "
+        f"({result.get('n_crawled', 0)} sources crawled):\n\n"
+        f"{briefing}\n\nSources:\n{sources}" + src
     )
 
 
@@ -2368,70 +4328,95 @@ def rl_policy_recommendation(ticker: str, as_of: str = "") -> str:
     return _rl_policy_recommendation_impl(ticker, as_of)
 
 
-@tool("retrieve_past_episodes")
-def retrieve_past_episodes(ticker: str, as_of: str = "", k: int = 3) -> str:
-    """Return up to ``k`` past episodes for ``ticker`` that ended *before* ``as_of``.
+@tool("lookup_blackboard")
+def lookup_blackboard(ticker: str = "") -> str:
+    """Read a COMPACT evidence board: each desk's lean, a short TLDR, and
+    any filled evidence-request addenda.
 
-    Embargo-aware: any episode whose outcome timestamp is on or after the
-    current decision date is excluded so the analyst can never lean on
-    information that didn't exist at the time of the trade.  Each
-    returned episode includes the action taken, the regime tag, and the
-    realised return (if any) so the analyst can update on prior outcomes.
-
-    ``as_of`` defaults to today.  Use this tool ONCE per run, at the
-    start, to ground your analysis in the trader's actual track record
-    on this name.  Don't call it repeatedly — the corpus is small and
-    the same episodes will come back.
+    Full analyst reports are NOT dumped here — use read_scratchpad for the
+    shared debate history.  Call this when you need a lean snapshot of
+    desk leans / addenda.  ``ticker`` is ignored; the board is scoped to
+    the current kickoff.
     """
-    import os
-    from datetime import datetime
-    from pathlib import Path
-    from trading_crew.agentic.memory.embedding import make_memory
+    from trading_crew.agentic.graph.blackboard import current
 
-    cache_dir = os.environ.get("TRADINGCREW_CACHE_DIR") or os.path.expanduser("~/.trading_crew")
-    store_path = Path(cache_dir) / "memory" / "episodes.jsonl"
-    if not store_path.exists():
-        return "No past episodes recorded for any ticker yet."
-
-    as_of = as_of or datetime.utcnow().date().isoformat()
-    try:
-        mem = make_memory(store_path)
-        results = mem.retrieve(query=ticker, as_of=as_of, k=k, symbol=ticker)
-    except Exception as exc:
-        return f"Episodic memory unavailable: {exc}"
-
-    if not results:
+    bb = current()
+    if bb is None:
         return (
-            f"No prior episodes for {ticker} have cleared their outcome embargo "
-            f"as of {as_of} — this is the first traceable analysis or the "
-            "outcomes are still pending."
+            "No evidence blackboard is active for this run. Call "
+            "read_scratchpad for the shared debate pad."
         )
+    return bb.render_compact()
 
-    lines = [f"## Past episodes for {ticker} (embargoed as-of {as_of})"]
-    for r in results:
-        ep = r.episode
-        ap = ep.action_proposal or {}
-        action = ap.get("side") or ap.get("action") or "?"
-        weight = ap.get("target_weight")
-        size_str = f"{(weight * 100):+.1f}%" if isinstance(weight, (int, float)) else "?"
-        realised = ep.realised_return
-        realised_str = f"{realised * 100:+.2f}%" if isinstance(realised, (int, float)) else "pending"
-        # Reflections from L2 outcome-resolution carry a [tag | conf X.XX] prefix.
-        # We keep that prefix because it gives the agent a self-quantified
-        # confidence weight on the lesson (low conf ⇒ market noise, ignore).
-        reflection = (ep.reflection or "(no reflection yet)").strip()[:480]
-        alpha = ep.alpha_return
-        alpha_str = f" · α={alpha * 100:+.2f}%" if isinstance(alpha, (int, float)) else ""
-        mdd = ep.max_drawdown
-        mdd_str = f" · mdd={mdd * 100:+.2f}%" if isinstance(mdd, (int, float)) and mdd != 0 else ""
-        lines.append(
-            f"- **{ep.decision_ts[:10]}** · regime={ep.regime.value} · action={action} "
-            f"size={size_str} · realised={realised_str}{alpha_str}{mdd_str} · score={r.score:.2f}\n"
-            f"  lesson: {reflection}"
+
+@tool("read_scratchpad")
+def read_scratchpad(ticker: str = "") -> str:
+    """Read the shared bull/bear scratch pad for this run.
+
+    Contains compact analyst TLDRs, prior debate turns, and any live
+    notes the other side wrote.  Call this ONCE at the start of your
+    turn instead of waiting for a dumped discussion in context.
+    ``ticker`` is ignored; the pad is scoped to the current kickoff.
+    """
+    from trading_crew.agentic.graph.scratchpad import current
+
+    pad = current()
+    if pad is None:
+        return (
+            "No debate scratch pad is active for this run. Argue from "
+            "tools you call this turn."
         )
-    return "\n".join(lines) + _source_line(
-        f"Episodic memory (M3) {store_path.name} for {ticker} as-of {as_of}"
-    )
+    return pad.render()
+
+
+@tool("write_scratchpad")
+def write_scratchpad(note: str, author: str = "") -> str:
+    """Append a compact claim or tool finding to the shared scratch pad.
+
+    Use this for NEW evidence you just fetched (web search, news, event
+    proximity) so the other side can rebut it without a full redump.
+    Keep it to a few bullets.  Your finished 4-6-bullet turn is copied
+    onto the pad automatically when the task completes — do not paste
+    that whole turn here.
+
+    ``author`` should be ``bull`` or ``bear`` (whichever side you are).
+    """
+    from trading_crew.agentic.graph.scratchpad import current
+
+    pad = current()
+    if pad is None:
+        return "Rejected: no debate scratch pad is active."
+    body = (note or "").strip()
+    if not body:
+        return "Rejected: empty note."
+    pad.write_note(author or "debate", body)
+    return f"Scratch pad updated ({len(body)} chars). Opponent will see this on read_scratchpad."
+
+
+@tool("request_evidence")
+def request_evidence(target_desk: str, question: str, tool_name: str = "") -> str:
+    """Queue a bounded re-query of ONE analyst desk's tool.
+
+    Use when a claim in the debate hinges on a number or catalyst that
+    is missing or stale on the blackboard.  ``target_desk`` must be an
+    analyst key (market_analyst, news_analyst, fundamentals_analyst,
+    reports_analyst, macro_analyst).  ``tool_name`` must be owned by
+    that desk; omit it to use the desk's primary tool.
+
+    Hard cap: two requests per run.  The owning desk is re-queried
+    (tool only, no extra LLM) before the next debate round — then call
+    lookup_blackboard or read_scratchpad to read the addendum.  Do NOT
+    use this to start a new research saga.
+    """
+    from trading_crew.agentic.graph.blackboard import current
+
+    bb = current()
+    if bb is None:
+        return (
+            "Rejected: no evidence blackboard is active. Cite the analyst "
+            "reports you already have."
+        )
+    return bb.queue_request(target_desk, question, tool_name)
 
 
 # ---------------------------------------------------------------------------
@@ -2451,6 +4436,7 @@ ALL_TOOLS = {
     "get_cashflow": get_cashflow,
     "get_income_statement": get_income_statement,
     "get_shareholding_pattern": get_shareholding_pattern,
+    "get_report_insights": get_report_insights,
     "get_long_term_thesis": get_long_term_thesis,
     "get_macro_data": get_macro_data,
     "get_sector_peers": get_sector_peers,
@@ -2458,18 +4444,20 @@ ALL_TOOLS = {
     "get_supply_chain_risk": get_supply_chain_risk,
     "get_options_summary": get_options_summary,
     "get_analyst_recommendations": get_analyst_recommendations,
+    "get_crowd_positioning": get_crowd_positioning,
+    "research_web": research_web,
     "get_forward_estimates": get_forward_estimates,
     "get_event_proximity": get_event_proximity,
     "backtest_setup": backtest_setup,
-    "retrieve_past_episodes": retrieve_past_episodes,
-    "rl_policy_recommendation": rl_policy_recommendation,
+    "lookup_blackboard": lookup_blackboard,
+    "read_scratchpad": read_scratchpad,
+    "write_scratchpad": write_scratchpad,
+    "request_evidence": request_evidence,
 }
 
 # Default tool ownership per agent (mirrors crew.py wiring).
-# The M3 retrieve_past_episodes tool is wired to the market analyst (first
-# in the chain — grounds the rest of the debate) and the trader (whose
-# job is to translate the thesis into a position; past hits/misses help
-# calibrate the sizing recommendation).
+# Past-episode retrieval is not a live desk tool. Resolve investigates
+# the miss and Hermes applies the next experiment.
 #
 # ``get_market_context`` is wired to the analysts whose queries depend on
 # country/industry context (news, macro, geopolitical, sector) so they
@@ -2481,13 +4469,19 @@ DEFAULT_AGENT_TOOLS: dict[str, list[str]] = {
     "market_analyst": [
         "get_stock_data", "get_indicators",
         "get_options_summary", "get_analyst_recommendations",
-        "retrieve_past_episodes", "rl_policy_recommendation",
+        # Swarm-intelligence crowd/positioning read (options + insider +
+        # analyst crowding) so the desk can judge whether an idea sides
+        # with an over-crowded consensus or fades it.
+        "get_crowd_positioning",
     ],
     # News desk = catalysts + corporate actions + sentiment + insider
     # (was news + social).
     "news_analyst": [
         "get_market_context", "get_news", "get_global_news",
         "get_corporate_actions", "get_insider_transactions",
+        # Deep search→crawl→summarize research for catalysts the headline
+        # snippet tools miss (auto-skips in point-in-time/backfill mode).
+        "research_web",
     ],
     # Fundamentals desk = financials + long-term thesis + sector/peers
     # (was fundamentals + sector).
@@ -2513,6 +4507,20 @@ DEFAULT_AGENT_TOOLS: dict[str, list[str]] = {
         # Sector/peer relative strength (absorbed from the sector desk).
         "get_market_context", "get_sector_peers",
     ],
+    # Reports desk = the company's OWN primary filings (concall transcripts,
+    # investor decks, annual-report MD&A, credit-rating rationales) crawled +
+    # LLM-summarised into a management-guidance / target-vs-actual digest.
+    # Market-aware: screener.in #documents for Indian names, SEC EDGAR
+    # (10-K / 10-Q + earnings 8-Ks) for US names; names in neither feed get a
+    # not-available note so the desk defers to the forward-estimates read.
+    "reports_analyst": [
+        "get_report_insights",
+        # Country/industry brief so the desk frames guidance in context.
+        "get_market_context",
+        # Forward-consensus counterweight (works everywhere, including names
+        # with no primary-filing feed where get_report_insights returns n/a).
+        "get_forward_estimates",
+    ],
     # Macro desk = macro regime + geopolitical + supply-chain
     # (was macro + geopolitical).
     "macro_analyst": [
@@ -2527,5 +4535,43 @@ DEFAULT_AGENT_TOOLS: dict[str, list[str]] = {
     # The ``backtest_setup`` @tool and the standalone M6 walk-forward
     # engine (agentic/backtest/) remain available for the Backtest tab
     # and grid search — they are validation features, not decision inputs.
-    "trader": ["get_event_proximity", "retrieve_past_episodes", "rl_policy_recommendation"],
+    "trader": ["get_event_proximity"],
+    "risk_aggressive": [
+        "read_scratchpad", "write_scratchpad",
+        "research_web", "get_news", "get_event_proximity",
+        "get_stock_data", "get_fundamentals",
+        "get_options_summary",
+    ],
+    "risk_conservative": [
+        "read_scratchpad", "write_scratchpad",
+        "research_web", "get_news", "get_event_proximity",
+        "get_stock_data", "get_fundamentals",
+        "get_options_summary",
+    ],
+    "risk_neutral": [
+        "read_scratchpad", "write_scratchpad",
+        "research_web", "get_news", "get_event_proximity",
+        "get_stock_data", "get_fundamentals",
+        "get_options_summary",
+    ],
+    # Debate desks share a compact scratch pad (no full-report redump) and
+    # may fetch NEW evidence with a dynamic query, plus queue at most two
+    # request_evidence re-queries (hard-capped).
+    "bull_researcher": [
+        "read_scratchpad", "write_scratchpad",
+        "research_web", "get_news", "get_event_proximity",
+        "get_stock_data", "get_fundamentals",
+        "get_analyst_recommendations",
+        "request_evidence",
+    ],
+    "bear_researcher": [
+        "read_scratchpad", "write_scratchpad",
+        "research_web", "get_news", "get_event_proximity",
+        "get_stock_data", "get_fundamentals",
+        "get_analyst_recommendations",
+        "request_evidence",
+    ],
+    "research_manager": [
+        "read_scratchpad", "lookup_blackboard", "request_evidence",
+    ],
 }

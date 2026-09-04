@@ -2,9 +2,12 @@
 
 Layout note (post-consolidation)
 --------------------------------
-The analyst team was consolidated from eight narrow desks to FOUR wider
+The analyst team was consolidated from eight narrow desks to four wider
 ones (market+quant, news+social, fundamentals+sector, macro+geopolitical)
-to cut redundant LLM tool-loops and reduce information dilution.  The
+to cut redundant LLM tool-loops and reduce information dilution; a fifth
+desk — the Reports Analyst (primary-filing guidance / target-vs-actual) —
+was later added back deliberately, since nothing else reads the company's
+own concall / annual-report / rating filings.  The
 Quality Reviewer and Compliance Officer are now OPTIONAL (toggle-gated,
 default off) and, when enabled, run ASYNC as advisory inputs to the
 Portfolio Manager rather than as sequential gates in front of the
@@ -45,18 +48,97 @@ from .schemas import PortfolioDecision
 from .tools import ALL_TOOLS, DEFAULT_AGENT_TOOLS
 
 
-def _rlmf_prefix_enabled() -> bool:
-    """Return True iff ``TRADINGCREW_RLMF_ENABLED`` is truthy.
+# Desks whose job is to AGGREGATE / DECIDE on the evidence rather than to
+# generate diverse arguments.  These run near-deterministic (low temperature)
+# so the SAME upstream evidence yields the SAME call — the ~32% intra-day
+# BUY<->SELL flip was largely sampling noise at the aggregation step, not new
+# information.  Exploration temperature is retained for the analyst + bull/bear
+# + aggressive/conservative desks, where a diversity of angles is the point.
+_DECISION_AGENTS = {"research_manager", "trader", "risk_neutral", "portfolio_manager"}
 
-    The RLMF (Reinforcement-Learning from Market Feedback) few-shot
-    prefix is an experimental hook — we default it to OFF so a fresh
-    install with no resolved episodes doesn't quietly change PM
-    behaviour.  Operators can flip it on with
-    ``TRADINGCREW_RLMF_ENABLED=1`` once they have a case-book of
-    resolved decisions worth learning from.
-    """
-    raw = os.environ.get("TRADINGCREW_RLMF_ENABLED", "0")
+# Synthesis / aggregation desks: disable Qwen3 ``<think>`` (they consume
+# assembled evidence; a 10-minute monologue does not improve the call).
+# Analysts + bull/bear keep thinking so argument diversity stays intact.
+_SYNTHESIS_NO_THINK = {
+    "research_manager",
+    "trader",
+    "portfolio_manager",
+    "risk_aggressive",
+    "risk_neutral",
+    "risk_conservative",
+}
+
+# Desks that get CrewAI's plan-then-act-then-observe loop (``planning=True`` +
+# ``PlanningConfig``).  Only the SYNTHESIS / DECISION desks: they reason over
+# the assembled evidence, where an explicit plan + post-step observation
+# measurably helps.  We deliberately EXCLUDE the tool-heavy analysts (they
+# already ReAct through their tool loops, and adding a planner on top invites
+# the degraded-tool-loop failure mode this crew already fights) and the
+# bull/bear/risk debaters (their value is argument diversity, not planning).
+# Planning is internal to the agent, so it never enlarges downstream context.
+_PLANNING_AGENTS = {"research_manager", "trader", "portfolio_manager"}
+
+# agent_key → display role string (matches the workflow diagram's node ids and
+# the runner's role layout).  Used to tell the UI which tiles run ReAct.
+_PLANNING_AGENT_ROLES = {
+    "research_manager": "Research Manager",
+    "trader": "Trader",
+    "portfolio_manager": "Portfolio Manager",
+}
+
+
+def planning_agent_roles() -> list:
+    """Display role strings for the desks running ReAct-style planning RIGHT
+    NOW — empty when ``TRADINGCREW_DECISION_PLANNING`` is off.  Drives the UI's
+    ReAct tile badge so it reflects the live config, never a hardcoded guess."""
+    if not _planning_enabled():
+        return []
+    return [
+        role for key, role in _PLANNING_AGENT_ROLES.items() if key in _PLANNING_AGENTS
+    ]
+
+
+def _planning_enabled() -> bool:
+    """ReAct-style planning on the decision desks.  Batch job → default ON;
+    flip ``TRADINGCREW_DECISION_PLANNING=0`` to A/B or if a backend chokes on
+    the extra planner calls."""
+    raw = os.environ.get("TRADINGCREW_DECISION_PLANNING", "1")
     return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _make_planning_config():
+    """Build a ``PlanningConfig`` for the decision desks, or ``None`` if the
+    installed CrewAI doesn't expose it (defensive import — never a runtime
+    fallback that hides a misconfig)."""
+    try:
+        from crewai.agent.planning_config import PlanningConfig
+    except Exception:  # noqa: BLE001 — older CrewAI without the planner
+        return None
+    effort = (os.environ.get("TRADINGCREW_PLANNING_EFFORT", "low") or "low").strip().lower()
+    if effort not in ("low", "medium", "high"):
+        effort = "low"
+    kwargs: dict = dict(
+        reasoning_effort=effort,
+        # Caps keep a single name bounded even though the batch has no time
+        # limit: a planner that loops or hangs must not stall the whole collect.
+        max_replans=int(os.environ.get("TRADINGCREW_PLANNING_MAX_REPLANS", "2")),
+        step_timeout=int(os.environ.get("TRADINGCREW_PLANNING_STEP_TIMEOUT", "900")),
+    )
+    # Per-step PlannerObserver LLM call.  DEFAULT OFF: our OSS model can't emit
+    # CrewAI's nested ``StepObservation`` schema (``suggested_refinements`` must
+    # be ``[{step_number, new_description}]`` objects — the model returns bare
+    # strings / ``{step, action}`` dicts), so every observation fails schema
+    # validation, is retried 2-3×, and falls back to "continue as-is".  That's
+    # non-fatal (no tool re-run, no replan) but pure wasted tokens/latency at
+    # batch scale.  We keep the useful plan→act loop and drop the broken
+    # observe.  Flip ``TRADINGCREW_PLANNING_OBSERVE_STEPS=1`` only on a model
+    # that reliably produces structured observations.  Guarded so an older
+    # CrewAI without the field still constructs.
+    observe = os.environ.get("TRADINGCREW_PLANNING_OBSERVE_STEPS", "0")
+    observe_on = observe.strip().lower() not in ("0", "false", "no", "off", "")
+    if "observe_steps" in getattr(PlanningConfig, "model_fields", {}):
+        kwargs["observe_steps"] = observe_on
+    return PlanningConfig(**kwargs)
 
 
 @CrewBase
@@ -79,6 +161,7 @@ class TradingCrew:
         tools_enabled: Optional[Dict[str, List[str]]] = None,
         quality_review_enabled: bool = False,
         compliance_enabled: bool = False,
+        run_mode: str = "autonomous",
     ) -> None:
         self.ticker = ticker
         self.debate_rounds = debate_rounds
@@ -86,6 +169,13 @@ class TradingCrew:
         self._step_callback = step_callback
         self._task_callback = task_callback
         self._use_memory = memory
+        mode = (run_mode or "autonomous").strip().lower()
+        if mode == "deterministic":
+            self.run_mode = "deterministic"
+        elif mode == "harness":
+            self.run_mode = "harness"
+        else:
+            self.run_mode = "autonomous"
         # Optional advisory reviewers.  Default OFF so a normal run is
         # lean; when ON they run async and feed the PM (see @crew).
         self._quality_review_enabled = bool(quality_review_enabled)
@@ -93,7 +183,17 @@ class TradingCrew:
         # Per-agent tool whitelist. Falls back to DEFAULT_AGENT_TOOLS when an
         # agent key is missing — so an empty dict gets default behaviour.
         self._tools_enabled: Dict[str, List[str]] = tools_enabled or {}
-        self._llm = get_llm(temperature=0.3)
+        # Exploration temperature for the analyst / debate desks (diverse
+        # angles are wanted there).  Decision/synthesis desks (see
+        # ``_DECISION_AGENTS``) run at a near-zero temperature so the same
+        # evidence reproduces the same call — both env-overridable.
+        self._debate_temp = float(os.environ.get("TRADINGCREW_DEBATE_TEMPERATURE", "0.3"))
+        self._decision_temp = float(os.environ.get("TRADINGCREW_DECISION_TEMPERATURE", "0.0"))
+        # ReAct-style planning on the decision desks (resolved once per crew).
+        self._planning_enabled = _planning_enabled()
+        self._llm = get_llm(temperature=self._debate_temp)
+        self._decision_llm: object | None = None
+        self._risk_no_think_llm: object | None = None
         # Phase 2E — per-agent LLM cache.  We look up
         # ``LLM_PER_AGENT[agent_key]`` lazily and cache the result so
         # the same persona doesn't pay LLM-construction cost twice.
@@ -129,16 +229,38 @@ class TradingCrew:
         # otherwise return an instance that's identical to the global.
         from . import _common
         overrides = _common._load_per_agent_overrides().get(agent_key)
-        if not overrides:
-            return self._llm
-        if agent_key in self._llm_cache:
-            return self._llm_cache[agent_key]
-        llm = get_llm(temperature=0.3, agent_key=agent_key)
-        self._llm_cache[agent_key] = llm
-        return llm
+        if overrides:
+            if agent_key in self._llm_cache:
+                return self._llm_cache[agent_key]
+            # An explicit per-agent override wins outright (it may set its own
+            # temperature); the debate temp is only the starting default.
+            llm = get_llm(
+                temperature=self._debate_temp,
+                agent_key=agent_key,
+                disable_thinking=agent_key in _SYNTHESIS_NO_THINK,
+            )
+            self._llm_cache[agent_key] = llm
+            return llm
+        # No explicit override: decision/synthesis desks run near-deterministic;
+        # everyone else keeps the exploration temperature.
+        if agent_key in _DECISION_AGENTS:
+            if self._decision_llm is None:
+                self._decision_llm = get_llm(
+                    temperature=self._decision_temp,
+                    disable_thinking=True,
+                )
+            return self._decision_llm
+        if agent_key in _SYNTHESIS_NO_THINK:
+            if self._risk_no_think_llm is None:
+                self._risk_no_think_llm = get_llm(
+                    temperature=self._debate_temp,
+                    disable_thinking=True,
+                )
+            return self._risk_no_think_llm
+        return self._llm
 
     def _agent_kwargs(self, max_iter: int = 6, agent_key: str | None = None) -> dict:
-        return dict(
+        kwargs = dict(
             llm=self._llm_for(agent_key),
             allow_delegation=False,
             max_iter=max_iter,
@@ -149,6 +271,53 @@ class TradingCrew:
             respect_context_window=True,
             verbose=True,
         )
+        # ReAct-style plan/observe loop on the synthesis + decision desks only
+        # (internal to the agent — does not enlarge downstream context).
+        if agent_key in _PLANNING_AGENTS and self._planning_enabled:
+            pc = _make_planning_config()
+            if pc is not None:
+                kwargs["planning"] = True
+                kwargs["planning_config"] = pc
+        return kwargs
+
+    def _apply_harness(self, agents) -> None:
+        """Prepend the Hermes harness (strategy, open experiment, optional desk addendum)."""
+        from trading_crew.agentic.harness import apply_harness
+
+        apply_harness(agents, book="equity", run_mode=self.run_mode)
+
+    def materialize_agents(self) -> Dict[str, Agent]:
+        """Build stock-desk agents for the LangGraph scheduler (no sequential crew)."""
+        agents: Dict[str, Agent] = {
+            "market_analyst": self.market_analyst(),
+            "news_analyst": self.news_analyst(),
+            "fundamentals_analyst": self.fundamentals_analyst(),
+            "reports_analyst": self.reports_analyst(),
+            "macro_analyst": self.macro_analyst(),
+            "bull_researcher": self.bull_researcher(),
+            "bear_researcher": self.bear_researcher(),
+            "research_manager": self.research_manager(),
+            "trader": self.trader(),
+            "risk_aggressive": self.risk_aggressive(),
+            "risk_conservative": self.risk_conservative(),
+            "risk_neutral": self.risk_neutral(),
+            "portfolio_manager": self.portfolio_manager(),
+        }
+        if self._quality_review_enabled:
+            agents["quality_reviewer"] = self.quality_reviewer()
+        if self._compliance_enabled:
+            agents["compliance_officer"] = self.compliance_officer()
+        self._apply_harness(agents)
+        pm = Task(
+            config=self.tasks_config["pm_decision"],
+            agent=agents["portfolio_manager"],
+            output_pydantic=PortfolioDecision,
+            guardrail=confidence_guardrail,
+            guardrail_max_retries=2,
+        )
+        self._pm_task = pm
+        self._materialized = agents
+        return agents
 
     # =======================================================================
     # Agents — one @agent per persona, all read role/goal/backstory from yaml
@@ -176,7 +345,9 @@ class TradingCrew:
         return Agent(
             config=self.agents_config["news_analyst"],
             tools=self._tools_for("news_analyst"),
-            **self._agent_kwargs(max_iter=12, agent_key="news_analyst"),
+            # 6-tool budget now (added research_web); each tool call burns
+            # ~2 reasoning iterations, so give one extra pair of headroom.
+            **self._agent_kwargs(max_iter=14, agent_key="news_analyst"),
         )
 
     @agent
@@ -187,6 +358,17 @@ class TradingCrew:
             config=self.agents_config["fundamentals_analyst"],
             tools=self._tools_for("fundamentals_analyst"),
             **self._agent_kwargs(max_iter=12, agent_key="fundamentals_analyst"),
+        )
+
+    @agent
+    def reports_analyst(self) -> Agent:
+        # Primary-filing desk: reads the company's own concall transcripts /
+        # investor decks / annual-report MD&A / credit ratings for management
+        # guidance + target-vs-actual (3-tool budget; PDFs pre-summarised).
+        return Agent(
+            config=self.agents_config["reports_analyst"],
+            tools=self._tools_for("reports_analyst"),
+            **self._agent_kwargs(max_iter=8, agent_key="reports_analyst"),
         )
 
     @agent
@@ -203,15 +385,27 @@ class TradingCrew:
 
     @agent
     def bull_researcher(self) -> Agent:
-        return Agent(config=self.agents_config["bull_researcher"], **self._agent_kwargs(agent_key="bull_researcher"))
+        return Agent(
+            config=self.agents_config["bull_researcher"],
+            tools=self._tools_for("bull_researcher"),
+            **self._agent_kwargs(max_iter=12, agent_key="bull_researcher"),
+        )
 
     @agent
     def bear_researcher(self) -> Agent:
-        return Agent(config=self.agents_config["bear_researcher"], **self._agent_kwargs(agent_key="bear_researcher"))
+        return Agent(
+            config=self.agents_config["bear_researcher"],
+            tools=self._tools_for("bear_researcher"),
+            **self._agent_kwargs(max_iter=12, agent_key="bear_researcher"),
+        )
 
     @agent
     def research_manager(self) -> Agent:
-        return Agent(config=self.agents_config["research_manager"], **self._agent_kwargs(agent_key="research_manager"))
+        return Agent(
+            config=self.agents_config["research_manager"],
+            tools=self._tools_for("research_manager"),
+            **self._agent_kwargs(agent_key="research_manager"),
+        )
 
     # ---- Quality Reviewer -------------------------------------------------
 
@@ -233,15 +427,27 @@ class TradingCrew:
 
     @agent
     def risk_aggressive(self) -> Agent:
-        return Agent(config=self.agents_config["risk_aggressive"], **self._agent_kwargs(agent_key="risk_aggressive"))
+        return Agent(
+            config=self.agents_config["risk_aggressive"],
+            tools=self._tools_for("risk_aggressive"),
+            **self._agent_kwargs(max_iter=12, agent_key="risk_aggressive"),
+        )
 
     @agent
     def risk_neutral(self) -> Agent:
-        return Agent(config=self.agents_config["risk_neutral"], **self._agent_kwargs(agent_key="risk_neutral"))
+        return Agent(
+            config=self.agents_config["risk_neutral"],
+            tools=self._tools_for("risk_neutral"),
+            **self._agent_kwargs(max_iter=12, agent_key="risk_neutral"),
+        )
 
     @agent
     def risk_conservative(self) -> Agent:
-        return Agent(config=self.agents_config["risk_conservative"], **self._agent_kwargs(agent_key="risk_conservative"))
+        return Agent(
+            config=self.agents_config["risk_conservative"],
+            tools=self._tools_for("risk_conservative"),
+            **self._agent_kwargs(max_iter=12, agent_key="risk_conservative"),
+        )
 
     # ---- Compliance + PM --------------------------------------------------
 
@@ -283,6 +489,14 @@ class TradingCrew:
         )
 
     @task
+    def reports_task(self) -> Task:
+        return Task(
+            config=self.tasks_config["reports_task"],
+            agent=self.reports_analyst(),
+            async_execution=True,
+        )
+
+    @task
     def macro_task(self) -> Task:
         return Task(
             config=self.tasks_config["macro_task"],
@@ -300,15 +514,29 @@ class TradingCrew:
             self.market_task(),
             self.news_task(),
             self.fundamentals_task(),
+            self.reports_task(),
             self.macro_task(),
         ]
 
         # ---- Bull / Bear debate ------------------------------------------
+        # Same as v2: sequential process drains the async analyst batch
+        # at the first sync debate task. Debate prompts do NOT receive
+        # those reports (or prior rounds) as CrewAI context — they share
+        # a compact scratch pad and fetch new evidence with tools.
         bull_cfg = self.tasks_config["bull_round"]
         bear_cfg = self.tasks_config["bear_round"]
         debate_tasks: List[Task] = []
-        debate_ctx: List[Task] = list(analyst_tasks)
+        last_bull: Optional[Task] = None
+        last_bear: Optional[Task] = None
         for r in range(1, self.debate_rounds + 1):
+            # Round-1 prompts are independent openings (not a bear
+            # rebuttal). CrewAI Process.sequential will not let an async
+            # task take other async tasks as context unless a sync task
+            # sits between them. The five analysts are already an async
+            # batch, so marking bull/bear async (simultaneous openings)
+            # raises ValidationError at Crew() — that is what broke the
+            # NTNX run. Autonomous LangGraph runs the openings in
+            # parallel; this sequential crew keeps them sync.
             bull_t = Task(
                 description=bull_cfg["description"].format(
                     ticker=self.ticker, round_num=r, total_rounds=self.debate_rounds
@@ -317,7 +545,7 @@ class TradingCrew:
                     ticker=self.ticker, round_num=r, total_rounds=self.debate_rounds
                 ),
                 agent=self.bull_researcher(),
-                context=list(debate_ctx),
+                context=[],
             )
             bear_t = Task(
                 description=bear_cfg["description"].format(
@@ -327,30 +555,31 @@ class TradingCrew:
                     ticker=self.ticker, round_num=r, total_rounds=self.debate_rounds
                 ),
                 agent=self.bear_researcher(),
-                context=list(debate_ctx) + [bull_t],
+                context=[],
             )
             debate_tasks += [bull_t, bear_t]
-            debate_ctx += [bull_t, bear_t]
+            last_bull, last_bear = bull_t, bear_t
 
         # ---- Research Manager synthesis ----------------------------------
+        synthesis_ctx = [t for t in (last_bull, last_bear) if t is not None]
         research_synthesis = Task(
             config=self.tasks_config["research_synthesis"],
             agent=self.research_manager(),
-            context=list(debate_ctx),
+            context=synthesis_ctx,
         )
 
         # ---- Quality Review (optional, ASYNC advisory to the PM) ---------
         # When enabled we mark it ``async_execution=True`` and DO NOT wire
         # it into the trader's context.  It only depends on the research
-        # synthesis + debate, so it fans out in parallel with the
-        # trader/risk stretch and is awaited only by the PM (which lists
-        # it in context).  This keeps it off the critical path.
+        # synthesis, so it fans out in parallel with the trader/risk
+        # stretch and is awaited only by the PM (which lists it in
+        # context).  This keeps it off the critical path.
         quality_review: Optional[Task] = None
         if self._quality_review_enabled:
             quality_review = Task(
                 config=self.tasks_config["quality_review"],
                 agent=self.quality_reviewer(),
-                context=[research_synthesis] + list(debate_ctx),
+                context=[research_synthesis],
                 async_execution=True,
             )
 
@@ -358,7 +587,7 @@ class TradingCrew:
         trader_t = Task(
             config=self.tasks_config["trader_task"],
             agent=self.trader(),
-            context=[research_synthesis] + list(debate_ctx),
+            context=[research_synthesis],
         )
 
         # ---- Risk debate -------------------------------------------------
@@ -368,11 +597,10 @@ class TradingCrew:
         risk_tasks: List[Task] = []
         risk_ctx: List[Task] = [trader_t, research_synthesis]
         for r in range(1, self.risk_rounds + 1):
-            # Phase 2E — Aggressive and Conservative argue *independently*
-            # from the same prior context.  Marking both
-            # ``async_execution=True`` lets CrewAI dispatch them in
-            # parallel; the Neutral task lists both in its ``context`` so
-            # it still waits for both to complete before synthesising.
+            # Round 1: both wings are independent first thoughts (parallel).
+            # Round 2+: Conservative waits on this-round Aggressive so it
+            # can rebut — same contract as later bull→bear turns.
+            opening = r == 1
             aggr = Task(
                 description=aggr_cfg["description"].format(
                     round_num=r, total_rounds=self.risk_rounds
@@ -382,7 +610,7 @@ class TradingCrew:
                 ),
                 agent=self.risk_aggressive(),
                 context=list(risk_ctx),
-                async_execution=True,
+                async_execution=opening,
             )
             cons = Task(
                 description=cons_cfg["description"].format(
@@ -392,11 +620,8 @@ class TradingCrew:
                     round_num=r, total_rounds=self.risk_rounds
                 ),
                 agent=self.risk_conservative(),
-                # Independent from ``aggr`` — same prior context, no
-                # rebuttal dependency.  Saves one round-trip-time per
-                # risk round.
-                context=list(risk_ctx),
-                async_execution=True,
+                context=list(risk_ctx) if opening else list(risk_ctx) + [aggr],
+                async_execution=opening,
             )
             neut = Task(
                 description=neut_cfg["description"].format(
@@ -447,32 +672,13 @@ class TradingCrew:
             guardrail=confidence_guardrail,
             guardrail_max_retries=2,
         )
-        # RLMF prefix — inject a compact block of past wins-to-emulate
-        # and losses-to-avoid, ranked by realised market-alignment
-        # reward.  Gated by ``TRADINGCREW_RLMF_ENABLED`` so users on a
-        # cold cache (no resolved episodes yet) don't waste tokens on
-        # an empty prefix, and so a debugging user can A/B the effect
-        # by flipping it off.  Wired here (not in tasks.yaml) because
-        # the exemplar pool changes every run — a YAML string can't
-        # capture that.
-        if _rlmf_prefix_enabled():
-            try:
-                from trading_crew.agentic.rlmf import build_few_shot_pool
-                prefix = build_few_shot_pool(
-                    symbol=self.ticker,
-                    k_wins=int(os.environ.get("TRADINGCREW_RLMF_K_WINS", "3")),
-                    k_losses=int(os.environ.get("TRADINGCREW_RLMF_K_LOSSES", "2")),
-                )
-                if prefix:
-                    pm.description = f"{prefix}\n\n{pm.description}"
-            except Exception:
-                # RLMF is an experimental hook — never crash a workflow
-                # on a bad prefix build.  The regular prompt still runs.
-                import logging
-                logging.getLogger(__name__).warning(
-                    "RLMF prefix build failed; falling back to plain prompt",
-                    exc_info=True,
-                )
+        # Expose the PM task so the driver (runner) can append the
+        # deterministically-parsed reports-desk guidance ledger to its prompt
+        # once the reports tool has run — guaranteeing that signal reaches the
+        # decision even if the analyst's prose dropped it.  CrewAI reads
+        # ``task.description`` at execution time (PM runs last), so a mutation
+        # made mid-kickoff (before the PM node) takes effect.
+        self._pm_task = pm
 
         # Assemble the task list.  CrewAI's sequential process drains all
         # pending async futures at the next SYNC task, so an async task
@@ -500,6 +706,7 @@ class TradingCrew:
             self.market_analyst(),
             self.news_analyst(),
             self.fundamentals_analyst(),
+            self.reports_analyst(),
             self.macro_analyst(),
             self.bull_researcher(), self.bear_researcher(),
             self.research_manager(),
@@ -511,6 +718,8 @@ class TradingCrew:
         if compliance is not None:
             agents.append(self.compliance_officer())
         agents.append(self.portfolio_manager())
+
+        self._apply_harness(agents)
 
         crew_kwargs: dict = dict(
             agents=agents,

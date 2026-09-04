@@ -294,3 +294,24 @@ def test_proposal_to_order_returns_none_when_delta_rounds_to_zero():
     )
     order = proposal_to_order(p, state, reference_price=200.0)
     assert order is None
+
+
+def test_proposal_to_order_fractional_keeps_small_weight():
+    """With allow_fractional=True (research backtests), a small-but-valid
+    target weight that would round to zero shares under integer sizing still
+    compiles into a fractional order instead of a NO_DELTA no-op."""
+    state = _fresh_state(starting=100_000.0)
+    p = ActionProposal(
+        symbol="AAPL", decision_ts="2026-01-14T20:00:00+00:00",
+        side=ActionSide.BUY, target_weight=0.001, horizon_days=5,
+        conviction_score=0.0, conviction_tier=ConvictionTier.LOW,
+        expected_return_pct=0.0, rationale="tiny",
+        validity_check=ValidityCheck(
+            data_timestamps_valid=True, fits_risk_budget=True,
+            survives_transaction_costs=False, liquidity_sufficient=True,
+        ),
+    )
+    # 0.1% of $100k = $100 at ref 200 => 0.5 shares — kept, not rounded away.
+    order = proposal_to_order(p, state, reference_price=200.0, allow_fractional=True)
+    assert order is not None
+    assert order.qty_signed == pytest.approx(0.5)

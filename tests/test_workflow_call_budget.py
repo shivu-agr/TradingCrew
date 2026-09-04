@@ -34,9 +34,11 @@ def _roles(crew):
 def test_default_workflow_has_four_analyst_desks(monkeypatch):
     crew = _build(monkeypatch)
     roles = set(_roles(crew))
-    # The 4 merged desks — the single biggest call-reduction lever.
+    # The merged desks — the single biggest call-reduction lever.  The
+    # Reports Analyst (primary-filing guidance / target-vs-actual) was added
+    # back deliberately on top of the four merged desks.
     for desk in ("Market Analyst", "News Analyst",
-                 "Fundamentals Analyst", "Macro Analyst"):
+                 "Fundamentals Analyst", "Reports Analyst", "Macro Analyst"):
         assert desk in roles, f"missing merged desk {desk!r}"
     # The 4 old narrow desks must be gone.
     for removed in ("Social Analyst", "Geopolitical Analyst",
@@ -52,10 +54,10 @@ def test_default_workflow_excludes_optional_reviewers(monkeypatch):
 
 
 def test_default_task_count_is_lean(monkeypatch):
-    # 4 analysts + (2 debate rounds * 2) + research_synthesis + trader
-    # + (1 risk round * 3) + pm = 14 tasks.
+    # 5 analysts + (2 debate rounds * 2) + research_synthesis + trader
+    # + (1 risk round * 3) + pm = 15 tasks.
     crew = _build(monkeypatch)
-    assert len(crew.tasks) == 14
+    assert len(crew.tasks) == 15
 
 
 def test_pm_is_terminal_and_sync(monkeypatch):
@@ -70,10 +72,50 @@ def test_pm_is_terminal_and_sync(monkeypatch):
 
 def test_analyst_fan_out_is_async(monkeypatch):
     crew = _build(monkeypatch)
-    first_four = crew.tasks[:4]
-    assert all(t.async_execution for t in first_four), (
-        "The 4 analyst desks must fan out in parallel (async_execution)."
+    first_five = crew.tasks[:5]
+    assert all(t.async_execution for t in first_five), (
+        "Deterministic matches v2: the 5 analyst desks fan out (async_execution)."
     )
+
+
+def test_debate_is_sync_and_does_not_redump_reports(monkeypatch):
+    """Bull/bear cannot be async: CrewAI forbids an async task whose
+    context is the preceding async analyst batch (NTNX ValidationError).
+
+    Debate context stays empty — they share a scratch pad instead of
+    redumping the five analyst reports or prior rounds.
+    """
+    crew = _build(monkeypatch, debate_rounds=2)
+    debate = [
+        t for t in crew.tasks
+        if t.agent.role in ("Bullish Researcher", "Bearish Researcher")
+    ]
+    assert len(debate) == 4
+    assert all(not t.async_execution for t in debate)
+    analyst_desks = {
+        "Market Analyst", "News Analyst", "Fundamentals Analyst",
+        "Reports Analyst", "Macro Analyst",
+    }
+    def _ctx_roles(task):
+        raw = getattr(task, "context", None)
+        if not isinstance(raw, (list, tuple)):
+            return set()
+        return {c.agent.role for c in raw}
+
+    for t in debate:
+        ctx = _ctx_roles(t)
+        assert ctx.isdisjoint(analyst_desks), (
+            f"{t.agent.role} must not receive full analyst reports in context"
+        )
+        assert "Bullish Researcher" not in ctx
+
+    rm = next(t for t in crew.tasks if t.agent.role == "Research Manager")
+    rm_ctx = [c.agent.role for c in (rm.context or [])]
+    assert rm_ctx == ["Bullish Researcher", "Bearish Researcher"]
+
+    trader = next(t for t in crew.tasks if t.agent.role == "Trader")
+    trader_ctx = [c.agent.role for c in (trader.context or [])]
+    assert trader_ctx == ["Research Manager"]
 
 
 def test_reviewers_present_and_async_when_enabled(monkeypatch):
@@ -84,7 +126,7 @@ def test_reviewers_present_and_async_when_enabled(monkeypatch):
     assert "Quality Reviewer" in roles
     assert "Compliance Officer" in roles
     # +2 tasks over the lean default.
-    assert len(crew.tasks) == 16
+    assert len(crew.tasks) == 17
     # Both reviewers run async so they overlap each other before the PM.
     by_role = {t.agent.role: t for t in crew.tasks}
     assert by_role["Quality Reviewer"].async_execution
@@ -105,3 +147,30 @@ def test_quality_review_not_wired_into_trader(monkeypatch):
     pm = crew.tasks[-1]
     pm_ctx_roles = [c.agent.role for c in (pm.context or [])]
     assert "Quality Reviewer" in pm_ctx_roles
+
+
+def test_risk_opening_is_parallel_later_round_is_rebuttal(monkeypatch):
+    """Round-1 wings are independent first thoughts; later conservative
+    waits on this-round aggressive the way later bear waits on bull."""
+    crew = _build(monkeypatch, debate_rounds=1, risk_rounds=2)
+    wings = [
+        t for t in crew.tasks
+        if t.agent.role in (
+            "Aggressive Risk Analyst", "Conservative Risk Analyst",
+        )
+    ]
+    assert len(wings) == 4
+    r1_aggr, r1_cons, r2_aggr, r2_cons = wings
+
+    def _ctx_roles(task):
+        raw = getattr(task, "context", None)
+        if not isinstance(raw, (list, tuple)):
+            return set()
+        return {c.agent.role for c in raw}
+
+    assert r1_aggr.async_execution and r1_cons.async_execution
+    assert r1_aggr not in (r1_cons.context or [])
+    assert "Aggressive Risk Analyst" not in _ctx_roles(r1_cons)
+    assert not r2_aggr.async_execution
+    assert not r2_cons.async_execution
+    assert r2_aggr in (r2_cons.context or [])

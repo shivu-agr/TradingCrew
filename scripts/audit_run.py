@@ -85,18 +85,17 @@ def _runs_dir() -> Path:
 
 
 def _load_run(ticker: str, run_id: Optional[str]) -> Tuple[Dict[str, Any], Path]:
-    rdir = _runs_dir() / ticker.upper()
-    if not rdir.exists():
-        raise SystemExit(f"No runs directory for {ticker} at {rdir}")
-    if run_id:
-        path = rdir / f"{run_id}.json"
-    else:
-        candidates = sorted(rdir.glob("*.json"), reverse=True)
-        if not candidates:
-            raise SystemExit(f"No saved runs for {ticker} in {rdir}")
-        path = candidates[0]
-    with open(path) as f:
-        return json.load(f), path
+    # Run records live in ``prediction.db`` (the ``runs`` table); use the
+    # public API so any legacy on-disk runs are migrated on first read.
+    from trading_crew.agentic.runs import load_run, load_latest_run
+
+    record = (
+        load_run(run_id, ticker, full=True) if run_id else load_latest_run(ticker, full=True)
+    )
+    if not record:
+        raise SystemExit(f"No saved runs for {ticker} in prediction.db")
+    rid = record.get("run_id") or run_id or "latest"
+    return record, Path(f"prediction.db:runs/{ticker.upper()}/{rid}")
 
 
 def _classify_report(role: str, body: str, degraded_roles: Iterable[str]) -> str:

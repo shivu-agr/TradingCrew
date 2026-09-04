@@ -56,6 +56,18 @@ def test_valid_hold_with_zero_size_passes():
     assert ok is True
 
 
+def test_hold_with_watch_size_still_passes():
+    """Recommended Kelly size on HOLD must not trip the book-size guardrail."""
+    ok, out = _run(_decision(
+        action="HOLD",
+        size_pct_of_book=0.0,
+        recommended_size_pct=1.4,
+        watch_side="long",
+    ))
+    assert ok is True
+    assert out.size_pct_of_book == 0.0
+
+
 def test_hold_with_nonzero_size_rejected():
     """A HOLD with positive size is contradictory — the guardrail must
     catch it because both the M1 bridge and the UI badge would render

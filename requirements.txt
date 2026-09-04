@@ -1,16 +1,26 @@
 crewai>=1.14.0
+langgraph>=0.2.0
+langchain-core>=0.3.0
 python-dotenv>=1.0.0
 pydantic>=2.6.0
 pyyaml>=6.0
 yfinance>=0.2.0
 tavily-python>=0.3.0
 pandas>=2.0.0
+numpy>=1.24.0
 lxml>=5.0.0
 stockstats>=0.6.0
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
 websockets>=12.0
 python-multipart>=0.0.9
+httpx>=0.27.0
+# Vertex Gemini + Google Search grounding (research_web when GEMINI_WEB_SEARCH=1).
+google-genai>=1.0.0
+google-auth>=2.0.0
+requests>=2.31.0
+certifi>=2024.0.0
+pytest>=8.0.0
 # L4 RL training: PyTorch hosts the PPO actor-critic network +
 # optimiser. Numpy is already pulled in by pandas, so no separate pin
 # is needed.
@@ -28,4 +38,15 @@ torch>=2.0.0
 #   option-chain.  Authenticates via a 1-year analytics token; only
 #   loaded when ``UPSTOX_ANALYTICS_TOKEN`` is set.
 beautifulsoup4>=4.12.0
+# Local PDF parser for filing docs (concalls / annual reports / credit-rating
+# PDFs on screener / BSE / NSE, and PDF exhibits on SEC EDGAR).  Accuracy-first,
+# layout-aware text + table extraction — used since the hosted crawler
+# (Firecrawl) is not available.  Tables are rendered to markdown so quarterly
+# financials survive into the LLM prompt with their structure intact.
+pdfplumber>=0.11.0
 upstox-python-sdk>=2.28.0
+# Kafka pub-sub for workflow dispatch (and, later, web-search request/reply).
+# aiokafka is native-asyncio so producers/consumers run on the FastAPI event
+# loop alongside the SessionManager.  Broker is a local Redpanda (Kafka-API
+# compatible) started by scripts/redpanda.sh.
+aiokafka>=0.10.0

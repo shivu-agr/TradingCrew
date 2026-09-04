@@ -1,0 +1,31 @@
+Market-structure pattern classes (generic; not issuer-specific).
+
+Policy-driven tape
+A listed name can reprice when a rule, tariff, export control, subsidy, or
+industrial-policy instrument changes the cash it can earn — not because a
+headline exists, but because the instrument maps onto that issuer's country,
+product, customer, or input. Short-horizon work asks whether the instrument
+is already in the last print. Medium-horizon work asks implementation lag
+and second-round volume. Long-horizon work asks whether the policy resets
+the industry's return on capital.
+
+Related-party and circular capital
+Cash that leaves an issuer and returns through affiliates, promoters,
+captive customers, or layered vehicles can inflate revenue or support the
+share without new economic demand. Evidence is ownership overlap, unusual
+receivables, related-party footnotes, and buybacks funded by intra-group
+paper. Absence of a filing is not proof of absence; it is a coverage gap.
+
+Narrative versus cash-flow
+A popular story (category growth, platform shift, geopolitical winner) can
+outrun free cash flow, working-capital drain, or guidance quality. Short
+horizon: crowding and options skew. Medium: revision momentum versus
+reported cash conversion. Long: whether ROCE and reinvestment rates
+support the story after the narrative cools.
+
+Ownership and control webs
+Who can force a recap, a related-party deal, or a squeeze matters more than
+the headline float. Promoter pledges, state control, dual-class votes,
+and concentrated institutional blocks change both governance risk and
+the path of a drawdown. Treat an ownership map as a hypothesis to verify
+in filings and live search — do not invent a graph.

@@ -105,6 +105,9 @@ def test_memory_llm_is_noop_for_non_thinking_model():
         VLLM_LLM_MODEL="Qwen/Qwen2.5-7B-Instruct",
         VLLM_LLM_API_KEY="dummy",
         LLM_PROVIDER_PREFIX="hosted_vllm",
+        TRADINGCREW_MEMORY_LLM_LOCAL="0",
+        LOCAL_LLM_BASE_URL=None,
+        LOCAL_LLM_MODEL=None,
     ):
         llm_presets.clear_active()
         llm = get_memory_llm()
@@ -184,6 +187,55 @@ def test_max_tokens_zero_disables_cap():
         assert llm.max_tokens is None, (
             f"LLM_MAX_TOKENS={value} must disable the cap; got {llm.max_tokens!r}"
         )
+
+
+def test_get_llm_disable_thinking_for_qwen3():
+    from trading_crew import llm_presets
+    from trading_crew._common import get_llm
+
+    with _env(
+        VLLM_LLM_BASE_URL="http://localhost:8081/v1",
+        VLLM_LLM_MODEL="Qwen/Qwen3.8-27B",
+        VLLM_LLM_API_KEY="dummy",
+        LLM_PROVIDER_PREFIX="hosted_vllm",
+    ):
+        llm_presets.clear_active()
+        thinking = get_llm()
+        quiet = get_llm(disable_thinking=True)
+
+    assert getattr(thinking, "additional_params", None) in (None, {})
+    ap = quiet.additional_params or {}
+    kwargs = (ap.get("extra_body") or {}).get("chat_template_kwargs") or {}
+    assert kwargs.get("enable_thinking") is False
+
+
+def test_synthesis_desks_disable_thinking(monkeypatch):
+    monkeypatch.setenv("VLLM_LLM_BASE_URL", "http://localhost:8081/v1")
+    monkeypatch.setenv("VLLM_LLM_MODEL", "Qwen/Qwen3-32B")
+    monkeypatch.setenv("VLLM_LLM_API_KEY", "dummy")
+    monkeypatch.setenv("LLM_PROVIDER_PREFIX", "hosted_vllm")
+    monkeypatch.setenv("VLLM_EMBEDDING_BASE_URL", "https://example.com")
+    monkeypatch.setenv("VLLM_EMBEDDING_MODEL", "embeddinggemma-300m")
+    monkeypatch.setenv("VLLM_EMBEDDING_API_KEY", "abc")
+
+    from trading_crew import llm_presets
+    from trading_crew.crew import TradingCrew
+
+    llm_presets.clear_active()
+    tc = TradingCrew(ticker="NTNX", memory=False)
+    for key in (
+        "research_manager", "trader", "portfolio_manager",
+        "risk_aggressive", "risk_neutral", "risk_conservative",
+    ):
+        llm = tc._llm_for(key)
+        ap = getattr(llm, "additional_params", None) or {}
+        kwargs = (ap.get("extra_body") or {}).get("chat_template_kwargs") or {}
+        assert kwargs.get("enable_thinking") is False, key
+
+    bull = tc._llm_for("bull_researcher")
+    bull_ap = getattr(bull, "additional_params", None) or {}
+    bull_kwargs = (bull_ap.get("extra_body") or {}).get("chat_template_kwargs") or {}
+    assert bull_kwargs.get("enable_thinking") is not False
 
 
 def test_memory_llm_preserves_pre_existing_additional_params():

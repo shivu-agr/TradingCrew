@@ -31,12 +31,31 @@ import subprocess
 import threading
 import time
 import traceback
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _json_safe(obj: Any) -> Any:
+    """Sanitise a payload for ``JSONResponse`` (strict ``json.dumps``).
+
+    FastAPI's ``JSONResponse`` rejects non-finite floats (``ValueError: Out
+    of range float values are not JSON compliant: nan``) — which a NaN
+    ``realised_return`` / reward (unresolved or missing price) used to 500
+    the whole RLMF endpoint on every page load.  Non-finite floats become
+    ``None`` so the UI renders "—" instead of the tab failing to load.
+    """
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    return obj
 
 
 # ---------------------------------------------------------------------------
@@ -130,15 +149,15 @@ def list_episodes(
         )
     # Newest decisions first.
     rows.sort(key=lambda r: r["decision_ts"], reverse=True)
-    return {
+    return _json_safe({
         "total": len(eps),
         "counts": counts,
         "sample_count": sample_count,
         "returned": min(len(rows), limit),
-        "store_path": str(store),
-        "store_exists": store.exists(),
+        "store_path": str(mem.db_path),
+        "store_exists": mem.db_path.exists(),
         "episodes": rows[:limit],
-    }
+    })
 
 
 # Sample episodes are tagged with this episode_id prefix so they can be
@@ -213,7 +232,7 @@ def seed_sample_episodes(*, count: int = 12, symbol: str = "SAMPLE.NS") -> Dict[
             )
         )
         added += 1
-    return {"seeded": added, "symbol": sym, "store_path": str(store)}
+    return {"seeded": added, "symbol": sym, "store_path": str(mem.db_path)}
 
 
 def clear_sample_episodes() -> Dict[str, Any]:
@@ -221,15 +240,14 @@ def clear_sample_episodes() -> Dict[str, Any]:
     from trading_crew.agentic.memory import EpisodicMemory
 
     store = _episode_store_path()
-    if not store.exists():
-        return {"removed": 0}
     mem = EpisodicMemory(store)
-    all_eps = list(mem.all_episodes())
-    keep = [e for e in all_eps if not e.episode_id.startswith(SAMPLE_PREFIX)]
-    removed = len(all_eps) - len(keep)
-    if removed:
-        mem._rewrite(keep)
-    return {"removed": removed}
+    if not mem.db_path.exists():
+        return {"removed": 0}
+    sample_ids = [e.episode_id for e in mem.all_episodes()
+                  if e.episode_id.startswith(SAMPLE_PREFIX)]
+    for eid in sample_ids:
+        mem.remove(eid)
+    return {"removed": len(sample_ids)}
 
 
 def dataset_summary(*, symbol: Optional[str] = None) -> Dict[str, Any]:
@@ -238,11 +256,11 @@ def dataset_summary(*, symbol: Optional[str] = None) -> Dict[str, Any]:
 
     sym = (symbol or "").strip() or None
     rows = build_dataset(symbol=sym)
-    return {
+    return _json_safe({
         "symbol": sym,
         "summary": summarise_dataset(rows),
         "rows": [r.to_jsonl_dict() for r in rows],
-    }
+    })
 
 
 def export_dataset(*, symbol: Optional[str] = None) -> Dict[str, Any]:

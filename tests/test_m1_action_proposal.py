@@ -112,6 +112,29 @@ def test_conviction_score_and_tier_aligned_pass(score, tier):
     assert ap.conviction_tier == tier
 
 
+@pytest.mark.parametrize("score,expected", [
+    (0.0, ConvictionTier.LOW),
+    (0.329, ConvictionTier.LOW),
+    (0.33, ConvictionTier.MEDIUM),     # inclusive MEDIUM floor
+    (0.5, ConvictionTier.MEDIUM),
+    (0.659, ConvictionTier.MEDIUM),
+    (0.66, ConvictionTier.HIGH),       # inclusive HIGH floor
+    (1.0, ConvictionTier.HIGH),
+])
+def test_from_score_is_canonical_bucketing(score, expected):
+    """The shared bucketing must accept the boundary that used to break the
+    bridge (0.65/0.66) and be the exact inverse the validator checks."""
+    assert ConvictionTier.from_score(score) == expected
+    # A proposal built with that tier must validate (no 'implies' error).
+    side = ActionSide.BUY if score >= 0.33 else ActionSide.HOLD
+    weight = 0.05 if side == ActionSide.BUY else 0.0
+    ap = ActionProposal(**_kwargs(
+        side=side, target_weight=weight,
+        conviction_score=score, conviction_tier=expected,
+    ))
+    assert ap.conviction_tier == expected
+
+
 # ---------------------------------------------------------------------------
 # Field range validation (pydantic)
 # ---------------------------------------------------------------------------

@@ -1,0 +1,267 @@
+# =============================================================================
+# all200.txt - the daily forward-collection universe: 100 Indian (.NS) + 100
+# US names, sector-diversified. This is the default universe for the daily
+# scale run. Keep in sync with in100.txt / us100.txt;
+# this file is the concatenation of the two (comments/blank lines ignored by
+# trading_crew.agentic.scale._read_universe).
+# =============================================================================
+
+# #############################################################################
+# INDIA (NSE, .NS) - 100 names
+# #############################################################################
+
+# --- Financials (12) ---
+HDFCBANK.NS
+ICICIBANK.NS
+SBIN.NS
+KOTAKBANK.NS
+AXISBANK.NS
+INDUSINDBK.NS
+BAJFINANCE.NS
+BAJAJFINSV.NS
+SBILIFE.NS
+HDFCLIFE.NS
+ICICIPRULI.NS
+PNB.NS
+
+# --- Information Technology (8) ---
+TCS.NS
+INFY.NS
+HCLTECH.NS
+WIPRO.NS
+TECHM.NS
+LTIM.NS
+PERSISTENT.NS
+COFORGE.NS
+
+# --- Energy / Oil & Gas (6) ---
+RELIANCE.NS
+ONGC.NS
+IOC.NS
+BPCL.NS
+GAIL.NS
+OIL.NS
+
+# --- FMCG / Consumer Staples (9) ---
+HINDUNILVR.NS
+ITC.NS
+NESTLEIND.NS
+BRITANNIA.NS
+DABUR.NS
+TATACONSUM.NS
+GODREJCP.NS
+MARICO.NS
+COLPAL.NS
+
+# --- Automobiles (8) ---
+MARUTI.NS
+TATAMOTORS.NS
+M&M.NS
+BAJAJ-AUTO.NS
+EICHERMOT.NS
+HEROMOTOCO.NS
+TVSMOTOR.NS
+ASHOKLEY.NS
+
+# --- Pharma / Healthcare (9) ---
+SUNPHARMA.NS
+DRREDDY.NS
+CIPLA.NS
+DIVISLAB.NS
+APOLLOHOSP.NS
+LUPIN.NS
+AUROPHARMA.NS
+BIOCON.NS
+TORNTPHARM.NS
+
+# --- Metals / Mining (8) ---
+TATASTEEL.NS
+JSWSTEEL.NS
+HINDALCO.NS
+VEDL.NS
+COALINDIA.NS
+JINDALSTEL.NS
+NMDC.NS
+SAIL.NS
+
+# --- Infrastructure / Cement / Construction (6) ---
+LT.NS
+ULTRACEMCO.NS
+GRASIM.NS
+SHREECEM.NS
+AMBUJACEM.NS
+DLF.NS
+
+# --- Telecom (3) ---
+BHARTIARTL.NS
+IDEA.NS
+INDUSTOWER.NS
+
+# --- Power / Utilities (6) ---
+NTPC.NS
+POWERGRID.NS
+TATAPOWER.NS
+ADANIPOWER.NS
+ADANIGREEN.NS
+JSWENERGY.NS
+
+# --- Consumer Discretionary / Retail (10) ---
+TITAN.NS
+TRENT.NS
+DMART.NS
+ASIANPAINT.NS
+BERGEPAINT.NS
+PIDILITIND.NS
+HAVELLS.NS
+VOLTAS.NS
+PAGEIND.NS
+JUBLFOOD.NS
+
+# --- Chemicals (5) ---
+UPL.NS
+SRF.NS
+PIIND.NS
+DEEPAKNTR.NS
+TATACHEM.NS
+
+# --- Capital Goods / Defense / Diversified (6) ---
+ADANIENT.NS
+SIEMENS.NS
+ABB.NS
+BEL.NS
+HAL.NS
+BOSCHLTD.NS
+
+# --- New-age / Services (4) ---
+IRCTC.NS
+ZOMATO.NS
+NAUKRI.NS
+INDIGO.NS
+
+# #############################################################################
+# UNITED STATES (yfinance) - 100 names
+# #############################################################################
+
+# --- Information Technology (20) ---
+AAPL
+MSFT
+NVDA
+GOOGL
+META
+AVGO
+ORCL
+ADBE
+CRM
+CSCO
+ACN
+AMD
+INTC
+IBM
+QCOM
+TXN
+NOW
+INTU
+MU
+AMAT
+
+# --- Communication Services (5) ---
+NFLX
+DIS
+CMCSA
+T
+VZ
+
+# --- Consumer Discretionary (11) ---
+AMZN
+TSLA
+HD
+MCD
+NKE
+SBUX
+LOW
+BKNG
+TGT
+GM
+F
+
+# --- Consumer Staples (9) ---
+WMT
+PG
+KO
+PEP
+COST
+PM
+MO
+CL
+MDLZ
+
+# --- Financials (13) ---
+JPM
+BAC
+WFC
+GS
+MS
+C
+BLK
+SCHW
+AXP
+SPGI
+CB
+USB
+PYPL
+
+# --- Healthcare (13) ---
+UNH
+JNJ
+LLY
+PFE
+MRK
+ABBV
+TMO
+ABT
+DHR
+BMY
+AMGN
+GILD
+CVS
+
+# --- Energy (5) ---
+XOM
+CVX
+COP
+SLB
+PSX
+
+# --- Industrials (11) ---
+BA
+CAT
+GE
+HON
+UPS
+RTX
+LMT
+DE
+MMM
+UNP
+EMR
+
+# --- Materials (4) ---
+LIN
+SHW
+FCX
+NEM
+
+# --- Utilities (4) ---
+NEE
+DUK
+SO
+AEP
+
+# --- Real Estate (3) ---
+AMT
+PLD
+SPG
+
+# --- Payments (2) ---
+V
+MA

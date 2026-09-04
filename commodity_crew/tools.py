@@ -689,63 +689,6 @@ def get_commodity_geopolitical(ticker: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 6. Past episodes (shared with stock crew — embargo-aware retrieval)
-# ---------------------------------------------------------------------------
-
-
-@tool("retrieve_past_episodes_commodity")
-def retrieve_past_episodes_commodity(ticker: str, as_of: str = "", k: int = 3) -> str:
-    """Same outcome-embargo-aware retrieval as the stock crew; the
-    underlying episodic memory store is shared so cross-asset lessons
-    propagate (e.g. an inflation-driven gold trade can inform a
-    later silver trade).
-    """
-    import os as _os
-    from datetime import datetime as _dt2
-    from trading_crew.agentic.memory import EpisodicMemory
-
-    cache_dir = _os.environ.get("TRADINGCREW_CACHE_DIR") or _os.path.expanduser("~/.trading_crew")
-    store_path = Path(cache_dir) / "memory" / "episodes.jsonl"
-    if not store_path.exists():
-        return "No past episodes recorded yet." + _source_line(
-            "Episodic memory (M3) episodes.jsonl (not created yet)"
-        )
-
-    as_of = as_of or _dt2.utcnow().date().isoformat()
-    try:
-        from trading_crew.agentic.memory.embedding import make_memory
-        mem = make_memory(store_path)
-        results = mem.retrieve(query=ticker, as_of=as_of, k=k, symbol=ticker)
-    except Exception as exc:
-        return f"Episodic memory unavailable: {exc}" + _source_line(
-            "Episodic memory (M3) episodes.jsonl (load failed)"
-        )
-    if not results:
-        return f"No prior episodes for {ticker} cleared the embargo as-of {as_of}." + _source_line(
-            f"Episodic memory (M3) episodes.jsonl for {ticker} as-of {as_of}"
-        )
-
-    lines = [f"## Past episodes for {ticker} (embargoed as-of {as_of})"]
-    for r in results:
-        ep = r.episode
-        ap = ep.action_proposal or {}
-        action = ap.get("side") or ap.get("action") or "?"
-        weight = ap.get("target_weight")
-        size_str = f"{(weight * 100):+.1f}%" if isinstance(weight, (int, float)) else "?"
-        realised = ep.realised_return
-        realised_str = f"{realised * 100:+.2f}%" if isinstance(realised, (int, float)) else "pending"
-        reflection = (ep.reflection or "(no reflection yet)").strip()[:480]
-        lines.append(
-            f"- **{ep.decision_ts[:10]}** · regime={ep.regime.value} · action={action} "
-            f"size={size_str} · realised={realised_str} · score={r.score:.2f}\n"
-            f"  lesson: {reflection}"
-        )
-    return "\n".join(lines) + _source_line(
-        f"Episodic memory (M3) episodes.jsonl for {ticker} as-of {as_of}"
-    )
-
-
-# ---------------------------------------------------------------------------
 # RL policy advisor — same shape as the equity tool but lives under the
 # commodity_crew namespace so the asset-class tool registries stay clean.
 # Implementation just delegates to the equity tool's underlying logic,
@@ -784,8 +727,6 @@ ALL_TOOLS = {
     "get_cot_report": get_cot_report,
     "get_commodity_news": get_commodity_news,
     "get_commodity_geopolitical": get_commodity_geopolitical,
-    "retrieve_past_episodes_commodity": retrieve_past_episodes_commodity,
-    "rl_policy_recommendation_commodity": rl_policy_recommendation_commodity,
 }
 
 # Default tool ownership per commodity agent.
@@ -796,18 +737,14 @@ ALL_TOOLS = {
 # rather than re-querying data sources. The compliance officer optionally
 # uses geopolitical news to verify sanctions / route concerns.
 DEFAULT_AGENT_TOOLS: Dict[str, List[str]] = {
-    "market_analyst": ["get_commodity_ohlcv", "get_commodity_indicators",
-                       "retrieve_past_episodes_commodity",
-                       "rl_policy_recommendation_commodity"],
+    "market_analyst": ["get_commodity_ohlcv", "get_commodity_indicators"],
     "curve_analyst": ["get_futures_curve"],
     "inventories_analyst": ["get_commodity_news"],
     "supply_demand_analyst": ["get_commodity_news"],
     "macro_analyst": ["get_commodity_news"],
     "geopolitical_analyst": ["get_commodity_geopolitical", "get_commodity_news"],
     "quant_analyst": ["get_cot_report", "get_seasonality"],
-    "trader": ["get_futures_curve", "get_seasonality",
-               "retrieve_past_episodes_commodity",
-               "rl_policy_recommendation_commodity"],
+    "trader": ["get_futures_curve", "get_seasonality"],
     "compliance_officer": ["get_commodity_geopolitical"],
 }
 

@@ -40,12 +40,14 @@ window.HELP_CONTENT = {
   "tab.workflow": {
     section: "tabs",
     title: "Workflow",
-    short: "Live SVG diagram of every agent + the deterministic post-LLM pipeline (sizing, risk gates, simulator, episode write).",
+    short: "One view per name: live agent diagram + deterministic post-LLM pipeline. Click any agent tile to read that agent's output; the decision + trend-signal card sit below — all replayed from the saved run on reopen.",
     long: `
-The **Workflow** tab is the orchestration view. It shows the 18-agent (stock) or 17-agent (commodity) debate as a strict left-to-right pipeline, with one column per pipeline stage. Genuinely parallel agents (Bull/Bear debate, 3-analyst risk team) stack vertically inside a single column; every sequential hand-off gets its own column:
+The **Workflow** tab is the orchestration view. Stock and commodity both use a two-band flowchart (research on top, decision below) so Fit stays readable. Parallel desks (Bull/Bear, the three risk analysts) sit as a pair or stack; sequential hand-offs read left to right on the decision band.
 
 \`\`\`
-analysts (4×2 grid) → bullish / bearish → research mgr → quality reviewer → trader → risk team (3 stacked) → compliance → portfolio mgr → decision
+stock (autonomous):     Playbook → analysts fan-out → blackboard → bull + bear opening (parallel) → rebuttal cycles → RM → trader → risk → PM
+stock (deterministic):  v2 LTR pipeline — Analyst team → Researcher team → Trader → Risk → Compliance + PM → Decision
+commodity:              analysts → bull / bear → RM → quality reviewer → trader → risk → compliance → PM
 \`\`\`
 
 Wrapped around the LLM debate are three deterministic gates:
@@ -60,11 +62,11 @@ Wrapped around the LLM debate are three deterministic gates:
 - **running** — **cyan dashed line that flows** toward the destination (the stroke animation makes direction obvious)
 - **done** — solid green
 
-Tool chips below each agent light yellow on tool start and green on success.
+Tool chips overlay each agent tile and light yellow on tool start and green on success.
 
-**Zoom + pan.** The toolbar in the top-right has \`−\` / \`+\` / \`Fit\` / \`100%\` buttons. You can also hold **Ctrl + scroll** anywhere inside the diagram to zoom at the cursor; drag the scrollbars to pan when zoomed in. The current zoom level is shown as a percentage between \`−\` and \`+\`.
+**Zoom + pan.** The toolbar in the top-right has \`−\` / \`+\` / \`Fit\` / \`100%\` and a live **elapsed timer** for this run (ticks while queued/running; freezes at the final duration when the run ends). You can also hold **Ctrl + scroll** anywhere inside the diagram to zoom at the cursor; drag the scrollbars to pan when zoomed in. The current zoom level is shown as a percentage between \`−\` and \`+\`.
 `.trim(),
-    keywords: ["agents", "pipeline", "diagram", "zoom", "animated"],
+    keywords: ["agents", "pipeline", "diagram", "zoom", "animated", "timer", "elapsed"],
   },
 
   "tab.charts": {
@@ -74,7 +76,7 @@ Tool chips below each agent light yellow on tool start and green on success.
     long: `
 180-day price chart powered by [Chart.js](https://www.chartjs.org/) and indicators computed server-side with [stockstats](https://github.com/jealous/stockstats).
 
-The chart's end date is driven by **Analysis date** in the sidebar — useful for back-dating an analysis to see what the indicators looked like on a specific day. The agent crew itself always uses *live* data (the analyst tools call yfinance at run time).
+The chart end date is **today**. The agent crew uses live data (analyst tools call yfinance at run time).
 
 Toggleable overlays: 10-EMA, 50-SMA, 200-SMA, Bollinger Mid/Upper/Lower. Dedicated subplots: RSI(14), MACD + MACD Signal + MACD Histogram, ATR.
 `.trim(),
@@ -97,10 +99,12 @@ Only visible on the \`/commodity\` dashboard. Three views:
 
   "tab.reports": {
     section: "tabs",
-    title: "Reports",
-    short: "Each completed task's full markdown output in execution order, plus the final-decision card.",
+    title: "Reports (now per-tile in Workflow)",
+    short: "The Reports tab was removed. Click an agent tile in the Workflow diagram to read THAT agent's output; click another tile to switch. Works live and after completion.",
     long: `
-Renders every CrewAI task output as the run progresses. Each card shows the agent role, the rendered markdown, and an inline source-attribution list. Every numeric claim in a report carries an inline \`[source: <identifier>]\` tag — the **Reflective Critic** validates these tags against the PM's \`sources\` list to distinguish real data from hallucinated numbers.
+The standalone Reports tab has been removed. Agent output is now **tile-specific**: click any agent node in the **Workflow** diagram and its full markdown report opens in the inspector below the diagram; click another tile and the inspector switches to that agent. This replaces the old single scrollable list of every report stacked together.
+
+This works both while the run streams (you also see the agent's intermediate steps + tool calls live) and after completion (the saved run replays each agent's final report(s) into the inspector). Every numeric claim carries an inline \`[source: <identifier>]\` tag — the **Reflective Critic** validates these tags against the PM's \`sources\` list to distinguish real data from hallucinated numbers. The final-decision card and the Firefly-style **trend-signal card** render just below the diagram.
 
 The bottom of the tab shows the **final-decision card**: action on the retail 5-tier scale (**STRONG_BUY / BUY / HOLD / SELL / STRONG_SELL**), size, confidence, key drivers, key risks, falsifiers, compliance status, and the deduplicated sources list.  Older runs may still show the legacy 3-tier action strings (OVERWEIGHT / NEUTRAL / UNDERWEIGHT) — the UI collapses them to BUY / HOLD / SELL for display.
 
@@ -110,38 +114,19 @@ A report card tagged with an amber **DEGRADED** badge means the LLM emitted a *t
     keywords: ["analyst", "rationale", "sources", "provenance", "degraded", "empty report"],
   },
 
-  "tab.memory": {
+  "tab.episodes": {
     section: "tabs",
-    title: "Memory",
-    short: "Audit-grade episodic memory (paper §M3). Embargo-aware retrieval + L2 outcome resolution + LLM reflection.",
+    title: "Episodes",
+    short: "The tape: episode store + Resolve. Hermes training lives on the Training tab.",
     long: `
-Episodic memory stores \`(state, action, outcome, timestamp)\` tuples for every past run on this ticker.
+Episodic memory stores \`(state, action, outcome, timestamp)\` tuples for every past run.
 
-**Embargo-aware retrieval**: an episode is invisible until its outcome materialises (\`outcome_ts = decision_ts + horizon_days\`). Without this, future-known returns leak into "past" retrieval and silently inflate reported edge.
+1. **Store / table** — the human tape for this ticker (optional embargo-aware retrieval for operators). Prediction desks do not retrieve past episodes as a live tool.
+2. **Resolve** — labels 30-day reviews and elapsed theses. The LLM may investigate why the call was wrong (web, news, filings). That tape is what Hermes reads.
 
-**Resolve outcomes & reflect** (L2 training): sweeps episodes whose horizon has elapsed; prices the outcome from yfinance for \`[decision_ts, outcome_ts]\`; scores realised return + alpha vs SPY + max drawdown; asks the LLM for a constrained one-paragraph lesson (≤600 chars). Reflections become visible to future runs via the \`retrieve_past_episodes\` tool.
-
-The Market Analyst + Trader both call this tool automatically — that's how the system **learns** between runs without touching LLM weights.
+Hermes (prompts / topology / size) and L3 sizing live on the **Training** tab. Mass promote is legacy.
 `.trim(),
-    keywords: ["episode", "embargo", "reflection", "L2", "training"],
-  },
-
-  "tab.portfolio": {
-    section: "tabs",
-    title: "Portfolio",
-    short: "Book snapshot (cash, positions, P&L) + HRP / Mean-Variance / Equal-Risk allocator preview across recent proposals.",
-    long: `
-Two distinct components live behind this tab:
-
-1. **PortfolioState book** — single JSON file per book (\`paper\` / \`prod\`), atomic-write via \`<path>.tmp\` + \`os.replace\`. Cash, open positions (symbol, qty, avg_cost, last_price, opened_ts), realised P&L, peak NAV, max drawdown.
-2. **Allocator preview** (triggered when ≥2 tickers have recent proposals). Three methods are switchable in the UI:
-   - **HRP** (Hierarchical Risk Parity, López de Prado 2016) — cluster by correlation distance, recursively split the risk budget. Robust to ill-conditioned covariance. **Default for thin universes.**
-   - **MEAN_VARIANCE** (Markowitz with long-only sum-to-budget constraint).
-   - **EQUAL_RISK** (1/N then vol-scale).
-
-The allocator only **redistributes** within the gross budget (default 0.80 = 80% of NAV invested, 20% cash). It cannot increase gross exposure.
-`.trim(),
-    keywords: ["allocator", "HRP", "Markowitz", "book"],
+    keywords: ["episode", "embargo", "reflection", "L2", "training", "memory", "store"],
   },
 
   "tab.backtest": {
@@ -153,45 +138,128 @@ The allocator only **redistributes** within the gross budget (default 0.80 = 80%
 
 **Why "backtest" appears in two places**: the *tool* \`backtest_setup\` is a decision-time base-rate lookup ("out of 1225 historical setups like this, 20% hit target"). The *tab* is the post-hoc strategy-level harness.
 
-The **Auto-tune sizing & risk gates** panel runs an L3 grid search across \`kelly_fraction × vol_target × max_position_weight\` (optionally extending to \`max_leverage\`, \`drawdown_kill_threshold\`, \`cost_model\`). Ranked by **Deflated Sharpe** (Bailey & López de Prado 2014), which penalises selection-bias from testing many configurations against the same history.
+The **L3 auto-tune** (grid/PSO search over \`kelly_fraction × vol_target × max_position_weight\`, ranked by **Deflated Sharpe**) lives on the **Training** tab and composes with an open Hermes \`size_scale\`. This tab keeps the walk-forward replay, PnL attribution, CPCV/PBO robustness, the multi-ticker portfolio backtest, and the crowd-positioning view.
 
 If you need ≥ \`train+embargo+test\` proposals (default 3+1+1 = 5), use the **Seed N synthetic proposals** button to bulk-generate proposals from existing PM decisions without re-running the LLM crew.
 `.trim(),
-    keywords: ["walk-forward", "CPCV", "Deflated Sharpe", "L3"],
+    keywords: ["walk-forward", "CPCV", "Deflated Sharpe", "attribution", "portfolio"],
   },
 
   "tab.training": {
     section: "tabs",
-    title: "RL Training",
-    short: "L4 — full reinforcement learning. Agents act, the M2 simulator pays out, gradients flow into the policy. Promote a run to expose it to the LLM crew.",
+    title: "Training",
+    short: "Hermes: one open experiment on the live book. L3: per-ticker size base.",
     long: `
-The closed-loop reinforcement-learning workbench. Default algorithm is **PPO** (Proximal Policy Optimization — Schulman 2017, clipped surrogate + GAE-λ advantages + value clipping + entropy bonus + gradient clipping). Optional alternatives:
+Prediction writes decisions. Episodes → Resolve labels the 30-day tape and runs Hermes. This tab is the **scoreboard**: the 30-day book name, SUCCESS/FAILURE vs the strategy bars, n / hit-rate / α / DD, the live experiment Hermes already opened, and used knobs.
 
-- **CVaR-PPO** — risk-sensitive variant; weights the advantage by the lower-CVaR quantile of returns.
-- **CQL** (Conservative Q-Learning) — offline RL; trains off the stored episode log without re-running the env.
-- **C51** (Distributional RL) — models the *distribution* of returns; surfaces the lower-quantile estimate to the M5 risk gate.
-- **Decision Transformer** — frames trading as conditional sequence modelling on offline trajectories.
+Hermes picks the next unused knob on Resolve — one at a time. There is no dropdown here. Mandate, prompts, and enabled knobs are edited on **Settings**.
 
-State: 21 features (10 lagged log-returns, vol_20, mom_5/20, RSI(14), MACD, Bollinger %b, position weight/unrealised/age, day-of-week sin/cos). Action: 7 discrete weight buckets (-20%, -10%, -5%, 0, +5%, +10%, +20%). Reward: per-bar ΔNAV after the M2 simulator deducts fees + slippage + impact + carry.
+Hermes still picks **one named knob with one fixed value** from rules + the live strategy (not an LLM search, not a value sweep) when you Resolve. If the book is still FAILURE after enough reviews, that knob is rejected and the next unused enabled one can open.
 
-**Promote** writes a single pointer in \`~/.trading_crew/rl_runs/promoted/<TICKER>.json\`. Until promoted, the policy stays invisible to the LLM crew (no implicit "use the latest run" fallback).
+L3 grid/PSO is separate: it searches Kelly / vol / cap. Apply writes the base; an open Hermes \`size_scale\` multiplies on top.
 `.trim(),
-    keywords: ["PPO", "CVaR", "CQL", "Decision Transformer", "L4"],
+    keywords: ["L3", "Hermes", "topology", "size_scale", "PSO", "auto-tune", "harness", "settings"],
+  },
+
+  "tab.prediction": {
+    section: "tabs",
+    title: "Prediction",
+    short: "Bulk or single. Completions land on today's Prediction run and are reused unless you force a rerun.",
+    long: `
+The **Prediction** tab is the live forward book on \`/stocks\`. **Bulk** and **Single** use the same Settings snapshot.
+
+A completed single or bulk name is written to the Prediction index for **today**. **Live · today** on the left returns here. The dated list below it opens that day's **prediction run** (\`/stocks/history/{date}\`) — Names + Portfolio, not this tab.
+
+The next single or bulk attempt on the same name **returns the cached result**. A failed cell is not a cache hit. Check **Force rerun** to ignore today's cache and run the crew again. Commodity sessions never use this index.
+`.trim(),
+    keywords: ["prediction", "cache", "force rerun", "bulk", "single", "today"],
+  },
+
+  "tab.run-names": {
+    section: "tabs",
+    title: "Names",
+    short: "Stocks that ran on this prediction-run date. Click a name to open that day's workflow.",
+    long: `
+A **prediction run** is a calendar day's completed (and failed) names — not the live universe on \`/stocks\`.
+
+Click a sidebar date or **Review names →** to open \`/stocks/history/{date}\`. This tab lists every name that ran that day. Click a row to open \`/run/{ticker}?date={date}\` and replay that day's workflow. **Back** on the workbench returns here; **Stocks** returns to \`/stocks\`.
+`.trim(),
+    keywords: ["names", "prediction run", "history", "workflow"],
+  },
+
+  "tab.portfolio": {
+    section: "tabs",
+    title: "Portfolio",
+    short: "₹10L virtual book for this prediction-run date, marked to the latest close.",
+    long: `
+The **Portfolio** tab lives on the prediction-run page (\`/stocks/history/{date}\`), next to **Names**. It notionally deploys ₹10,00,000 across that day's BUY / STRONG_BUY names, weighted by predicted growth, then marks each holding to the latest known price.
+
+Switch dates from the left pane (or the run-date dropdown). Click a holding to open that name's workflow for this run date. Market Both / India / US re-deploys the full book inside the selection.
+`.trim(),
+    keywords: ["portfolio", "virtual", "10 lakh", "history", "prediction run"],
+  },
+
+  "page.settings": {
+    section: "sidebar",
+    title: "Settings",
+    short: "Run config on the left; live strategy, prompts, and bulk snapshot on the right. One save.",
+    long: `
+The **Settings** page (\`/settings\`, or \`/settings?book=commodity\`) is the operator console. Open it from the gear on \`/stocks\` or \`/commodity\` (or a focused run). Back on Settings returns to that book. Home on the stock/commodity dashboards returns to \`/\`. History stays on \`/stocks\` and \`/commodity\`.
+
+**Left pane** is run config only: LLM, Run (mode + optional sliders + reviewers), tools. There is no Advanced wrapper, no embedding picker, and no CrewAI-memory toggle. Ticker, analysis date, sessions, and recent runs are not here — ticker lives on Prediction (single), date is always today, sessions live on History.
+
+**Right pane** is desk strategy and per-desk goal/backstory overlays. **Save all settings** writes strategy + the selected prompt overlay + the current run snapshot through \`PUT /api/settings\`. Single and bulk prediction both use that same snapshot. Revert deletes the live strategy file. Unset restores one packaged persona.
+
+Writes go to the cache (\`v3/desk_strategy.yaml\`, \`v3/prompt_overlay.yaml\`, \`v3/bulk_settings.json\`), not the git yaml. \`TRADINGCREW_STRATEGY_PATH\` still wins if set.
+
+LLM API keys and vLLM URLs stay in \`.env\`. There is no profile or account menu.
+`.trim(),
+    keywords: ["settings", "strategy", "prompts", "bulk", "overlay"],
   },
 
   "tab.logs": {
     section: "tabs",
-    title: "Logs",
-    short: "Live event-by-event console of every node_started / tool_call / tool_result / node_completed event with timestamps.",
+    title: "Logs (removed)",
+    short: "The activity log was removed — the diagram's edge colours already show live progress, and per-agent output is read by clicking a tile.",
     long: `
-Raw event stream from the WebSocket: \`run_started → node_started → tool_call → tool_result → node_completed → final_decision → reflection_records → action_proposal → execution_result → episode_recorded → run_completed\`.
-
-The badge next to the Logs tab counts pending log entries (the events you haven't viewed yet on this tab). Click into the tab to clear the badge.
+The standalone activity log has been removed entirely. Progress is shown by the **Workflow** diagram itself: edges animate cyan while an agent runs and turn solid green (or amber if degraded) when it completes. To read what an agent produced, click its tile — the output opens in the inspector below the diagram.
 `.trim(),
-    keywords: ["events", "websocket", "trace"],
+    keywords: ["events", "trace", "activity log", "removed"],
   },
 
   /* ========================================================= SIDEBAR === */
+
+  "sidebar.prediction_runs": {
+    section: "sidebar",
+    title: "Prediction runs",
+    short: "Live · today is the /stocks universe. Dated rows open that day's Names + Portfolio.",
+    long: `
+The left pane splits **Live sessions** (queued / running kickoffs) and **Prediction runs** evenly when anything is in flight. Live sessions is only the active queue — finished kickoffs leave this list.
+
+**Live · today** returns to \`/stocks\` (the live Prediction universe). **Review names →** opens that same live collection day — the server calendar date from the universe API, which can differ from the browser's local date around midnight.
+
+The scrollable list under it is **past** run dates only. Today's date is not listed twice. Click a past date for that day's ran names and virtual book (\`/stocks/history/{date}\`). Click a name there to open \`/run/{ticker}?date=...\`. Back from the workflow returns to the run; **Stocks** on the run page returns to \`/stocks\`.
+
+Opening a live session on `/run/{ticker}` streams that kickoff. It does not replay yesterday's cached HOLD on top of a still-running job.
+
+A name already \`done\` today is reused on the next single or bulk run unless **Force rerun** is checked. Failed cells retry without Force.
+`.trim(),
+    keywords: ["history", "prediction runs", "today", "cache"],
+  },
+
+  "sidebar.force_rerun": {
+    section: "sidebar",
+    title: "Force rerun",
+    short: "Ignore today's cached prediction and run the crew again. Off by default.",
+    long: `
+Same-day **done** predictions are cached: Single → Run analysis and Bulk → Start return that row instead of calling the LLM.
+
+Check **Force rerun** when you want a new kickoff for names already completed today. The new result overwrites the day's Prediction-index row. Failed cells are not cached, so they retry without this box.
+
+Commodity runs never read or write this cache.
+`.trim(),
+    keywords: ["force", "rerun", "cache", "skip"],
+  },
 
   "sidebar.ticker": {
     section: "sidebar",
@@ -226,99 +294,64 @@ Does NOT replay historical news from that date — the analyst tools always call
   "sidebar.llm": {
     section: "sidebar",
     title: "LLM picker",
-    short: "Pick the LLM for the next run — open-source local / hosted vLLM or closed-source OpenAI / Anthropic.",
+    short: "Pick the LLM for the next run. Every desk and tool call in that run uses this endpoint.",
     long: `
-Each run can use a different LLM. Pick a **preset** from the dropdown — your selection is persisted to \`localStorage\` and sent with the next \`/ws/analyze\` payload as \`llm_preset\`.
-
-**Open-source presets**
-- \`hosted-vllm-oss\` — any OpenAI-compatible vLLM-style endpoint you point \`VLLM_LLM_BASE_URL\` / \`VLLM_LLM_MODEL\` / \`VLLM_LLM_API_KEY\` at in \`.env\`. Recommended default for debate rounds that ship all 8 analyst reports — pick a long-context (131K-ish) model so prompts don't overflow.
-- \`local-vllm\` — your local \`vllm serve <model> --port 8081\` (configurable via \`LOCAL_LLM_*\`). Tool calling enabled. Watch the context window so debate rounds stay within the model's limit.
-
-**Closed-source presets**
-- \`openai-gpt-4o-mini\` / \`openai-gpt-4o\` — needs \`OPENAI_PROD_API_KEY\` in \`.env\` (kept separate from \`OPENAI_API_KEY=dummy\` used by the local vLLM client).
-- \`anthropic-claude-sonnet\` — needs \`ANTHROPIC_API_KEY\` in \`.env\`.
-
-The dropdown greys out closed-source options whose API key isn't configured. Adding more presets: edit \`trading_crew/llm_presets.py::BUILTIN_PRESETS\`.
-
-**Resolution order** inside \`get_llm()\`:
-1. \`LOCAL_LLM_*\` env (fallback)
-2. \`VLLM_LLM_*\` env (default)
-3. \`LLM_PER_AGENT\` JSON (per-agent override)
-4. **Active UI preset** (thread-local — what this dropdown sets)
-5. Direct kwargs
-
-Per-agent and UI-preset overrides compose: e.g. you can pick \`hosted-vllm-oss\` as the default and still pin the Reflective Critic to \`openai-gpt-4o\` via \`LLM_PER_AGENT\` in \`.env\`.
+One dropdown. The selection is persisted to \`localStorage\` and sent as \`llm_preset\`. Default comes from \`TRADINGCREW_LLM_PRESET\` in \`.env\` (\`local-vllm\` → \`LOCAL_LLM_*\`, \`hosted-vllm\` → \`VLLM_LLM_*\`). Desks, planner, critic, and tool summarize use that catalog. \`get_report_insights\` map-reduce is separate: it uses \`REPORT_PROCESS_*\` only.
 `.trim(),
     keywords: ["model", "vllm", "openai", "anthropic", "preset", "picker"],
   },
 
   "sidebar.embedding": {
     section: "sidebar",
-    title: "Embedding model picker",
-    short: "Pick the embedder used by LLM-enriched memory. Only relevant when memory is ON.",
+    title: "Embedding model (removed)",
+    short: "The Settings embedding picker is gone. Sequential memory still uses the .env embedder.",
     long: `
-The embedder turns task outputs (PM rationale, analyst summaries, debate synthesis) into vectors so CrewAI's memory can retrieve relevant context on later runs. It's only used when the **LLM-enriched memory** toggle is ON.
+Live \`retrieve_past_episodes\` is no longer a desk tool, so Settings no longer offers an embedding preset. \`embedding_preset\` is dropped from \`v3/bulk_settings.json\` on the next Settings load/save.
 
-**Open-source preset**
-- \`vllm-embedding\` — any OpenAI-compatible embedding server you point \`VLLM_EMBEDDING_BASE_URL\` / \`VLLM_EMBEDDING_MODEL\` / \`VLLM_EMBEDDING_API_KEY\` at in \`.env\`. Default deployments use \`embeddinggemma-300m\` (768-d, 2048-token input cap); the \`TruncatingOpenAIEmbedder\` wrapper clips inputs to \`TRADINGCREW_EMBEDDER_MAX_CHARS\` (default 6000 ≈ 1500 tokens) so memory writes never trip the upstream 2048-token limit.
-
-**Closed-source presets** (need \`OPENAI_PROD_API_KEY\` in \`.env\`)
-- \`openai-text-embedding-3-small\` — 1536-d, 8191-token input cap.
-- \`openai-text-embedding-3-large\` — 3072-d, 8191-token input cap. Better retrieval quality at higher cost.
-
-**Why partition memory by preset?** Embedding dim is locked into the LanceDB schema the first time a store is written. Switching from a 768-d embedder to a 1536-d embedder on the same scope would crash the next \`search_memory\` with *"query dim doesn't match the column vector dim"*. The crew folds the active preset id into the memory \`root_scope\` (\`/crew/<crew>/emb/<preset-id>\`) so switching presets just starts a fresh store side-by-side with the old one.
-
-**Resolution order** inside \`TruncatingOpenAIEmbedder.__init__\`:
-1. \`VLLM_EMBEDDING_*\` env (fallback)
-2. **Active UI preset** (thread-local — what this dropdown sets)
-3. Direct kwargs (tests / explicit construction)
-
-Adding more presets: edit \`trading_crew/embedding_presets.py::BUILTIN_PRESETS\`.
+If a script still constructs CrewAI Memory, the embedder comes from \`VLLM_EMBEDDING_*\` in \`.env\` via \`trading_crew/embedding_presets.py\`.
 `.trim(),
-    keywords: ["embedding", "embedder", "memory", "vector", "dim", "preset"],
+    keywords: ["embedding", "embedder", "memory", "removed"],
+  },
+
+  "sidebar.run_mode": {
+    section: "sidebar",
+    title: "Run mode (stock)",
+    short: "Autonomous LangGraph, deterministic CrewAI, or harness conductor loop. Applies to Run Analysis and Prediction batch.",
+    long: `
+Stock runs on v3 can use one of three orchestrators. The same Settings radios are sent on **Run Analysis** and on **Prediction → Start batch**.
+
+- **Autonomous (multi-agent)** — default. LangGraph canvas plus **autonomous desk/task prompts** (\`run_mode_prompts.yaml\`): desks must lock a lean or MIXED-with-conviction; debate does not treat the printed round count as a stop rule; extra turn on a split / MIXED board. Hermes can still open \`debate_rounds_1/2\` or \`risk_rounds_2\`.
+- **Deterministic** — sequential v2 crew plus **deterministic prompts**: each desk fills its assigned slot and stops. Debate and risk-round sliders are honoured.
+- **Harness** — a conductor loop (not Hermes). It is a **long-horizon** investigation: the step budget is a ceiling, not a reason to finish early. It observes results, picks tools or parallel sub-agents, and must cover **market**, **news**, **fundamentals**, **macro**, **filings** (\`get_report_insights\`), a **bundled debate** (\`desk=debate\`: bull and bear in one crew; each side may \`research_web\` / news / fundamentals mid-exchange), and a **bundled risk debate** (\`desk=risk\`: aggressive, conservative, and neutral in one crew — first each writes an independent opinion, then they debate each other). A **spawn planner** expands each desk brief into a full child instruction (assignment, constraints, priors to re-check, verify, return-to-parent) from \`harness_plugins.yaml\` skills plus the live coverage board. Separate bull/bear or risk-wing spawns remain available after those bundles. If the step budget runs out, the loop takes \`exhaust_steps\` closing turns (no new spawns) so the PM can write a ticket from the desks that already ran — HOLD when they conflict, with that conflict in the rationale — instead of a canned size-0 stub. If the transcript overflows the model window, the loop **compacts** earlier observations and continues instead of failing. Spawned desks use **harness remits** in \`run_mode_prompts.yaml\` (they pick their own tools; no tool-order or round-N script). Packaged standing rules live in \`harness.yaml\`. \`research_web\` uses Gemini Google Search first when \`GEMINI_WEB_SEARCH=1\`, then SearXNG.
+
+Commodity is always sequential and uses the deterministic prompt contract. M1–M7 after the LLM (stops, critic, Kelly/vol, gates) run on all stock modes.
+`.trim(),
+    keywords: ["run mode", "autonomous", "deterministic", "harness", "langgraph", "sequential", "batch"],
   },
 
   "sidebar.dialogue": {
     section: "sidebar",
-    title: "Debate / Risk rounds + memory",
-    short: "Sliders for bull/bear debate rounds (1–10) + risk-team rounds (1–10) + shared-memory toggle.",
+    title: "Run mode + debate / risk",
+    short: "Autonomous and harness stock use different prompts and no debate/risk sliders. Deterministic and commodity still expose sliders.",
     long: `
-- **Debate rounds** — how many turns the bull and bear researchers take before the Research Manager synthesises. More rounds = more thorough adversarial argumentation but linearly more LLM cost.
-- **Risk rounds** — same idea for the Aggressive / Conservative / Neutral risk debate.
-- **LLM-enriched memory** — toggles CrewAI's unified short-term / long-term / entity memory. When **ON**, every task save is enriched by an LLM pass (\`analyze_for_save\` / \`extract_memories_from_content\` / \`analyze_for_consolidation\`) and every \`search_memory\` recall runs \`analyze_query\`. The displayed estimate (e.g. *"~108 LLM analysis calls ≈ 1.8 min"*) shows what to expect — it scales with debate / risk rounds because every extra round adds tasks, and each task adds ~3.5 analysis calls on top of the agent's own LLM call. When **OFF**, memory is disabled entirely and agents start each task fresh. Memory embeddings always use the vLLM \`embeddinggemma-300m\` model configured in \`.env\` (truncation-guarded via \`TruncatingOpenAIEmbedder\`).
-
-  *Why this matters for runtime.* The local LLM endpoint caps at ~60 req/min, so the analysis pass adds roughly *count ÷ 60 min* of latency on top of the agent work. We override CrewAI's default 1-worker save pool to 8 workers (configurable via \`TRADINGCREW_MEMORY_SAVE_WORKERS\`) so concurrent saves actually fan out to that budget instead of serializing. The pool size pairs with the existing 10-worker pool inside \`EncodingFlow\` for batch-internal items.
+- **Run mode (stock)** — **Autonomous** uses the LangGraph scheduler plus autonomous prompts (continue until a lean or MIXED-with-conviction). **Deterministic** is the v2 CrewAI pipeline plus one-slot-and-stop prompts. **Harness** is a conductor loop plus replacement remits (no tool-order or round-N scripts). Both **Run Analysis** and **Prediction batch** read this radio. Personas live in \`agents.yaml\`; the mode contract is \`run_mode_prompts.yaml\`.
+- **Autonomous / harness debate / risk** — no operator sliders. Autonomous: opening debate is one bundled crew (bull opens with tools, bear rebuts with tools, bull closes); the graph may take an extra turn on a split or MIXED board; Hermes can open \`debate_rounds_1/2\` or \`risk_rounds_2\`. Harness: finish is refused until a bundled \`debate\` spawn (and a risk desk) have written; extra bull/bear one-shots stay available. Those keys are omitted from the Settings bulk document.
+- **Debate / risk sliders** — shown only for **Deterministic** stock and commodity (sequential). More rounds = more adversarial turns and linearly more LLM cost.
+- **CrewAI memory toggle** — removed. Live \`retrieve_past_episodes\` is gone; CrewAI Memory was a different, expensive per-task analyze pass and is no longer an operator control. The Episodes tab / Resolve tape is unchanged.
 `.trim(),
-    keywords: ["debate", "rounds", "memory"],
+    keywords: ["debate", "rounds", "run mode", "autonomous"],
   },
 
   "sidebar.memory": {
     section: "sidebar",
-    title: "LLM-enriched memory",
-    short: "Toggles CrewAI's unified memory. When ON, every save / recall is enriched by an LLM analysis pass.",
+    title: "LLM-enriched memory (removed)",
+    short: "Settings no longer offers CrewAI Memory. It was not retrieve_past_episodes.",
     long: `
-When **ON**, every CrewAI task save runs an LLM analysis pass that classifies the content into a scope (e.g. \`/crew/trading-crew-NTNX/decisions\`), assigns an importance score, and extracts entities / dates / topics. Every \`search_memory\` tool call also runs an LLM query-analysis step to pick keywords and target scopes.
+CrewAI Memory was **not** \`retrieve_past_episodes\`. It auto-saved each sequential task through extra LLM analyze calls (~60+/run) and did not read the 30-day tape.
 
-**Per-run cost.** The sidebar displays an estimate like *"~108 LLM analysis calls ≈ 1.8 min"*. The math:
-
-\`\`\`
-tasks ≈ (8 analysts × 2 tasks)              # analyst grid
-      + (2 × debate_rounds)                  # bull + bear per round
-      + 3                                    # research-mgr / quality-reviewer / trader
-      + (3 × risk_rounds)                    # 3 risk personas per round
-      + 2                                    # compliance + portfolio manager
-
-calls ≈ tasks × 3.5 + 12                     # ~3.5 analyze calls/task + ~12 recall calls
-minutes ≈ calls / 60                         # local LLM rate limit = 60 req/min
-\`\`\`
-
-For the default debate=2 / risk=1 sliders that's *~28 tasks × 3.5 + 12 = ~110 calls ≈ 1.8 min*. Cranking debate=10 / risk=10 climbs to *~63 tasks × 3.5 + 12 = ~233 calls ≈ 3.9 min*.
-
-**Parallelism override.** CrewAI's default \`Memory._save_pool\` is a 1-worker \`ThreadPoolExecutor\`, which serializes all saves. We override it to 8 workers (configurable via \`TRADINGCREW_MEMORY_SAVE_WORKERS\`) so concurrent \`remember()\` calls fan out. Combined with the existing 10-worker pool inside \`EncodingFlow\` (for batch-internal items), the analyze calls can actually saturate the local-LLM 60-req/min budget instead of leaving ~90 % of throughput on the table. Without this override, a single ticker run took ~30 min; with it, the same run is back to ~5 min.
-
-When **OFF**, no \`Memory\` object is constructed — every task starts fresh, zero extra LLM calls. Memory embeddings (vLLM \`embeddinggemma-300m\` via \`TruncatingOpenAIEmbedder\`) are still configured in \`.env\` because the \`search_memory\` tool needs them when memory is on; they have no effect when memory is off.
+Live desks no longer retrieve past episodes. Settings therefore dropped this toggle; \`memory\` is stripped from \`v3/bulk_settings.json\`. The Episodes tab and Resolve still use the episodic store. Scripts may still pass \`memory=True\` into \`TradingCrew\` for tests.
 `.trim(),
-    keywords: ["memory", "llm", "parallel", "rate-limit", "embedding"],
+    keywords: ["memory", "removed", "crewai"],
   },
 
   "sidebar.tools": {
@@ -500,9 +533,44 @@ A wide spread between low and high P&L is a robustness flag — the strategy dep
     long: `
 Every run appends an \`Episode\` to \`~/.trading_crew/memory/episodes.jsonl\`. The episode is \`PENDING\` until \`outcome_ts = decision_ts + horizon_days\` elapses, at which point you can click **Resolve outcomes & reflect** in the Memory tab to materialise the realised return + alpha + max drawdown + LLM reflection.
 
-The outcome embargo is enforced server-side: an episode is invisible to \`retrieve_past_episodes\` until its \`outcome_ts + embargo_days\` has passed — that's how the system prevents future-known returns from leaking into "past" retrieval.
+The Episodes table is the human tape. Resolve writes 30-day lessons for Hermes. Prediction desks do not retrieve past episodes as a live tool.
 `.trim(),
     keywords: ["episode", "memory", "embargo"],
+  },
+
+  "panel.stagedTargets": {
+    section: "panels",
+    title: "Staged targets (scale-out plan)",
+    short: "Deterministic T1/T2/T3 profit tiers the risk layer derives from the validated final target — a partial-exit plan, not a single all-or-nothing exit.",
+    long: `
+The LLM emits one \`target_price\`. The risk layer (\`stops.compute_staged_targets\`) turns that into a **scale-out ladder**: three tiers between entry and the validated final target, each with the fraction of the position to exit there (\`weight\`, summing to ~1.0).
+
+Each tier shows:
+- **price** — the level to trim at.
+- **%** — signed move from entry (profit-direction positive).
+- **R:R** — reward-to-risk at that tier (distance to tier ÷ distance to stop).
+- **exit** — fraction of the position to scale out at the tier.
+
+This is deterministic and additive: it never overrides the PM's final target, it just structures how you'd realise it. Tiers only appear for directional (BUY/SELL) decisions with a valid entry / stop / target.
+`.trim(),
+    keywords: ["staged", "targets", "scale-out", "partial exit", "T1", "T2", "T3", "reward risk"],
+  },
+
+  "panel.calibration": {
+    section: "panels",
+    title: "Conviction calibration",
+    short: "Is the desk's stated confidence honest? Brier score + reliability bins + over/under-confidence gap over resolved directional episodes.",
+    long: `
+The PM attaches a \`conviction_score\` in [0,1] to every call, and M5 sizing scales risk by it. This panel measures whether that number is **calibrated**: when the desk says "0.8 conviction", does it win ~80% of the time?
+
+- **Brier** — mean squared error between conviction and the realised win/loss. Lower is better; **0.25** is the "always guess 0.5" baseline.
+- **Hit-rate vs conviction** — overall realised win-rate next to the mean predicted conviction. Big gap ⇒ miscalibrated.
+- **Confidence gap** — \`mean(predicted − realised)\`. **Positive = overconfident** (oversizing losers); **negative = underconfident** (leaving edge on the table); near zero = well-calibrated.
+- **Reliability bins** — conviction bucketed on [0,1]; the grey bar is mean predicted conviction, the coloured edge is realised hit-rate. Aligned bars ⇒ calibrated.
+
+Scope: only **RESOLVED, directional (BUY/SELL)** episodes count (HOLD/ABSTAIN carry no bet). **Basis** toggles raw return vs benchmark-relative alpha; **cohort** restricts to the current workflow version (default) or all history. Measurement-only — it does not change sizing today.
+`.trim(),
+    keywords: ["calibration", "brier", "conviction", "reliability", "overconfident", "hit rate"],
   },
 
   "panel.backtest_extra_axes": {
@@ -782,7 +850,7 @@ Bridges the LLM's narrative intent (\`PortfolioDecision\`) into the strict deter
     long: `
 Veteran technical analyst. Speaks in moving averages, RSI, trend regime and risk/reward — never mental arithmetic, always tool calls for the actual numbers.
 
-**Tools**: \`get_stock_data\`, \`get_indicators\`, \`retrieve_past_episodes\`, \`rl_policy_recommendation\`.
+**Tools**: \`get_stock_data\`, \`get_indicators\`.
 
 **Output**: MARKET REPORT with trend regime, last close, SMA20/SMA50, RSI14, momentum read, and a 1-line bias. Every number carries an inline \`[source: <identifier>]\` tag.
 `.trim(),
@@ -824,11 +892,27 @@ The global-news search is grounded in the company's home country: an Indian name
     long: `
 CFA-charter-holder. Reads income statements like prose, anchors every claim in the filings, never guesses a multiple.
 
-**Tools**: \`get_fundamentals\`, \`get_balance_sheet\`, \`get_cashflow\`, \`get_income_statement\`, \`get_long_term_thesis\` (trailing multi-year), \`get_forward_estimates\` (forward consensus — targets, fwd P/E, next-FY growth, revisions), \`get_sector_peers\`.
+**Tools**: \`get_fundamentals\`, \`get_balance_sheet\`, \`get_cashflow\`, \`get_income_statement\`, \`get_long_term_thesis\` (trailing multi-year), \`get_forward_estimates\` (forward consensus — targets, fwd P/E, next-FY growth, revisions), \`get_sector_peers\` (always pass the run ticker; live industry + country screen; pass \`peers=\` to replace a wrong set). If the desk omits ticker, the tool binds the kickoff symbol — it does not invent a name.
 
 **Output**: FUNDAMENTALS REPORT — growth, profitability, leverage/cash, valuation snapshot (P/E, P/B), a forward-consensus read (implied upside + fwd-vs-trailing EPS), and 1-line bias.
 `.trim(),
     keywords: ["fundamentals", "valuation", "earnings"],
+  },
+
+  "agent.reports_analyst": {
+    section: "agents",
+    title: "Reports Analyst",
+    short: "Reads the company's OWN primary filings — concall transcripts, investor decks, annual-report MD&A, credit ratings — for management guidance + target-vs-actual delivery.",
+    long: `
+Buy-side analyst who lives in the primary documents. Reads what management COMMITTED to (revenue / margin / order-book / capex guidance) and checks it against what was DELIVERED — beat, miss or in-line.
+
+**Tools**: \`get_report_insights\` (market-aware: **Indian** names pull screener.in concall / annual-report / credit-rating PDFs over HTTP — no Firecrawl — and extract text + tables from every page, with the selected filings extracted in parallel; the **newest annual report** is enough (prior years already sit in its comparatives / MD&A) while several concalls are kept for guidance vintages; **US** names pull the SEC EDGAR feed — 10-K / 10-Q reports + earnings 8-Ks resolved to their Exhibit 99.1 press release — then a dedicated \`REPORT_PROCESS_*\` LLM map-reduces the whole document in **context-sized chunks** (128k or 256k) BEFORE it reaches the agent, point-in-time-safe). Unchanged filings (listing date/title + first-page hash) reuse the last digest instead of a same-day timer. \`get_market_context\`, \`get_forward_estimates\` (the forward-consensus fallback for names with no primary-filing feed).
+
+**Output**: REPORTS & GUIDANCE briefing that LEADS with a Firefly-style **trend signal card** — directional, confidence-scored signals derived from the filings (OUTLOOK_TONE, REVENUE_GUIDANCE raised/maintained/cut, MARGIN_GUIDANCE, DELIVERY_TRACK_RECORD beat/in-line/miss, DEMAND_MOMENTUM, CREDIT_TRAJECTORY, and a synthesised NET_GUIDANCE_BIAS) — plus a **COMPUTED FINANCIAL TREND SIGNALS** block (deterministic, from hard quarterly numbers: REVENUE_TREND / EARNINGS_TREND with YoY growth + acceleration, and MARGIN_TREND). Below the card, the supporting evidence: guidance/targets, target-vs-actual, **reported actuals & segments**, **order book / operations**, **MD&A and named risks**, and any credit-rating action. Broader briefing is kept (not dropped as NONE). Never fabricates a target or a signal direction: marks a signal INSUFFICIENT_DATA when the filings/numbers don't support it, and says so plainly when a name is in neither the Indian nor the US filing feed.
+
+The whole card is parsed into a structured **ReportSignals** object (with a single numeric \`guidance_bias_score\` in [-1, 1]), emitted as a \`report_signals\` event, rendered on the Workflow tab, and persisted with the run + prediction so it's queryable downstream (and shown alongside the optional signal-fusion panel as advisory context).
+`.trim(),
+    keywords: ["reports", "filings", "guidance", "concall", "annual report", "target", "transcript"],
   },
 
   "agent.macro_analyst": {
@@ -848,13 +932,13 @@ The macro basket is country-aware: US → 10y UST + DXY + VIX + WTI + gold; Indi
   "agent.geopolitical_analyst": {
     section: "agents",
     title: "Geopolitical Analyst",
-    short: "Identifies geopolitical / regulatory / trade-policy catalysts. Industry-aware (shipbuilder → Hormuz; semis → Taiwan).",
+    short: "Identifies geopolitical / regulatory / trade-policy catalysts. The analyst writes the search query from the brief + remit + any gap.",
     long: `
 Ex-policy-desk analyst. Tracks tariffs, export controls, sanctions, election risk and regional conflict for their direct impact on revenue and supply chain. Quantifies exposure: "X% of revenue is at risk if rule Y passes".
 
 **Tools**: \`get_market_context\`, \`get_geopolitical_news\`, \`get_global_news\`, \`get_supply_chain_risk\`.
 
-Industry-aware: a shipbuilder gets Strait of Hormuz / Red Sea / naval procurement; semis get Taiwan + chip-export controls; oil & gas get OPEC quota + Red Sea shipping.
+\`get_market_context\` is facts only (country, industry, name). You pass \`query=\` on the news tools — there is no canned Hormuz / Taiwan / OPEC phrasebook.
 `.trim(),
     keywords: ["geopolitical", "sanctions", "regulation"],
   },
@@ -868,7 +952,7 @@ Sector specialist. Only commits to a name if it's better than its closest 4–5 
 
 **Tools**: \`get_market_context\`, \`get_sector_peers\`, \`get_indicators\`.
 
-Peer baskets are country-aware: MAZDOCK.NS → COCHINSHIP.NS / GRSE.NS / BEL.NS / HAL.NS; NVDA → AMD / AVGO / INTC / TSM / QCOM.
+Peer baskets are a live Yahoo industry + country screen, not a ticker dictionary. The desk may pass \`peers=\` when filings named better comparables. Quote the tool's printed alpha vs the median.
 `.trim(),
     keywords: ["sector", "peers", "alpha"],
   },
@@ -892,9 +976,9 @@ Volatility-desk quant. Reads IV term-structure, skew and put/call ratio for a po
     title: "Bullish Researcher",
     short: "Builds the strongest evidence-based case for going long. Cites the analyst report each argument leans on — no vibes.",
     long: `
-Optimistic but disciplined buy-side researcher. Always cites the analyst report each argument leans on — no vibes-based bullishness.
+Optimistic but disciplined buy-side researcher. In the bundled debate they share one crew with the Bear (open → rebut → close) and may call \`research_web\` / \`get_news\` / \`get_fundamentals\` / \`get_stock_data\` mid-exchange to prove a point. They also share a scratch pad (compact analyst TLDRs + prior turns). Open-web search uses Gemini Google Search first when \`GEMINI_WEB_SEARCH=1\`, then rotates SearXNG engines (duckduckgo web, privacywall, infospace, …) and keeps a hop only when the run LLM marks the URLs as about the query.
 
-Runs \`debate_rounds\` turns alternating with the Bear; each round sees prior rounds + the 8 analyst reports in context, and must explicitly rebut the most recent Bear turn.
+Round 1 is an independent opening run in parallel with the Bear (not a rebuttal). Later rounds alternate: each turn must explicitly rebut the most recent Bear claim on the pad.
 `.trim(),
     keywords: ["bull", "debate", "researcher"],
   },
@@ -904,9 +988,7 @@ Runs \`debate_rounds\` turns alternating with the Bear; each round sees prior ro
     title: "Bearish Researcher",
     short: "Builds the strongest evidence-based case against going long. Treats every bull thesis as a hypothesis to falsify.",
     long: `
-Skeptical short-seller. Treats every bull thesis as a hypothesis to falsify, and looks for cracks in numbers, narrative, and positioning.
-
-Runs \`debate_rounds\` turns alternating with the Bull; each round must explicitly rebut the most recent Bull turn.
+Skeptical short-seller. In the bundled debate they share one crew with the Bull and may call \`research_web\` / \`get_news\` / \`get_fundamentals\` / \`get_stock_data\` mid-exchange to falsify a claim. They also share a scratch pad. Extra one-shot turns after the bundle rebut the most recent bull claim.
 `.trim(),
     keywords: ["bear", "debate", "researcher"],
   },
@@ -916,9 +998,11 @@ Runs \`debate_rounds\` turns alternating with the Bull; each round must explicit
     title: "Research Manager",
     short: "Moderates the bull/bear debate. Picks the side with stronger evidence — does NOT split the difference.",
     long: `
-Head of research. Doesn't pick the side they like — picks the side with stronger evidence, and explicitly notes 1–2 things that would change their mind.
+Head of research. Reads the shared scratch pad plus the last bull/bear turns (not the five full analyst reports). Doesn't pick the side they like — picks the side with stronger evidence, and explicitly notes 1–2 things that would change their mind.
 
-**Output**: RESEARCH THESIS — STANCE (BULL/BEAR), 3 key drivers, 3 key risks, 1–2 falsifiers. Every line that contains a number ends with an inline \`[source: …]\` tag inherited from the analyst report it cites.
+\`STANCE: MIXED\` is a locked thesis with named evidence on both sides — not an instruction for the PM to sit out. HOLD is only for a true split (bullish count == bearish count, both > 0) or a majority of directional desks against the lean. Neutrals do not create a split.
+
+**Output**: RESEARCH THESIS — STANCE (BULL/BEAR/MIXED), 3 key drivers, 3 key risks, 1–2 falsifiers. Every line that contains a number ends with an inline \`[source: …]\` tag inherited from the analyst report it cites.
 `.trim(),
     keywords: ["manager", "synthesis", "thesis"],
   },
@@ -926,11 +1010,11 @@ Head of research. Doesn't pick the side they like — picks the side with strong
   "agent.quality_reviewer": {
     section: "agents",
     title: "Quality Reviewer",
-    short: "Audits the thesis. Marks each claim SUPPORTED (with tag) or UNSUPPORTED. Below-5 score halves the trader's default size.",
+    short: "Audits the thesis. A real [source: …] tag is SUPPORTED. Advisory to the PM — does not drop tagged facts.",
     long: `
-Internal-audit lead for the research desk. For every claim in the manager's thesis, marks SUPPORTED (with the analyst report it cites) or UNSUPPORTED, then grades the thesis 0–10.
+Internal-audit lead for the research desk. For every claim in the manager's thesis, marks SUPPORTED (the claim already has \`[source: <identifier>]\`), SUPPORTED-qualitative (\`[analyst judgement]\`), or UNSUPPORTED (untagged bare number or an example.com placeholder), then grades the thesis 0–10.
 
-A claim counts as SUPPORTED only if it carries an inline \`[source: <identifier>]\` tag. A bare number with no tag is automatic UNSUPPORTED — flagged explicitly so the trader can omit it.
+The tag is the citation. A news URL or tool id (\`screener.in\`, \`yfinance\`, \`get_report_insights\`) is SUPPORTED even if that URL does not reappear in the truncated analyst pack. Tools stamp \`[source: …]\` on valid figures that left the extract untagged, so those numbers are not marked UNSUPPORTED. Quality Review must not tell the PM to omit or down-weight tagged claims. Score below 4 may right-size; it never forces a HOLD by itself.
 `.trim(),
     keywords: ["audit", "quality", "review"],
   },
@@ -942,9 +1026,11 @@ A claim counts as SUPPORTED only if it carries an inline \`[source: <identifier>
     long: `
 Buy-side trader. Translates views into entries, stops, targets, time horizons and rough sizing.
 
-**Tools**: \`get_event_proximity\` (next earnings + days-to-event + EPS estimates), \`backtest_setup\` (per-trade base-rate lookup), \`retrieve_past_episodes\`, \`rl_policy_recommendation\`.
+**Tools**: \`get_event_proximity\` (next earnings + days-to-event + EPS estimates).
 
 If \`days_to_event\` is less than the intended horizon, the trader either shortens the horizon or explicitly sizes for the catalyst. If the historical hit-rate from \`backtest_setup\` disagrees with intuitive confidence (<40% hit rate but 70% confidence wanted), the plan is tightened or the size shrunk.
+
+MIXED-with-conviction on a directional majority is a smaller or hedged plan on that majority — not an automatic sit-out. Sit out only on a true split (bullish count == bearish count, both > 0) or a majority-opposed board.
 `.trim(),
     keywords: ["trader", "plan", "sizing"],
   },
@@ -954,9 +1040,9 @@ If \`days_to_event\` is less than the intended horizon, the trader either shorte
     title: "Aggressive Risk Analyst",
     short: "Argues for higher conviction sizing when the edge justifies it. Pushes back when EV is being left on the table.",
     long: `
-Risk analyst with a high-conviction bias. Pushes back when the team is leaving expected value on the table.
+Risk analyst with a high-conviction bias. Pushes back when the team is leaving expected value on the table. This debate is about **size and execution**, not direction — the trader already has a plan.
 
-Runs in parallel with the Conservative analyst; the Neutral analyst then synthesises both into a balanced sizing/execution recommendation.
+In harness, the bundled \`desk=risk\` crew runs two rounds: each wing writes an independent opinion, then they debate. Extra one-shot turns after that remain available. Call \`research_web\` / news / fundamentals / price mid-exchange when a size claim needs a source.
 `.trim(),
     keywords: ["aggressive", "risk", "sizing"],
   },
@@ -968,7 +1054,7 @@ Runs in parallel with the Conservative analyst; the Neutral analyst then synthes
     long: `
 Capital-preservation specialist. Highlights tail risks, correlated exposures, and reasons the trade could quietly fail.
 
-Runs in parallel with the Aggressive analyst.
+In the bundled risk crew, round 1 is an independent size-down / skip case — not a rebuttal of a turn that has not happened. Round 2 debates the other openings. Extra one-shot turns after the bundle remain available.
 `.trim(),
     keywords: ["conservative", "risk", "tail"],
   },
@@ -978,7 +1064,9 @@ Runs in parallel with the Aggressive analyst.
     title: "Neutral Risk Analyst",
     short: "Synthesises the aggressive + conservative arguments into a balanced sizing/execution plan.",
     long: `
-Risk analyst who weighs aggressive and conservative arguments and proposes a middle path defensible to the PM.
+Risk analyst who weighs aggressive and conservative arguments and proposes a middle path defensible to the PM. Does not re-decide side.
+
+In the bundled risk crew, Neutral first writes their own size opinion, then debates the other two and locks one size. Extra one-shot turns after the bundle remain available. On the sequential graph, Neutral can still emit \`REOPEN_TRADER\` when the plan's size is indefensible.
 `.trim(),
     keywords: ["neutral", "risk", "synthesis"],
   },
@@ -1015,6 +1103,7 @@ Hard rules:
 - If compliance is BLOCKED, action MUST be HOLD.
 - STRONG_BUY / STRONG_SELL are reserved for one-sided evidence across the chosen tier's row + the adjacent tier.
 - HOLD requires size_pct_of_book == 0; directional tiers require size_pct_of_book > 0.
+- HOLD is for a true split (bullish count == bearish count, both > 0), a majority-opposed board, contradictory evidence, or BLOCKED. Neutrals do not create a split. MIXED-with-conviction on a 3–0 or 3–1 board is not an automatic HOLD.
 - \`horizon == LONG\` requires \`long_term_view\` to be a full 2-5 sentence narrative AND requires a \`get_long_term_thesis\` citation.  For SHORT / MEDIUM decisions, \`long_term_view\` still has to be a non-empty 1-2 sentence context line ("multi-year thesis is intact/broken/N/A") — the desk shows it in every final report so the LONG-panel evidence is always visible.
 `.trim(),
     keywords: ["PM", "decision", "PortfolioDecision", "horizon", "SHORT", "MEDIUM", "LONG"],
@@ -1033,32 +1122,31 @@ Every PortfolioDecision now carries an explicit **horizon tier** alongside \`hor
 
 The backtest_setup tool surfaces all three tiers in one panel (with rows tagged [SHORT] / [MEDIUM] / [LONG] and human-readable windows like "1260d ≈ 5y"), plus a **Per-tier best expectancy** summary the PM anchors on.
 
-Because outcome resolution can't wait a decade, LONG-tier decisions have their **accounting horizon** clamped to 5 years (1260d) — the *narrative* 5-10 year thesis lives in the \`long_term_view\` free-form field (accepted under the legacy name \`long_term_thesis\` too).  The RLMF training loop uses the 5y realised return as the reward proxy for LONG-tier calls.
+Because outcome resolution can't wait a decade, LONG-tier decisions have their **accounting horizon** clamped to 5 years (1260d) — the *narrative* 5-10 year thesis lives in the \`long_term_view\` free-form field (accepted under the legacy name \`long_term_thesis\` too). The 30-day harness review still scores the short path while this thesis stays pending.
 `.trim(),
     keywords: ["horizon", "SHORT", "MEDIUM", "LONG", "5-year", "10-year", "compounder"],
   },
 
-  "concept.rlmf": {
+  "concept.harness": {
     section: "glossary",
-    title: "RLMF — Reinforcement Learning from Market Feedback",
-    short: "FinGPT-inspired training loop where the reward is realised return over the decision's horizon, not human preference.",
+    title: "Prediction harness — Hermes (Mass is legacy)",
+    short: "One loop after Resolve: score the 30-day book, open one evidence-backed experiment. Mass promote stays for later A/B.",
     long: `
-The FinGPT project (AI4Finance-Foundation) adapted the RLHF framework used to align ChatGPT: replace **human feedback** with **market feedback** — the realised return of a decision over its stated horizon.  Our RLMF module implements this in two paths:
+The prediction is made by **strategy knobs + agent prompts + graph topology**. Hermes selects the next change from Resolve evidence.
 
-**Prompt-only (default, runs every workflow when \`TRADINGCREW_RLMF_ENABLED=1\`)**
-- Walks resolved episodes and computes \`reward = alpha_return × conviction_weight × horizon_weight\`.
-- Ranks the case-book; picks the top-K wins ("TO EMULATE") and bottom-K losses ("TO AVOID").
-- Injects them as a few-shot PREFIX on the Portfolio Manager task, before the regular prompt.  The PM now sees "here are the past prompts that turned into positive alpha — emulate their shape; here are the ones that turned into losses — avoid their shape".
-- Needs no GPU, no LoRA training, no dataset export.
+**Generate feedback.** Run predictions, then **Resolve** (Episodes tab or \`POST /api/memory/resolve\`). A 30-day review scores the path. Hurt desks write \`recommended_change\` only when the LLM reflection ran — skip-LLM reviews often have empty change text, so Hermes will not invent a desk prompt.
 
-**LoRA fine-tune (offline)**
-- \`python -m trading_crew.agentic.rlmf --export\` writes a FinGPT-Forecaster-compatible JSONL (\`~/.trading_crew/rlmf/dataset.jsonl\`).
-- Point the standard FinGPT LoRA notebook at the file; it fine-tunes the base LLM on \`(state, action) → reward\` pairs.
-- Merge the LoRA adapter back into the vLLM-served base model to close the loop.
+**Hermes diagnosis.** On FAILURE with \`n ≥ min_reviews_to_change\`, open **one** experiment from Resolve's descriptive lessons (which desk misread, which tools hurt, what was over-weighted): dominant hurt desk → desk prompt; reports/filings blamed → skip reports; debate evidence/web blamed → close the evidence drain; split boards → extra debate; hit-rate OK but alpha/DD failed → size down; hit-rate failed → two debate rounds; trader reopen blamed → no reopen; majority playbook vote (must already be a YAML action) → that knob; else the next unused YAML catalog knob. SUCCESS does not auto-install. One LOSS never rewrites production. The LLM does not pick knobs.
 
-The prompt-only path is what runs in production — the LoRA path is the one users adopt after they've accumulated a few hundred resolved decisions.
+**Apply.** Trader / research manager / PM get strategy + the open experiment. A desk-prompt experiment prepends only that desk. A playbook experiment is live on the graph router (\`skip_reports\`, debate/evidence/risk rounds, \`no_trader_reopen\`; debate-round knobs also override the sequential slider). Analyst YAML files are not rewritten. Mass promote is not required.
+
+**Hermes UI.** The Training tab is the 30-day book scoreboard (verdict, n, hit-rate, the experiment Resolve already opened). Strategy, prompts, and bulk run snapshot live on **Settings** (header gear → \`/settings\`). Save writes \`$TRADINGCREW_CACHE_DIR/v3/desk_strategy.yaml\`, \`prompt_overlay.yaml\`, and \`bulk_settings.json\` — not the git yaml, unless you revert. \`TRADINGCREW_STRATEGY_PATH\` still wins if set.
+
+**Legacy Mass.** 1PO/2TO/3PO writes and \`scripts/promote_graph.py\` remain in the tree so Mass-alone can still be A/B'd. They are not the live training step. An existing \`promoted.json\` still applies.
+
+Hermes does not sweep values of a knob and does not use an LLM to pick the winner. One named treatment is live at a time; the 30-day book score keeps or rejects it.
 `.trim(),
-    keywords: ["RLMF", "RLHF", "FinGPT", "training", "reward", "few-shot", "LoRA"],
+    keywords: ["harness", "Hermes", "Mass", "self-learn", "promote", "knob", "desk addenda", "legacy"],
   },
 
   /* ================================================ GLOSSARY TERMS === */

@@ -64,8 +64,9 @@ class FakeRunner:
 
 
 @pytest.fixture(autouse=True)
-def _reset_session_manager(monkeypatch):
+def _reset_session_manager(monkeypatch, tmp_path):
     """Every test gets a fresh SessionManager wired to the FakeRunner."""
+    monkeypatch.setenv("TRADINGCREW_CACHE_DIR", str(tmp_path))
     sm_module.reset_session_manager_for_tests()
 
     original_init = sm_module.init_session_manager

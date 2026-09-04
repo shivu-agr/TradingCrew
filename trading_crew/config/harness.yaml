@@ -1,0 +1,136 @@
+# Harness workflow — conductor budgets and allowlists.
+# Every key is required. Missing keys are an error (no Python defaults).
+
+max_steps: 48
+# Extra conductor turns after max_steps if finish never cleared.
+# Used to write a reasoned ticket (HOLD if conflicted) from the desks
+# that already ran — not a canned size-0 stub.
+exhaust_steps: 4
+max_parallel: 5
+max_spawn_depth: 1
+max_spawn: 20
+context_chars: 24000
+knowledge_k: 5
+retriever: tfidf
+corpus_dir: trading_crew/config/harness_corpus
+conductor_temperature: 0.3
+min_tool_families: 3
+require_skeptical_lens: true
+require_debate_pair: true
+require_bundled_debate: true
+require_reports_lens: true
+require_market_lens: true
+require_news_lens: true
+require_fundamentals_lens: true
+require_macro_lens: true
+require_risk_lens: true
+require_bundled_risk: true
+min_steps_before_finish: 8
+
+query_required_tools:
+  - get_news
+  - get_global_news
+  - get_geopolitical_news
+  - get_supply_chain_risk
+  - research_web
+
+deny_tools:
+  - backtest_setup
+  - request_evidence
+  - write_scratchpad
+
+tool_allowlist:
+  - get_market_context
+  - get_stock_data
+  - get_indicators
+  - get_options_summary
+  - get_analyst_recommendations
+  - get_crowd_positioning
+  - get_news
+  - get_global_news
+  - get_corporate_actions
+  - get_insider_transactions
+  - research_web
+  - get_fundamentals
+  - get_balance_sheet
+  - get_cashflow
+  - get_income_statement
+  - get_shareholding_pattern
+  - get_long_term_thesis
+  - get_forward_estimates
+  - get_sector_peers
+  - get_report_insights
+  - get_macro_data
+  - get_geopolitical_news
+  - get_supply_chain_risk
+  - get_event_proximity
+  - query_knowledge
+
+catalog_desks:
+  - market_analyst
+  - news_analyst
+  - fundamentals_analyst
+  - reports_analyst
+  - macro_analyst
+  - debate
+  - bull_researcher
+  - bear_researcher
+  - research_manager
+  - trader
+  - risk
+  - risk_aggressive
+  - risk_conservative
+  - risk_neutral
+
+plugins_file: trading_crew/config/harness_plugins.yaml
+
+standing_rules: |
+  You are the stock-prediction conductor on a LONG-HORIZON investigation.
+  The operator gives a ticker. Your job is to gather enough cited evidence
+  that SHORT, MEDIUM, and LONG forecasts plus one primary book ticket are
+  defensible — not to finish quickly. The step budget is a ceiling, not a
+  target to burn down. Do not finish because a few tools returned or
+  because one side looks obvious.
+
+  There is no debate-round or risk-round quota and no fixed desk order.
+  You choose what to spawn next from the coverage board. Spawned desks
+  pick their own tools.
+
+  These lenses are required before finish (order is yours):
+  - market_analyst (price / tape)
+  - reports_analyst, and that desk must call get_report_insights
+  - debate at least once (bundled bull+bear in ONE crew: bull opens
+    with tools, bear rebuts with tools, bull closes — each side may
+    call research_web / get_news / get_fundamentals mid-exchange).
+    After that, bull_researcher or bear_researcher may be spawned
+    separately for an extra turn. Separate sides alone do not replace
+    the bundled exchange.
+  - risk at least once (bundled aggressive + conservative + neutral
+    in ONE crew, two rounds: each writes an independent opinion,
+    then they debate each other's opinions). After that,
+    risk_aggressive / risk_conservative / risk_neutral may be spawned
+    separately, or risk may be re-spawned for another bundled debate.
+    Separate wings alone do not replace the bundled exchange.
+  Skipping a required lens is not allowed just to save steps.
+
+  Write every search query yourself from get_market_context facts plus the
+  gap you are filling. Do not reuse canned regional or political phrases.
+
+  Pattern classes to test when the facts warrant it — not a checklist, and
+  never as named anecdotes:
+  - policy-driven tape (rule, sanction, tariff, industrial-policy transmission)
+  - related-party or circular capital (cash that loops through affiliates)
+  - narrative versus cash-flow divergence
+  - ownership / control webs and crowding
+
+  Price, fundamental/filings, and policy/news/structure tool families
+  must all be used. A skeptical lens must run. HOLD is first-class.
+  Horizon stances may disagree; do not copy one narrative into the
+  other two. The primary ticket must follow the primary horizon.
+
+  If the observation transcript is getting long, emit action=compact
+  and keep working. Do not stop because context is large.
+
+  When few steps remain, do not open a new bundled debate. Finish with
+  independent SHORT / MEDIUM / LONG forecasts. Conflict across desks is
+  a HOLD, not a reason to keep spawning.

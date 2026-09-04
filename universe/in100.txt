@@ -1,0 +1,134 @@
+# =============================================================================
+# in100.txt - 100 Indian (NSE) large/mid-cap names, sector-diversified.
+# One ticker per line; `#` comments and blank lines are ignored by
+# trading_crew.agentic.scale._read_universe. `.NS` suffix routes Indian
+# tickers through screener.in + upstox (see .env "Indian-market data sources").
+# =============================================================================
+
+# --- Financials (12) ---
+HDFCBANK.NS
+ICICIBANK.NS
+SBIN.NS
+KOTAKBANK.NS
+AXISBANK.NS
+INDUSINDBK.NS
+BAJFINANCE.NS
+BAJAJFINSV.NS
+SBILIFE.NS
+HDFCLIFE.NS
+ICICIPRULI.NS
+PNB.NS
+
+# --- Information Technology (8) ---
+TCS.NS
+INFY.NS
+HCLTECH.NS
+WIPRO.NS
+TECHM.NS
+LTIM.NS
+PERSISTENT.NS
+COFORGE.NS
+
+# --- Energy / Oil & Gas (6) ---
+RELIANCE.NS
+ONGC.NS
+IOC.NS
+BPCL.NS
+GAIL.NS
+OIL.NS
+
+# --- FMCG / Consumer Staples (9) ---
+HINDUNILVR.NS
+ITC.NS
+NESTLEIND.NS
+BRITANNIA.NS
+DABUR.NS
+TATACONSUM.NS
+GODREJCP.NS
+MARICO.NS
+COLPAL.NS
+
+# --- Automobiles (8) ---
+MARUTI.NS
+TATAMOTORS.NS
+M&M.NS
+BAJAJ-AUTO.NS
+EICHERMOT.NS
+HEROMOTOCO.NS
+TVSMOTOR.NS
+ASHOKLEY.NS
+
+# --- Pharma / Healthcare (9) ---
+SUNPHARMA.NS
+DRREDDY.NS
+CIPLA.NS
+DIVISLAB.NS
+APOLLOHOSP.NS
+LUPIN.NS
+AUROPHARMA.NS
+BIOCON.NS
+TORNTPHARM.NS
+
+# --- Metals / Mining (8) ---
+TATASTEEL.NS
+JSWSTEEL.NS
+HINDALCO.NS
+VEDL.NS
+COALINDIA.NS
+JINDALSTEL.NS
+NMDC.NS
+SAIL.NS
+
+# --- Infrastructure / Cement / Construction (6) ---
+LT.NS
+ULTRACEMCO.NS
+GRASIM.NS
+SHREECEM.NS
+AMBUJACEM.NS
+DLF.NS
+
+# --- Telecom (3) ---
+BHARTIARTL.NS
+IDEA.NS
+INDUSTOWER.NS
+
+# --- Power / Utilities (6) ---
+NTPC.NS
+POWERGRID.NS
+TATAPOWER.NS
+ADANIPOWER.NS
+ADANIGREEN.NS
+JSWENERGY.NS
+
+# --- Consumer Discretionary / Retail (10) ---
+TITAN.NS
+TRENT.NS
+DMART.NS
+ASIANPAINT.NS
+BERGEPAINT.NS
+PIDILITIND.NS
+HAVELLS.NS
+VOLTAS.NS
+PAGEIND.NS
+JUBLFOOD.NS
+
+# --- Chemicals (5) ---
+UPL.NS
+SRF.NS
+PIIND.NS
+DEEPAKNTR.NS
+TATACHEM.NS
+
+# --- Capital Goods / Defense / Diversified (6) ---
+ADANIENT.NS
+SIEMENS.NS
+ABB.NS
+BEL.NS
+HAL.NS
+BOSCHLTD.NS
+
+# --- New-age / Services (4) ---
+IRCTC.NS
+ZOMATO.NS
+NAUKRI.NS
+INDIGO.NS

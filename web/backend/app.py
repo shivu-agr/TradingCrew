@@ -6,6 +6,7 @@ Routes
 * GET  /static/*            -> static assets (js / css)
 * GET  /api/options         -> dropdowns: tickers, tools, agents, indicators, defaults
 * GET  /api/chart           -> OHLCV + indicator series for the Charts tab
+* /api/v1/*                 -> programmatic Prediction API (start / status / stop)
 * WS   /ws/analyze          -> first text frame is JSON config, then events stream
 """
 
@@ -20,16 +21,21 @@ from typing import Any, AsyncIterator, Dict, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-# Load env from the project root (the parent of the ``web/`` dir)
+# Load env from the project root (the parent of the ``web/`` dir).
+# override=True makes .env authoritative: any stale/empty value already present
+# in the launching shell's environment (which load_dotenv would otherwise keep)
+# is replaced by the .env value.  Without this, a leftover shell export silently
+# shadows .env — e.g. the search min-gap reading 0 while .env says 6.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-load_dotenv(PROJECT_ROOT / ".env")
+load_dotenv(PROJECT_ROOT / ".env", override=True)
 
 from .charts import SUPPORTED_INDICATORS, build_chart_payload  # noqa: E402
 from .logging_setup import configure_logging  # noqa: E402
 from .runner import AnalysisRunner, get_agent_catalog, get_tool_catalog  # noqa: E402
+from .api_v1 import router as api_v1_router  # noqa: E402
 from .session_manager import (  # noqa: E402
     _EOF,
     RunStatus,
@@ -51,18 +57,70 @@ FRONTEND_DIR = BACKEND_DIR.parent / "frontend"
 async def _lifespan(app_: FastAPI) -> AsyncIterator[None]:
     """FastAPI lifespan hook.
 
-    Binds the ``SessionManager`` singleton to the running event loop
-    at startup so every subsequent ``/api/sessions/*`` and
-    ``/ws/session/*`` handler can resolve it via
-    ``get_session_manager()``.  Yields immediately (no async teardown
-    on shutdown — sessions in memory are simply discarded).
+    Binds the ``SessionManager`` singleton to the running event loop at startup,
+    then brings up the Kafka (Redpanda) pub-sub bus + the in-process workflow
+    consumer pool so ``/api/scale/*`` can publish work that consumers pull
+    continuously.  If the broker is unreachable we log a clear, actionable error
+    and leave the rest of the UI usable — the scale endpoints will report the
+    same until ``scripts/redpanda.sh start`` is run and the server restarts.
     """
     init_session_manager(asyncio.get_running_loop())
     logger.info("SessionManager initialised on the FastAPI event loop.")
-    yield
+
+    from . import kafka_bus, workflow_consumer
+
+    try:
+        await kafka_bus.start_bus()
+        try:
+            n = int(os.environ.get("TRADINGCREW_WORKFLOW_CONSUMERS", "6"))
+        except ValueError:
+            n = 6
+        await workflow_consumer.start_consumers(n)
+        logger.info(
+            "Kafka workflow pub-sub ready: %d consumers on '%s'. Console: %s",
+            n, kafka_bus.workflow_requests_topic(), kafka_bus.console_url(),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Kafka bus/consumers failed to start — is Redpanda up? Run "
+            "`scripts/redpanda.sh start`. Scale (batch) runs are unavailable "
+            "until the broker is reachable and the server is restarted."
+        )
+
+    # Rate-limit gateway: route outbound web search + screener scraping through
+    # a shared Kafka slot queue so their upstream rate limits are enforced
+    # centrally (and visible in the Console).
+    try:
+        from trading_crew.data_sources import rate_gateway
+
+        await rate_gateway.start(bootstrap=kafka_bus.bootstrap_servers())
+        logger.info("Rate-limit gateway ready for domains: %s", list(rate_gateway.domains()))
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Rate-limit gateway failed to start — search/scrape will fall back "
+            "to in-process throttling until Redpanda is reachable."
+        )
+
+    try:
+        yield
+    finally:
+        try:
+            from trading_crew.data_sources import rate_gateway
+            await rate_gateway.stop()
+        except Exception:  # noqa: BLE001
+            logger.exception("error stopping rate-limit gateway")
+        try:
+            await workflow_consumer.stop_consumers()
+        except Exception:  # noqa: BLE001
+            logger.exception("error stopping workflow consumers")
+        try:
+            await kafka_bus.stop_bus()
+        except Exception:  # noqa: BLE001
+            logger.exception("error stopping Kafka bus")
 
 
 app = FastAPI(title="TradingCrew UI", version="0.2.0", lifespan=_lifespan)
+app.include_router(api_v1_router)
 
 
 class _NoCacheStaticFiles(StaticFiles):
@@ -160,6 +218,12 @@ _HTML_NO_CACHE = {
 }
 
 
+@app.get("/api/health")
+async def health() -> dict:
+    """Liveness probe for Docker / compose. No auth, no I/O."""
+    return {"ok": True, "service": "tradingcrew"}
+
+
 @app.get("/")
 async def homepage() -> FileResponse:
     """Landing page with two dashboard cards (Stock / Commodity).
@@ -173,24 +237,96 @@ async def homepage() -> FileResponse:
     return FileResponse(str(home_path), headers=_HTML_NO_CACHE)
 
 
+@app.get("/settings")
+async def settings_page() -> FileResponse:
+    """Operator Settings page: left pane is run config, right pane is
+    strategy + prompt overlays. Same SPA as ``/stocks``; the client reads
+    the path (and optional ``?book=commodity``)."""
+    return _predict_page()
+
+
+@app.get("/stocks")
+async def stocks_dashboard() -> FileResponse:
+    """High-level stock dashboard (unified SPA): the live prediction universe +
+    Training / Episodes, with the History left pane.  This is the canonical
+    stock landing (renamed from ``/predict``); opening a tile deep-links to
+    ``/run/{ticker}``.  Dated prediction runs live at
+    ``/stocks/history/{date}`` (Names + Portfolio)."""
+    return _predict_page()
+
+
+@app.get("/stocks/history/{run_date}")
+async def stocks_history_page(run_date: str) -> FileResponse:
+    """Prediction-run review: the SPA reads the date off the path and shows
+    that day's ran names plus the virtual portfolio.  Opening a name
+    deep-links to ``/run/{ticker}?date=...``."""
+    return _predict_page()
+
+
 @app.get("/stock")
-async def stock_dashboard() -> FileResponse:
-    index_path = FRONTEND_DIR / "index.html"
-    if not index_path.exists():
-        raise HTTPException(status_code=500, detail="Stock dashboard not found")
-    return FileResponse(str(index_path), headers=_HTML_NO_CACHE)
+async def stock_dashboard() -> RedirectResponse:
+    """Back-compat alias — the stock dashboard is now ``/stocks``."""
+    return RedirectResponse(url="/stocks", status_code=307)
 
 
 @app.get("/commodity")
 async def commodity_dashboard() -> FileResponse:
-    """Same SPA shell as /stock — the client reads window.location.pathname
-    to discriminate asset_class, and the API endpoints accept an
-    ``asset_class`` query param to surface the right ticker presets and
-    route the websocket to the right crew.
+    """High-level commodity dashboard (unified SPA): the Contracts picker +
+    Training / Episodes, with the History/Settings left pane.  Mirrors the
+    stock ``/stocks`` flow — opening a contract deep-links to
+    ``/commodity/run/{contract}`` for a focused per-contract workbench.
+
+    The client reads ``window.location.pathname`` to discriminate asset_class,
+    and the API endpoints accept an ``asset_class`` query param to surface the
+    right ticker presets and route the websocket to the right crew.
     """
     index_path = FRONTEND_DIR / "index.html"
     if not index_path.exists():
         raise HTTPException(status_code=500, detail="Commodity dashboard not found")
+    return FileResponse(str(index_path), headers=_HTML_NO_CACHE)
+
+
+@app.get("/commodity/run/{contract:path}")
+async def commodity_run_page(contract: str) -> FileResponse:
+    """Focused per-contract workbench (commodity analog of ``/run/{ticker}``):
+    the SPA drops the left pane and shows only the instrument tabs (Workflow ·
+    Charts · Futures · Backtest) with a Back button to ``/commodity``.  Uses a
+    ``:path`` converter because futures symbols contain ``=`` (e.g. ``CL=F``)."""
+    index_path = FRONTEND_DIR / "index.html"
+    if not index_path.exists():
+        raise HTTPException(status_code=500, detail="Commodity dashboard not found")
+    return FileResponse(str(index_path), headers=_HTML_NO_CACHE)
+
+
+def _predict_page() -> FileResponse:
+    # The Prediction dashboard is now the front page of the unified SPA
+    # (index.html) — it reads the URL path to open the Prediction tab (or a
+    # historical snapshot) and reveals stock-specific tabs on tile click.
+    index_path = FRONTEND_DIR / "index.html"
+    if not index_path.exists():
+        raise HTTPException(status_code=500, detail="Prediction dashboard not found")
+    return FileResponse(str(index_path), headers=_HTML_NO_CACHE)
+
+
+@app.get("/predict")
+async def predict_page() -> RedirectResponse:
+    """Back-compat alias — the high-level dashboard was renamed to ``/stocks``."""
+    return RedirectResponse(url="/stocks", status_code=307)
+
+
+@app.get("/predict/history/{run_date}")
+async def predict_history_page(run_date: str) -> RedirectResponse:
+    """Back-compat alias — history snapshots now live under ``/stocks``."""
+    return RedirectResponse(url=f"/stocks/history/{run_date}", status_code=307)
+
+
+@app.get("/run/{ticker}")
+async def run_page(ticker: str) -> FileResponse:
+    """Per-stock workbench (the /stock SPA) deep-linked to one ticker with the
+    Workflow tab focused — this is where a Prediction tile opens to."""
+    index_path = FRONTEND_DIR / "index.html"
+    if not index_path.exists():
+        raise HTTPException(status_code=500, detail="Stock dashboard not found")
     return FileResponse(str(index_path), headers=_HTML_NO_CACHE)
 
 
@@ -209,6 +345,9 @@ async def options(
     llm_base = os.getenv("VLLM_LLM_BASE_URL") or os.getenv("LOCAL_LLM_BASE_URL")
     llm_model = os.getenv("VLLM_LLM_MODEL") or os.getenv("LOCAL_LLM_MODEL")
 
+    # Desks running ReAct-style planning (empty when disabled). Only the
+    # trading_crew wires planning today, so commodity stays empty.
+    react_agents: list = []
     if asset_class == "commodity":
         tickers = PRESET_TICKERS_COMMODITY
         default_ticker = os.getenv("TRADINGCREW_DEFAULT_COMMODITY", "CL=F")
@@ -226,11 +365,13 @@ async def options(
         default_ticker = os.getenv("TRADINGCREW_DEFAULT_TICKER", "NTNX")
         tools = get_tool_catalog()
         agents = get_agent_catalog()
+        try:
+            from trading_crew.crew import planning_agent_roles
+            react_agents = planning_agent_roles()
+        except Exception:
+            react_agents = []
 
     from trading_crew.llm_presets import list_presets
-    from trading_crew.embedding_presets import (
-        list_presets as list_embedding_presets,
-    )
 
     return JSONResponse({
         "asset_class": asset_class,
@@ -241,6 +382,7 @@ async def options(
         "default_risk_rounds": int(os.getenv("TRADINGCREW_DEFAULT_RISK", "1")),
         "tools": tools,
         "agents": agents,
+        "react_agents": react_agents,
         "chart_indicators": SUPPORTED_INDICATORS,
         "llm": {
             "model": llm_model,
@@ -248,13 +390,7 @@ async def options(
             "provider": os.getenv("LLM_PROVIDER_PREFIX", "hosted_vllm"),
         },
         "llm_presets": list_presets(),
-        "default_llm_preset": os.getenv(
-            "TRADINGCREW_DEFAULT_LLM_PRESET", "hosted-vllm-oss"
-        ),
-        "embedding_presets": list_embedding_presets(),
-        "default_embedding_preset": os.getenv(
-            "TRADINGCREW_DEFAULT_EMBEDDING_PRESET", "vllm-embedding"
-        ),
+        "default_llm_preset": os.getenv("TRADINGCREW_LLM_PRESET") or "",
         "tavily_configured": bool(os.getenv("TAVILY_API_KEY")),
     })
 
@@ -504,12 +640,18 @@ async def memory_retrieve(
                 "realised_return": r.episode.realised_return,
                 "alpha_return": r.episode.alpha_return,
                 "reflection": r.episode.reflection,
+                "reflection_meta": getattr(r.episode, "reflection_meta", None),
+                "action": (r.episode.action_proposal or {}).get("action"),
                 "similarity": round(r.similarity, 4),
                 "decay_factor": round(r.decay_factor, 4),
                 "score": round(r.score, 4),
                 "delta_days": round(r.delta_days, 2),
                 "retrieval_count": getattr(r.episode, "retrieval_count", 0),
                 "schema_version": getattr(r.episode, "schema_version", 0),
+                "review_ts": getattr(r.episode, "review_ts", None),
+                "review_status": getattr(r.episode, "review_status", None),
+                "review": getattr(r.episode, "review", None),
+                "horizon_scores": getattr(r.episode, "horizon_scores", None),
             }
             for r in results
         ],
@@ -551,19 +693,199 @@ async def memory_evict(
     })
 
 
+def _strategy_memory():
+    from trading_crew.agentic.memory.embedding import make_memory
+
+    cache_dir = os.environ.get("TRADINGCREW_CACHE_DIR") or os.path.expanduser("~/.trading_crew")
+    store_path = Path(cache_dir) / "memory" / "episodes.jsonl"
+    return make_memory(store_path)
+
+
+@app.get("/api/settings")
+async def get_settings(
+    book: str = Query("equity", description="'equity' or 'commodity'"),
+) -> JSONResponse:
+    """One Settings document: live strategy, prompt overlays, and bulk run snapshot."""
+    from trading_crew.agentic.live_settings import SettingsError, settings_payload
+    from trading_crew.agentic.prompt_overlay import PromptOverlayError
+    from trading_crew.agentic.strategy import StrategyError
+
+    try:
+        payload = await asyncio.to_thread(settings_payload, book)
+    except (SettingsError, PromptOverlayError, StrategyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(payload)
+
+
+@app.put("/api/settings")
+async def put_settings(
+    payload: Dict[str, Any],
+    book: str = Query("equity", description="'equity' or 'commodity'"),
+) -> JSONResponse:
+    """Persist only the keys sent: strategy, prompts, unset_prompts, revert_strategy, bulk.
+
+    Existing ``/api/strategy*`` endpoints stay for Hermes experiment ops and
+    programmatic edits.
+    """
+    from trading_crew.agentic.live_settings import SettingsError, save_settings
+    from trading_crew.agentic.prompt_overlay import PromptOverlayError
+    from trading_crew.agentic.strategy import StrategyError
+
+    try:
+        out = await asyncio.to_thread(save_settings, book, payload)
+    except (SettingsError, PromptOverlayError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except StrategyError as exc:
+        code = 409 if payload.get("revert_strategy") else 400
+        raise HTTPException(status_code=code, detail=str(exc)) from exc
+    return JSONResponse(out)
+
+
+@app.get("/api/strategy")
+async def desk_strategy(
+    book: str = Query("equity", description="'equity' or 'commodity'"),
+) -> JSONResponse:
+    """Editable desk strategy + live unified harness scoreboard."""
+    from trading_crew.agentic.harness import dashboard_payload
+
+    mem = _strategy_memory()
+    payload = await asyncio.to_thread(
+        dashboard_payload, mem.all_episodes(), book=book,
+    )
+    return JSONResponse(payload)
+
+
+@app.put("/api/strategy")
+async def save_desk_strategy_api(
+    payload: Dict[str, Any],
+    book: str = Query("equity"),
+) -> JSONResponse:
+    """Validate and write the live strategy file used by the next run / Resolve."""
+    from trading_crew.agentic.harness import dashboard_payload
+    from trading_crew.agentic.strategy import StrategyError, save_desk_strategy
+
+    try:
+        await asyncio.to_thread(save_desk_strategy, payload)
+    except StrategyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    mem = _strategy_memory()
+    board = await asyncio.to_thread(
+        dashboard_payload, mem.all_episodes(), book=book,
+    )
+    return JSONResponse(board)
+
+
+@app.post("/api/strategy/revert")
+async def revert_desk_strategy_api(
+    book: str = Query("equity"),
+) -> JSONResponse:
+    """Delete the live strategy file so the packaged yaml is used."""
+    from trading_crew.agentic.harness import dashboard_payload
+    from trading_crew.agentic.strategy import StrategyError, revert_live_strategy
+
+    try:
+        reverted = await asyncio.to_thread(revert_live_strategy)
+    except StrategyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    mem = _strategy_memory()
+    board = await asyncio.to_thread(
+        dashboard_payload, mem.all_episodes(), book=book,
+    )
+    board["reverted"] = reverted
+    return JSONResponse(board)
+
+
+@app.put("/api/strategy/prompts")
+async def save_strategy_prompt(
+    payload: Dict[str, Any],
+    book: str = Query("equity"),
+) -> JSONResponse:
+    """Set a per-agent goal/backstory overlay. Unset via DELETE."""
+    from trading_crew.agentic.prompt_overlay import PromptOverlayError, set_prompt
+
+    key = str(payload.get("key") or "").strip()
+    try:
+        row = await asyncio.to_thread(
+            set_prompt,
+            book,
+            key,
+            goal=str(payload.get("goal") or ""),
+            backstory=str(payload.get("backstory") or ""),
+        )
+    except PromptOverlayError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(row)
+
+
+@app.delete("/api/strategy/prompts/{agent_key}")
+async def delete_strategy_prompt(
+    agent_key: str,
+    book: str = Query("equity"),
+) -> JSONResponse:
+    from trading_crew.agentic.prompt_overlay import PromptOverlayError, unset_prompt
+
+    try:
+        removed = await asyncio.to_thread(unset_prompt, book, agent_key)
+    except PromptOverlayError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse({"key": agent_key, "removed": removed})
+
+
+@app.post("/api/strategy/experiment")
+async def strategy_experiment_api(
+    payload: Dict[str, Any],
+    book: str = Query("equity"),
+) -> JSONResponse:
+    """Close, open, or clear used knobs from the Hermes UI."""
+    from trading_crew.agentic.harness import dashboard_payload
+    from trading_crew.agentic.self_learn import (
+        clear_used_knobs_ui,
+        close_experiment_ui,
+        open_knob_ui,
+    )
+    from trading_crew.agentic.strategy import StrategyError
+
+    action = str(payload.get("action") or "").strip()
+    mem = _strategy_memory()
+    try:
+        if action == "close":
+            await asyncio.to_thread(close_experiment_ui)
+        elif action == "clear_used":
+            await asyncio.to_thread(clear_used_knobs_ui)
+        elif action == "open":
+            knob = str(payload.get("knob") or "").strip()
+            if not knob:
+                raise HTTPException(status_code=400, detail="open requires knob")
+            await asyncio.to_thread(
+                open_knob_ui, knob, mem.all_episodes(), book=book,
+            )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="action must be close, open, or clear_used",
+            )
+    except HTTPException:
+        raise
+    except (ValueError, StrategyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    board = await asyncio.to_thread(
+        dashboard_payload, mem.all_episodes(), book=book,
+    )
+    return JSONResponse(board)
+
+
 @app.post("/api/memory/resolve")
 async def memory_resolve(
     ticker: Optional[str] = Query(None, description="Optional ticker filter; resolve only this symbol's episodes"),
     skip_llm: bool = Query(False, description="If true, write outcomes but skip the LLM reflection step (useful for batch / CI)"),
 ) -> JSONResponse:
-    """Agentic training L2 — sweep pending episodes whose outcome window
-    has elapsed, compute realised return + alpha + max drawdown, and write
-    an LLM-generated lesson back into each episode.
+    """Agentic training L2 — sweep pending episodes whose 30-day learning
+    review or thesis ``outcome_ts`` has elapsed, compute realised return +
+    alpha + max drawdown, and write an LLM-generated lesson on the thesis
+    clock.
 
-    The reflections are immediately visible to future runs via the
-    ``retrieve_past_episodes`` tool (M3 + Phase C) because the M3
-    outcome-embargo unlocks an episode for retrieval once its
-    ``outcome_ts`` has passed.
+    A 30-day ``REVIEW_RESOLVED`` does not close a MEDIUM/LONG thesis.
+    The review lesson (and any tool investigation) is written for Hermes.
 
     Returns
     -------
@@ -601,6 +923,41 @@ def _count_statuses(records) -> Dict[str, int]:
     for r in records:
         counts[r.status] = counts.get(r.status, 0) + 1
     return counts
+
+
+@app.get("/api/calibration")
+async def calibration(
+    ticker: Optional[str] = Query(None, description="Optional ticker filter; omit for the whole book"),
+    n_bins: int = Query(10, ge=2, le=20, description="Reliability bins over [0,1]"),
+    basis: str = Query("return", description="'return' (raw) or 'alpha' (vs SPY)"),
+    cohort: str = Query("current", description="'current' (this workflow version) or 'all'"),
+) -> JSONResponse:
+    """Conviction calibration — is the desk's stated confidence honest?
+
+    Scores resolved directional episodes into a Brier score, reliability bins
+    (predicted conviction vs realised hit-rate), and a signed over/under-
+    confidence gap.  Measurement-only; empty (``n == 0``) until episodes
+    resolve.
+    """
+    from trading_crew.agentic.calibration import compute_calibration
+
+    workflow_version = None
+    if (cohort or "current").strip().lower() != "all":
+        try:
+            from trading_crew.agentic.versioning import workflow_version as _wv
+
+            workflow_version = _wv()
+        except Exception:
+            workflow_version = None
+
+    report = await asyncio.to_thread(
+        compute_calibration,
+        symbol=ticker,
+        n_bins=n_bins,
+        use_alpha=(basis or "return").strip().lower() == "alpha",
+        workflow_version=workflow_version,
+    )
+    return JSONResponse(report.to_dict())
 
 
 @app.get("/api/portfolio")
@@ -757,23 +1114,62 @@ async def runs_clear(
 
 
 @app.get("/api/runs/{ticker}/latest")
-async def runs_latest(ticker: str) -> JSONResponse:
-    """Phase E — full record of the most recent run for ``ticker``."""
+async def runs_latest(
+    ticker: str,
+    full: bool = Query(False, description="Include agent report bodies"),
+) -> JSONResponse:
+    """Most recent run for ``ticker``. Lite header by default."""
     from trading_crew.agentic.runs import load_latest_run
-    record = await asyncio.to_thread(load_latest_run, ticker)
+    record = await asyncio.to_thread(load_latest_run, ticker, full)
     if not record:
         return JSONResponse({"error": "No runs recorded for this ticker"}, status_code=404)
     return JSONResponse(record)
 
 
+@app.get("/api/runs/{ticker}/{run_id}/reports")
+async def runs_reports(
+    ticker: str,
+    run_id: str,
+    role: str = Query("", description="If set, only this agent role"),
+) -> JSONResponse:
+    """Agent report bodies for a saved run (one role, or all)."""
+    from . import prediction_db as db
+    payload = await asyncio.to_thread(db.get_run_reports, run_id, ticker, role or None)
+    if payload is None:
+        return JSONResponse({"error": "Run not found"}, status_code=404)
+    return JSONResponse(payload)
+
+
 @app.get("/api/runs/{ticker}/{run_id}")
-async def runs_load(ticker: str, run_id: str) -> JSONResponse:
-    """Phase E — full record of a specific past run."""
+async def runs_load(
+    ticker: str,
+    run_id: str,
+    full: bool = Query(False, description="Include agent report bodies"),
+) -> JSONResponse:
+    """Saved run header (diagram + decision). Bodies via ``/reports`` or ``?full=1``."""
     from trading_crew.agentic.runs import load_run
-    record = await asyncio.to_thread(load_run, run_id, ticker)
+    record = await asyncio.to_thread(load_run, run_id, ticker, full)
     if not record:
         return JSONResponse({"error": "Run not found"}, status_code=404)
     return JSONResponse(record)
+
+
+@app.get("/api/search_stats")
+async def search_stats_list(limit: int = Query(50, ge=1, le=500)) -> JSONResponse:
+    """Recent sessions (trace ids) that recorded web-search calls."""
+    from web.backend import prediction_db as db
+
+    rows = await asyncio.to_thread(db.list_search_trace_ids, limit)
+    return JSONResponse({"sessions": rows})
+
+
+@app.get("/api/search_stats/{trace_id}")
+async def search_stats_detail(trace_id: str) -> JSONResponse:
+    """Per-backend web-search counters for one session (batch job_id / run_id)."""
+    from web.backend import prediction_db as db
+
+    stats = await asyncio.to_thread(db.get_search_stats, trace_id)
+    return JSONResponse(stats)
 
 
 @app.post("/api/grid_search")
@@ -790,7 +1186,18 @@ async def grid_search(
     sweep_drawdown_kill: bool = Query(False, description="Also sweep drawdown_kill_threshold in {0.10, 0.20, 0.30}"),
     sweep_cost_model: bool = Query(False, description="Also sweep cost_model across low/standard/high (forks search per preset)"),
     validation: str = Query("walk_forward", description="walk_forward | cpcv (Combinatorial Purged CV)"),
+    cpcv_groups: int = Query(6, ge=2, le=12, description="CPCV: number of contiguous groups (validation=cpcv only)"),
+    cpcv_k: int = Query(2, ge=1, le=6, description="CPCV: groups held out per fold (validation=cpcv only)"),
+    optimizer: str = Query("grid", description="grid (brute-force) | pso (particle-swarm)"),
+    swarm_size: int = Query(12, ge=2, le=60, description="PSO: number of particles (optimizer=pso only)"),
+    swarm_iterations: int = Query(8, ge=1, le=40, description="PSO: iterations (optimizer=pso only)"),
+    swarm_seed: int = Query(0, description="PSO: RNG seed for reproducibility (optimizer=pso only)"),
+    consensus: bool = Query(False, description="Also fuse the top-K configs into a consensus ensemble backtest"),
+    consensus_top_k: int = Query(5, ge=2, le=25, description="How many configs to fuse when consensus=true"),
     lookback_years: int = Query(5, ge=1, le=10, description="Years of OHLCV history to fetch for the backtest (default 5y)"),
+    workflow_version: str = Query("", description="Phase 0 cohort filter — restrict to this workflow_version (blank = all)"),
+    source: str = Query("", description="Phase 0 cohort filter — 'live' | 'backfill' (blank = all)"),
+    apply: bool = Query(False, description="Persist the winning config as this ticker's tuned sizing/gate config — applied at live inference AND walk-forward"),
 ) -> JSONResponse:
     """Agentic training L3 — sweep sizing/gate configs against logged
     proposals for ``ticker`` and return the best configuration by the
@@ -799,10 +1206,12 @@ async def grid_search(
     The Default ranking is Deflated Sharpe (Bailey & López de Prado 2014),
     which penalises the multiple-comparison overfit that grid-searches
     notoriously fall into.  Coarse = 8 points (2^3), Default = 27 (3^3),
-    Fine = 125 (5^3).
+    Fine = 125 (5^3).  With ``validation=cpcv`` each config is scored on
+    its combinatorial out-of-sample paths and the sweep also reports a
+    Probability of Backtest Overfitting (PBO).
     """
     from datetime import datetime
-    from trading_crew.agentic.backtest import WalkForwardConfig
+    from trading_crew.agentic.backtest import CPCVConfig, WalkForwardConfig
     from trading_crew.agentic.execution.contracts import ActionProposal
     from trading_crew.agentic.grid_search import (
         GridAxis, default_grid, run_grid_search,
@@ -814,6 +1223,13 @@ async def grid_search(
     store_path = Path(cache_dir) / "memory" / "episodes.jsonl"
     mem = EpisodicMemory(store_path)
     episodes = [e for e in mem.all_episodes() if e.symbol.upper() == ticker.upper()]
+    if workflow_version or source:
+        from trading_crew.agentic.versioning import filter_episodes_by_cohort
+        episodes = filter_episodes_by_cohort(
+            episodes,
+            workflow_version=workflow_version or None,
+            source=source or None,
+        )
     if not episodes:
         return JSONResponse({
             "ticker": ticker, "n_proposals": 0,
@@ -873,6 +1289,108 @@ async def grid_search(
         })
 
     wf_cfg = WalkForwardConfig(train_size=train_size, embargo_size=embargo_size, test_size=test_size)
+    cpcv_cfg = CPCVConfig(n_groups=cpcv_groups, k_test=cpcv_k, embargo_size=embargo_size)
+
+    def _persist_best(best: dict | None) -> dict | None:
+        """When ``apply=1``, save the winning config as this ticker's tuned
+        sizing/gate config so live inference + walk-forward both use it."""
+        if not apply or not best:
+            return None
+        try:
+            from trading_crew.agentic.tuning import save_tuned_config
+            meta = {
+                "rank_by": rank_by,
+                "rank_metric": best.get("rank_metric"),
+                "deflated_sharpe": (best.get("metrics") or {}).get("deflated_sharpe"),
+                "sharpe": (best.get("metrics") or {}).get("sharpe"),
+                "n_proposals": len(proposals),
+                "validation": validation,
+                "optimizer": optimizer,
+                "cohort_workflow_version": workflow_version or None,
+            }
+            path = save_tuned_config(
+                ticker,
+                sizing_config=best.get("sizing_config") or {},
+                gate_config=best.get("gate_config") or {},
+                meta=meta,
+                cache_dir=cache_dir,
+            )
+            return {"saved_to": str(path), "meta": meta}
+        except Exception as exc:  # noqa: BLE001 — persistence is best-effort
+            logger.warning("Failed to persist tuned config for %s: %s", ticker, exc)
+            return {"error": str(exc)}
+
+    def _consensus_block(members: list[tuple]) -> dict | None:
+        """Fuse the supplied (sizing, gate, score) members into a consensus
+        ensemble backtest and return its serialised result (or None)."""
+        if not consensus or len(members) < 2:
+            return None
+        from trading_crew.agentic.swarm import ConsensusConfig, run_consensus_backtest
+        cons = run_consensus_backtest(
+            proposals=proposals,
+            ohlcv_by_symbol={ticker: ohlcv},
+            members=members,
+            config=ConsensusConfig(top_k=consensus_top_k),
+            cost_model_name=cost_model,
+        )
+        return cons.to_dict()
+
+    # ---- Swarm (PSO) optimizer branch ------------------------------------
+    if optimizer == "pso":
+        from trading_crew.agentic.swarm import PSOConfig, run_swarm_search
+        pso = await asyncio.to_thread(
+            run_swarm_search,
+            proposals=proposals,
+            ohlcv_by_symbol={ticker: ohlcv},
+            pso_config=PSOConfig(
+                swarm_size=swarm_size, iterations=swarm_iterations, seed=swarm_seed,
+            ),
+            walk_forward_config=wf_cfg,
+            cpcv_config=cpcv_cfg,
+            cost_model_name=cost_model,
+            rank_by=rank_by,
+            validation=validation,
+        )
+        d = pso.to_dict()
+        # Re-shape the swarm evaluations into the same "points" schema the
+        # grid returns, so the UI table renders either optimizer uniformly.
+        points = [
+            {
+                "sizing_config": e["sizing_config"],
+                "gate_config": e["gate_config"],
+                "metrics": e["metrics"],
+                "rank_metric": e["score"],
+                "iteration": e.get("iteration", 0),
+                "cost_model": cost_model,
+            }
+            for e in d.get("evaluations", [])
+        ]
+        points.sort(key=lambda p: p.get("rank_metric", float("-inf")), reverse=True)
+        members = [
+            (e["sizing_config"], e["gate_config"], e["score"])
+            for e in d.get("evaluations", [])
+            if e.get("metrics")
+        ]
+        resp = {
+            "ticker": ticker,
+            "n_proposals": len(proposals),
+            "optimizer": "pso",
+            "validation": validation,
+            "n_points": len(points),
+            "points": points,
+            "best": points[0] if points else None,
+            "best_index": 0 if points else None,
+            "best_params": d.get("best_params"),
+            "history": d.get("history"),
+            "n_evaluations": d.get("n_evaluations"),
+        }
+        cons_block = _consensus_block(members)
+        if cons_block is not None:
+            resp["consensus"] = cons_block
+        applied = _persist_best(resp.get("best"))
+        if applied is not None:
+            resp["applied_tune"] = applied
+        return JSONResponse(resp)
 
     # Phase 2C — cost-model sweep.  Re-run the same grid against each
     # cost preset, then pick the best (configuration, cost-model) pair.
@@ -897,6 +1415,8 @@ async def grid_search(
             grid=grid,
             cost_model_name=cm,
             rank_by=rank_by,
+            validation=validation,
+            cpcv_config=cpcv_cfg,
         )
         d = partial.to_dict()
         if not base_dict:
@@ -919,7 +1439,19 @@ async def grid_search(
         base_dict["best"] = best
         base_dict["best_index"] = 0
         base_dict["validation"] = validation
+        base_dict["optimizer"] = "grid"
         base_dict["cost_models_swept"] = cost_models
+        cons_members = [
+            (p.get("sizing_config", {}), p.get("gate_config", {}), p.get("rank_metric", float("-inf")))
+            for p in aggregated_points
+            if p.get("metrics")
+        ]
+        cons_block = _consensus_block(cons_members)
+        if cons_block is not None:
+            base_dict["consensus"] = cons_block
+        applied = _persist_best(base_dict.get("best"))
+        if applied is not None:
+            base_dict["applied_tune"] = applied
     return JSONResponse(base_dict)
 
 
@@ -1016,99 +1548,38 @@ async def backtest_seed(
         "ticker": ticker.upper(),
         "seeded": n,
         "sample": seeded_records,
-        "store_path": str(store_path),
+        "store_path": str(mem.db_path),
     })
 
 
 # ---------------------------------------------------------------------------
-# L4 — Reinforcement Learning training endpoints
+# L4 — removed from the live prediction path (410, not a silent 404)
 # ---------------------------------------------------------------------------
+
+_L4_GONE = (
+    "L4 PPO is removed from the live prediction path. "
+    "Live sizing is the L3 applied tune composed with an open Hermes "
+    "size_scale. The trainer library remains at trading_crew.agentic.rl."
+)
+
+
+def _l4_removed() -> None:
+    raise HTTPException(status_code=410, detail=_L4_GONE)
 
 
 @app.post("/api/training/rl/start")
 async def rl_start(payload: Dict[str, Any]) -> JSONResponse:
-    """Kick off an L4 PPO training run for ``ticker``.
-
-    Request JSON::
-
-        {
-          "ticker": "NVDA",
-          "asset_class": "stock",                    # or "commodity"
-          "train_window_days": 750,
-          "eval_window_days": 60,
-          "ppo_config": {                            # all optional
-            "total_steps": 20000,
-            "steps_per_rollout": 512,
-            "n_epochs": 4,
-            "learning_rate": 0.0003,
-            "entropy_coef": 0.01
-          },
-          "env_config": {                            # all optional
-            "cost_model_name": "standard",
-            "drawdown_kill_pct": 0.4,
-            "turnover_penalty_bps": 0.0
-          },
-          "seed": 42
-        }
-
-    Returns the new run record immediately (status="running"); the
-    actual PPO loop runs in a background worker.  Poll
-    ``/api/training/rl/status?ticker=...`` to watch progress.
-    """
-    from .rl_runner import start_training
-
-    ticker = (payload.get("ticker") or "").strip()
-    if not ticker:
-        raise HTTPException(status_code=400, detail="ticker is required")
-    asset_class = (payload.get("asset_class") or "stock").lower()
-    train_window = int(payload.get("train_window_days") or 750)
-    eval_window = int(payload.get("eval_window_days") or 60)
-    seed = int(payload.get("seed") or 42)
-    horizon_mode = (payload.get("horizon_mode") or "balanced").lower()
-
-    algorithm = (payload.get("algorithm") or "ppo").lower()
-    policy_universe = payload.get("policy_universe") or []
-    try:
-        record = await asyncio.to_thread(
-            start_training,
-            ticker=ticker,
-            asset_class=asset_class,
-            train_window_days=train_window,
-            eval_window_days=eval_window,
-            ppo_overrides=payload.get("ppo_config") or {},
-            env_overrides=payload.get("env_config") or {},
-            seed=seed,
-            algorithm=algorithm,
-            policy_universe=list(policy_universe),
-            horizon_mode=horizon_mode,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return JSONResponse(record)
+    _l4_removed()
 
 
 @app.post("/api/training/rl/stop")
 async def rl_stop(payload: Dict[str, Any]) -> JSONResponse:
-    """Cooperatively stop a running L4 training job.
-
-    Body must contain either ``{"ticker": "..."}`` (stops the active
-    run for that ticker) or ``{"run_id": "..."}`` (stops a specific
-    run id, regardless of ticker).
-    """
-    from .rl_runner import stop_training
-    ticker = (payload.get("ticker") or "").strip() or None
-    run_id = (payload.get("run_id") or "").strip() or None
-    if not ticker and not run_id:
-        raise HTTPException(status_code=400, detail="ticker or run_id required")
-    result = await asyncio.to_thread(stop_training, ticker=ticker, run_id=run_id)
-    return JSONResponse(result)
+    _l4_removed()
 
 
 @app.get("/api/training/rl/status")
 async def rl_status(ticker: str = Query(..., min_length=1)) -> JSONResponse:
-    """Snapshot of the currently-running L4 job for ``ticker``."""
-    from .rl_runner import get_status
-    return JSONResponse(get_status(ticker))
+    _l4_removed()
 
 
 @app.get("/api/training/rl/runs")
@@ -1116,238 +1587,368 @@ async def rl_runs(
     ticker: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=200),
 ) -> JSONResponse:
-    """List past + current L4 runs (most recent first).
-
-    If ``ticker`` is set, restrict to that ticker.  Each entry includes
-    the eval result + duration so the UI leaderboard can rank without
-    a second call.
-    """
-    from trading_crew.agentic.rl import list_runs
-    return JSONResponse(
-        {
-            "ticker": ticker,
-            "runs": [r.to_dict() for r in list_runs(ticker, limit=limit)],
-        }
-    )
+    _l4_removed()
 
 
 @app.get("/api/training/rl/runs/{ticker}/{run_id}")
 async def rl_run_detail(ticker: str, run_id: str) -> JSONResponse:
-    """Full snapshot for a single L4 run: record + metrics stream."""
-    from .rl_runner import get_run_snapshot
-    snap = get_run_snapshot(ticker, run_id)
-    if snap is None:
-        raise HTTPException(status_code=404, detail=f"No run {ticker}/{run_id}")
-    return JSONResponse(snap)
+    _l4_removed()
 
 
 @app.post("/api/training/rl/promote")
 async def rl_promote(payload: Dict[str, Any]) -> JSONResponse:
-    """Promote a completed L4 run so it becomes the active policy for
-    its ticker.  Body: ``{"ticker": "...", "run_id": "..."}``.
-
-    Promotion writes a single ``promoted/<ticker>.json`` pointer that
-    the ``rl_policy_recommendation`` tool consults at inference time.
-    Until you promote, the tool returns a "no policy" note — there's
-    no implicit "use latest" fallback so a half-trained run can never
-    silently bleed into production decisions.
-    """
-    from trading_crew.agentic.rl import promote_run
-    ticker = (payload.get("ticker") or "").strip()
-    run_id = (payload.get("run_id") or "").strip()
-    if not ticker or not run_id:
-        raise HTTPException(status_code=400, detail="ticker and run_id required")
-    try:
-        result = await asyncio.to_thread(promote_run, ticker, run_id)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    return JSONResponse(result)
+    _l4_removed()
 
 
 @app.get("/api/training/rl/promoted")
 async def rl_promoted() -> JSONResponse:
-    """List every promoted L4 policy, one per ticker."""
-    from trading_crew.agentic.rl import list_promoted
-    return JSONResponse({"promoted": list_promoted()})
+    _l4_removed()
 
 
 @app.post("/api/training/rl/recommend")
 async def rl_recommend(payload: Dict[str, Any]) -> JSONResponse:
-    """Run the promoted policy against today's bar and return the
-    structured recommendation.  Body: ``{"ticker": "..."}``.
-
-    This is the same call path the LLM tool uses, exposed via HTTP so
-    the UI can show the current advice without spinning up the crew.
-    """
-    from trading_crew.agentic.rl import load_policy
-    from .charts import _fetch_ohlcv
-
-    ticker = (payload.get("ticker") or "").strip().upper()
-    if not ticker:
-        raise HTTPException(status_code=400, detail="ticker is required")
-    client = await asyncio.to_thread(load_policy, ticker)
-    if client is None:
-        return JSONResponse({"ticker": ticker, "available": False,
-                             "note": "No policy has been promoted for this ticker yet."})
-
-    df = await asyncio.to_thread(_fetch_ohlcv, ticker, datetime.utcnow(), 180)
-    if df is None or df.empty:
-        raise HTTPException(status_code=400, detail=f"No OHLCV for {ticker}")
-    df = df.rename(columns={c: c.lower() for c in df.columns})
-    if "date" in df.columns:
-        df = df.set_index("date").sort_index()
-    try:
-        rec = await asyncio.to_thread(client.recommend, df)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Policy inference failed: {exc}")
-    return JSONResponse({"ticker": ticker, "available": True, "recommendation": rec.to_dict()})
+    _l4_removed()
 
 
 # ---------------------------------------------------------------------------
-# RLMF — training data (episodes), dataset export, LoRA fine-tune, serving.
-# See web/backend/rlmf_runner.py for the controller.  The prompt-only RLMF
-# surrogate runs inside the workflow; these endpoints drive the *offline*
-# LoRA leg + let the operator serve the trained model (with/without LoRA)
-# for inference — all from the RL-Training tab.
+# Phase 4 — signal fusion (advisory). LLM + L3 expectancy + crowd.
+# L4 policy is not assembled on the live path.
 # ---------------------------------------------------------------------------
 
 
-@app.get("/api/training/rlmf/episodes")
-async def rlmf_episodes(
-    symbol: Optional[str] = Query(None),
-    status: Optional[str] = Query(None, description="PENDING / RESOLVED / ABANDONED"),
-    limit: int = Query(200, ge=1, le=1000),
+# Moved to web/backend/fusion.py so the workflow runner can reuse it for the
+# optional in-run fusion step without importing app (circular).
+from .fusion import assemble_fusion_inputs as _assemble_fusion_inputs
+
+
+@app.get("/api/signals/fusion")
+async def signals_fusion(
+    ticker: str = Query(..., min_length=1),
+    include_crowd: bool = Query(False, description="Also fetch the live crowd signal (slower)"),
+    expectancy_source: str = Query(
+        "pso",
+        description="L3 expectancy source: 'pso' (swarm-tuned M5 config), "
+                    "'proxy' (mean resolved-episode edge), or 'none' (disable gate)",
+    ),
 ) -> JSONResponse:
-    """Raw episode store — the source data RLMF trains on."""
-    from .rlmf_runner import list_episodes
-    return JSONResponse(await asyncio.to_thread(list_episodes, symbol=symbol, status=status, limit=limit))
+    """Fuse LLM + L3 expectancy + crowd into one guardrailed signal (advisory)."""
+    from trading_crew.agentic.signals import fuse_signals
+
+    ticker = ticker.strip().upper()
+    inputs, sources, err = await asyncio.to_thread(
+        _assemble_fusion_inputs, ticker, include_crowd, expectancy_source
+    )
+    if err:
+        return JSONResponse({"ticker": ticker, "available": False, "note": err, "sources": sources})
+    fused = fuse_signals(
+        inputs["llm"],
+        policy=inputs["policy"],
+        expectancy=inputs["expectancy"],
+        crowd=inputs["crowd"],
+    )
+    return JSONResponse({
+        "ticker": ticker,
+        "available": True,
+        "sources": sources,
+        "fused": fused.to_dict(),
+    })
 
 
-@app.get("/api/training/rlmf/dataset")
-async def rlmf_dataset(symbol: Optional[str] = Query(None)) -> JSONResponse:
-    """RLMF dataset rows (resolved episodes) + aggregate reward summary."""
-    from .rlmf_runner import dataset_summary
-    return JSONResponse(await asyncio.to_thread(dataset_summary, symbol=symbol))
+# ---------------------------------------------------------------------------
+# Harness — synthetic 30-day book so Hermes diagnosis can be exercised without
+# waiting for live clocks.  Tagged SAMPLE-… and removable.
+# ---------------------------------------------------------------------------
 
 
-@app.post("/api/training/rlmf/export")
-async def rlmf_export(payload: Dict[str, Any]) -> JSONResponse:
-    """Write the FinGPT-Forecaster-compatible dataset JSONL to disk."""
-    from .rlmf_runner import export_dataset
-    symbol = (payload.get("symbol") or "").strip() or None
-    return JSONResponse(await asyncio.to_thread(export_dataset, symbol=symbol))
+@app.post("/api/harness/sample/seed")
+async def harness_sample_seed(payload: Dict[str, Any]) -> JSONResponse:
+    """Seed synthetic 30-day reviews and run one harness step on those rows."""
+    from trading_crew.agentic.harness import seed_and_step
+    from trading_crew.agentic.memory.embedding import make_memory
 
-
-@app.post("/api/training/rlmf/sample/seed")
-async def rlmf_sample_seed(payload: Dict[str, Any]) -> JSONResponse:
-    """Seed synthetic *resolved* episodes so RLMF can be tested without
-    waiting for real decisions to resolve.  Tagged ``SAMPLE-…`` and
-    removable via the clear endpoint."""
-    from .rlmf_runner import seed_sample_episodes
+    cache_dir = os.environ.get("TRADINGCREW_CACHE_DIR") or os.path.expanduser("~/.trading_crew")
+    mem = make_memory(Path(cache_dir) / "memory" / "episodes.jsonl")
     return JSONResponse(await asyncio.to_thread(
-        seed_sample_episodes,
+        seed_and_step,
         count=int(payload.get("count") or 12),
         symbol=(payload.get("symbol") or "SAMPLE.NS").strip() or "SAMPLE.NS",
+        memory=mem,
+        fail=bool(payload.get("fail", True)),
+        pattern=(payload.get("pattern") or None),
     ))
 
 
-@app.post("/api/training/rlmf/sample/clear")
-async def rlmf_sample_clear() -> JSONResponse:
-    """Remove every seeded ``SAMPLE-…`` episode (real data untouched)."""
-    from .rlmf_runner import clear_sample_episodes
-    return JSONResponse(await asyncio.to_thread(clear_sample_episodes))
+@app.post("/api/harness/sample/clear")
+async def harness_sample_clear() -> JSONResponse:
+    """Remove ``SAMPLE-…`` episodes and restore the pre-seed journal."""
+    from trading_crew.agentic.harness import clear_sample_and_restore
+    from trading_crew.agentic.memory.embedding import make_memory
+
+    cache_dir = os.environ.get("TRADINGCREW_CACHE_DIR") or os.path.expanduser("~/.trading_crew")
+    mem = make_memory(Path(cache_dir) / "memory" / "episodes.jsonl")
+    return JSONResponse(await asyncio.to_thread(clear_sample_and_restore, memory=mem))
 
 
-@app.get("/api/training/rlmf/adapters")
-async def rlmf_adapters() -> JSONResponse:
-    """Discover the trained LoRA adapter on disk (if any)."""
-    from .rlmf_runner import list_adapters
-    return JSONResponse(await asyncio.to_thread(list_adapters))
+# ---------------------------------------------------------------------------
+# Offline PIT decision-label backfill (Phase 2).  Runs the crew "as of" past
+# dates to generate labeled decisions now; resumable + rate-limited.
+# ---------------------------------------------------------------------------
 
 
-@app.post("/api/training/rlmf/lora/start")
-async def rlmf_lora_start(payload: Dict[str, Any]) -> JSONResponse:
-    """Kick off a background LoRA fine-tune against the chosen base model.
+@app.post("/api/backfill/start")
+async def backfill_start(payload: Dict[str, Any]) -> JSONResponse:
+    """Start (or resume) an offline point-in-time backfill.
 
     Body::
 
-        {"base_model": "Qwen/Qwen3-32B", "symbol": null, "epochs": 1,
-         "learning_rate": 2e-4, "lora_r": 16, "lora_alpha": 32,
-         "lora_dropout": 0.05, "max_seq_len": 2048, "output_dir": null}
+        {"tickers": ["RELIANCE.NS", "TCS.NS"], "start_date": "2023-01-01",
+         "end_date": "2024-06-01", "spacing_days": 30, "horizon_days": 90,
+         "debate_rounds": 1, "risk_rounds": 1, "cell_gap_seconds": 5,
+         "resolve": true, "reflect": false, "include_unresolvable": false}
     """
-    from .rlmf_runner import start_lora_training
+    from .backfill_runner import start_backfill
+
+    tickers = payload.get("tickers") or []
+    if isinstance(tickers, str):
+        tickers = [t.strip() for t in tickers.split(",") if t.strip()]
     try:
         snap = await asyncio.to_thread(
-            start_lora_training,
-            base_model=(payload.get("base_model") or "").strip(),
-            symbol=(payload.get("symbol") or "").strip() or None,
-            epochs=int(payload.get("epochs") or 1),
-            learning_rate=float(payload.get("learning_rate") or 2e-4),
-            lora_r=int(payload.get("lora_r") or 16),
-            lora_alpha=int(payload.get("lora_alpha") or 32),
-            lora_dropout=float(payload.get("lora_dropout") or 0.05),
-            max_seq_len=int(payload.get("max_seq_len") or 2048),
-            output_dir=(payload.get("output_dir") or "").strip() or None,
+            start_backfill,
+            tickers=tickers,
+            start_date=(payload.get("start_date") or "").strip(),
+            end_date=(payload.get("end_date") or "").strip(),
+            spacing_days=int(payload.get("spacing_days") or 30),
+            horizon_days=int(payload.get("horizon_days") or 90),
+            debate_rounds=int(payload.get("debate_rounds") or 1),
+            risk_rounds=int(payload.get("risk_rounds") or 1),
+            cell_gap_seconds=float(payload.get("cell_gap_seconds") or 5.0),
+            resolve=bool(payload.get("resolve", True)),
+            reflect=bool(payload.get("reflect", False)),
+            include_unresolvable=bool(payload.get("include_unresolvable", False)),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return JSONResponse(snap)
 
 
-@app.post("/api/training/rlmf/lora/stop")
-async def rlmf_lora_stop() -> JSONResponse:
-    from .rlmf_runner import stop_lora_training
-    return JSONResponse(await asyncio.to_thread(stop_lora_training))
+@app.post("/api/backfill/stop")
+async def backfill_stop() -> JSONResponse:
+    from .backfill_runner import stop_backfill
+    return JSONResponse(await asyncio.to_thread(stop_backfill))
 
 
-@app.get("/api/training/rlmf/lora/status")
-async def rlmf_lora_status() -> JSONResponse:
-    from .rlmf_runner import get_lora_status
-    return JSONResponse(await asyncio.to_thread(get_lora_status))
+@app.get("/api/backfill/status")
+async def backfill_status() -> JSONResponse:
+    from .backfill_runner import get_backfill_status
+    return JSONResponse(await asyncio.to_thread(get_backfill_status))
 
 
-@app.post("/api/training/rlmf/serve/start")
-async def rlmf_serve_start(payload: Dict[str, Any]) -> JSONResponse:
-    """Serve a model (with/without the RLMF LoRA) for inference.
+# ---------------------------------------------------------------------------
+# Forward-collection scale job (UI-driven).  Runs the crew LIVE over the
+# 200-stock universe with parallel workers; start / pause / resume / kill.
+# Cross-process flock ensures only one collection runs at once.
+# ---------------------------------------------------------------------------
 
-    Body: ``{"mode": "with_lora"|"base", "base_model": "...",
-    "adapter_dir": null, "port": 8091, "max_model_len": null,
-    "gpu_mem_util": null, "max_num_seqs": null}``.  Port defaults to
-    8091 to avoid colliding with a primary vLLM on 8081.
 
-    Registers the served endpoint(s) as runtime LLM presets so the
-    model is selectable in the run-config dropdown.
+@app.post("/api/scale/start")
+async def scale_start(payload: Dict[str, Any]) -> JSONResponse:
+    """Start (or resume-from-scratch) a forward-collection run.
+
+    Body::
+
+        {"universe": "all200", "workers": 6}
+        {"tickers": ["RELIANCE.NS", "AAPL"], "workers": 4}
     """
-    from .rlmf_runner import start_server
+    from .scale_runner import start_scale
+
+    tickers = payload.get("tickers") or None
+    if isinstance(tickers, str):
+        tickers = [t.strip() for t in tickers.replace("\n", ",").split(",") if t.strip()]
     try:
-        snap = await asyncio.to_thread(
-            start_server,
-            mode=(payload.get("mode") or "with_lora"),
-            base_model=(payload.get("base_model") or "").strip() or None,
-            adapter_dir=(payload.get("adapter_dir") or "").strip() or None,
-            port=int(payload.get("port") or 8091),
-            lora_name=(payload.get("lora_name") or "rlmf").strip(),
-            max_model_len=int(payload["max_model_len"]) if payload.get("max_model_len") else None,
-            gpu_mem_util=float(payload["gpu_mem_util"]) if payload.get("gpu_mem_util") else None,
-            max_num_seqs=int(payload["max_num_seqs"]) if payload.get("max_num_seqs") else None,
-            reasoning_parser=(payload.get("reasoning_parser") or "").strip() or None,
-            tool_parser=(payload.get("tool_parser") or "").strip() or None,
+        # start_scale is async — it schedules the orchestrator task on this loop
+        # (needed so it can drive the SessionManager for live streaming).
+        snap = await start_scale(
+            universe=(payload.get("universe") or None),
+            tickers=tickers,
+            workers=int(payload.get("workers") or 5),
+            day=(payload.get("day") or None),
+            run_cfg=(payload.get("run_cfg") or None),
+            force_rerun=bool(payload.get("force_rerun")),
         )
-    except ValueError as exc:
+    except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return JSONResponse(snap)
 
 
-@app.post("/api/training/rlmf/serve/stop")
-async def rlmf_serve_stop() -> JSONResponse:
-    from .rlmf_runner import stop_server
-    return JSONResponse(await asyncio.to_thread(stop_server))
+@app.post("/api/scale/pause")
+async def scale_pause() -> JSONResponse:
+    from .scale_runner import pause_scale
+    return JSONResponse(await pause_scale())
 
 
-@app.get("/api/training/rlmf/serve/status")
-async def rlmf_serve_status() -> JSONResponse:
-    from .rlmf_runner import get_server_status
-    return JSONResponse(await asyncio.to_thread(get_server_status))
+@app.post("/api/scale/resume")
+async def scale_resume() -> JSONResponse:
+    from .scale_runner import resume_scale
+    return JSONResponse(await resume_scale())
+
+
+@app.post("/api/scale/stop")
+async def scale_stop() -> JSONResponse:
+    from .scale_runner import stop_scale
+    return JSONResponse(await stop_scale())
+
+
+@app.get("/api/scale/status")
+async def scale_status() -> JSONResponse:
+    from .scale_runner import get_scale_status
+    return JSONResponse(await asyncio.to_thread(get_scale_status))
+
+
+# ---------------------------------------------------------------------------
+# Prediction dashboard (multi-page /predict UI, SQLite-backed)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/predict/universe")
+async def predict_universe(run_date: str = Query("", description="YYYY-MM-DD; defaults to today")) -> JSONResponse:
+    """Editable universe (categories + companies) with per-day prediction status."""
+    from . import prediction_db as db
+    data = await asyncio.to_thread(db.list_universe, run_date or None)
+    return JSONResponse(data)
+
+
+@app.get("/api/predict/search")
+async def predict_search(
+    q: str = Query(..., min_length=1),
+    limit: int = Query(8, ge=1, le=20),
+    market: str = Query("", description="IN | US | '' (auto) — IN constructs/validates .NS candidates"),
+) -> JSONResponse:
+    """Resolve a company-name query to real, runnable tickers (Yahoo search)."""
+    from .company_meta import search_symbols
+    try:
+        results = await asyncio.to_thread(search_symbols, q, limit, market)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"symbol search failed: {exc}")
+    return JSONResponse({"query": q, "results": results})
+
+
+@app.post("/api/predict/company")
+async def predict_add_company(payload: Dict[str, Any]) -> JSONResponse:
+    """Add a company to the universe under a sector (from the search box)."""
+    from . import prediction_db as db
+    from .company_meta import enrich_ticker
+
+    ticker = (payload.get("ticker") or "").strip()
+    if not ticker:
+        raise HTTPException(status_code=400, detail="ticker is required")
+    name = (payload.get("name") or "").strip()
+    homepage = payload.get("homepage")
+    wikipedia = payload.get("wikipedia")
+    sector = (payload.get("sector") or "").strip()
+    # Fill missing name/links/sector live so the new tile lands in the right
+    # place and is immediately complete (name + hover links).
+    if not name or not homepage or not sector:
+        meta = await asyncio.to_thread(enrich_ticker, ticker)
+        name = name or (meta.get("name") or "")
+        homepage = homepage or meta.get("homepage")
+        wikipedia = wikipedia or meta.get("wikipedia")
+        sector = sector or (meta.get("sector") or "")
+    try:
+        company = await asyncio.to_thread(
+            db.add_company,
+            ticker=ticker,
+            name=name,
+            sector=(sector or "Other"),
+            market=(payload.get("market") or "US"),
+            homepage=homepage,
+            wikipedia=wikipedia,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse({"ok": True, "company": company})
+
+
+@app.delete("/api/predict/company/{ticker}")
+async def predict_remove_company(ticker: str) -> JSONResponse:
+    from . import prediction_db as db
+    removed = await asyncio.to_thread(db.remove_company, ticker)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"{ticker} not in universe")
+    return JSONResponse({"ok": True, "ticker": ticker})
+
+
+@app.post("/api/predict/enrich")
+async def predict_enrich(limit: int = Query(20, ge=1, le=100)) -> JSONResponse:
+    """Resolve name/homepage/wikipedia for up to ``limit`` un-enriched companies.
+
+    The frontend calls this in a loop after loading the universe (each yfinance
+    lookup is ~0.5–1s), refreshing tiles until ``remaining`` hits zero.
+    """
+    from . import prediction_db as db
+    from .company_meta import enrich_ticker
+
+    def _run() -> Dict[str, Any]:
+        pending = db.companies_needing_meta(limit)
+        enriched = 0
+        for row in pending:
+            meta = enrich_ticker(row["ticker"])
+            db.set_company_meta(
+                row["ticker"],
+                name=meta.get("name"),
+                homepage=meta.get("homepage"),
+                wikipedia=meta.get("wikipedia"),
+            )
+            enriched += 1
+        remaining = len(db.companies_needing_meta(1))
+        return {"enriched": enriched, "remaining": remaining}
+
+    return JSONResponse(await asyncio.to_thread(_run))
+
+
+@app.get("/api/predict/prediction/{ticker}")
+async def predict_prediction(
+    ticker: str,
+    run_date: str = Query("", description="YYYY-MM-DD; defaults to latest"),
+) -> JSONResponse:
+    """The stored prediction (decision + report) for a ticker (latest or dated)."""
+    from . import prediction_db as db
+    pred = await asyncio.to_thread(db.get_prediction, ticker, run_date or None)
+    company = await asyncio.to_thread(db.get_company, ticker)
+    return JSONResponse({"ticker": ticker, "company": company, "prediction": pred})
+
+
+@app.get("/api/predict/history")
+async def predict_history() -> JSONResponse:
+    """List historical run dates for the front-page history panel."""
+    from . import prediction_db as db
+    return JSONResponse({"days": await asyncio.to_thread(db.list_run_days)})
+
+
+@app.get("/api/predict/history/{run_date}")
+async def predict_history_day(run_date: str) -> JSONResponse:
+    """Read-only snapshot of all predictions made on ``run_date``."""
+    from . import prediction_db as db
+    return JSONResponse(await asyncio.to_thread(db.get_day_snapshot, run_date))
+
+
+@app.get("/api/portfolio/virtual")
+async def virtual_portfolio_days() -> JSONResponse:
+    """Run dates that have a virtual book (== any run day with predictions)."""
+    from . import prediction_db as db
+    return JSONResponse({"days": await asyncio.to_thread(db.list_run_days)})
+
+
+@app.get("/api/portfolio/virtual/{run_date}")
+async def virtual_portfolio_day(
+    run_date: str,
+    market: str = Query("all", description="Investable universe: all | IN | US"),
+) -> JSONResponse:
+    """Growth-weighted ₹10L virtual book for ``run_date``, marked to the latest
+    known price of each held name (see web/backend/vportfolio.py).  ``market``
+    restricts the universe and re-deploys the full capital within it."""
+    from . import vportfolio
+    return JSONResponse(await asyncio.to_thread(
+        vportfolio.compute_portfolio, run_date, vportfolio.DEFAULT_CAPITAL_INR, market))
 
 
 @app.get("/api/backtest")
@@ -1358,38 +1959,77 @@ async def backtest(
     test_size: int = Query(1, ge=1, le=200),
     cost_model: str = Query("standard"),
     lookback_years: int = Query(5, ge=1, le=10, description="Years of OHLCV history to fetch for the backtest (default 5y)"),
+    validation: str = Query("walk_forward", description="walk_forward | cpcv (Combinatorial Purged CV)"),
+    cpcv_groups: int = Query(6, ge=2, le=12, description="CPCV: number of contiguous groups (validation=cpcv only)"),
+    cpcv_k: int = Query(2, ge=1, le=6, description="CPCV: groups held out per fold (validation=cpcv only)"),
+    workflow_version: str = Query("", description="Phase 0 cohort filter — restrict to episodes stamped with this workflow_version (blank = latest version, see all_versions)"),
+    source: str = Query("", description="Phase 0 cohort filter — 'live' | 'backfill' (blank = all)"),
+    all_versions: bool = Query(False, description="Backtest across ALL workflow versions instead of only the latest (default: latest-only, the trustworthy cohort)"),
 ) -> JSONResponse:
-    """M6 — walk-forward backtest of logged proposals for ``ticker``."""
+    """M6 — walk-forward (or CPCV) backtest of logged proposals for ``ticker``.
+
+    By default this restricts to the **latest workflow version** so the
+    walk-forward measures the *current* workflow rather than a mix of drifting
+    past versions (whose proposals are not comparable).  Pass ``all_versions=1``
+    (or an explicit ``workflow_version``) to override.
+    """
     from datetime import datetime
     from trading_crew.agentic.backtest import (
+        CPCVConfig,
         WalkForwardConfig,
+        generate_cpcv_folds,
         generate_folds,
+        run_cpcv,
         run_walk_forward,
     )
     from trading_crew.agentic.execution.contracts import ActionProposal
-    from trading_crew.agentic.memory import EpisodicMemory
     from .charts import _fetch_ohlcv
 
+    # Shared library path (also used by `python -m trading_crew.agentic.validate`)
+    # so the web app and the CLI harness build the cohort + proposal timeline
+    # identically instead of re-implementing it.
+    from trading_crew.agentic.evaluation import (
+        latest_workflow_version,
+        load_cohort,
+        proposals_from_episodes,
+    )
+
     cache_dir = os.environ.get("TRADINGCREW_CACHE_DIR") or os.path.expanduser("~/.trading_crew")
-    store_path = Path(cache_dir) / "memory" / "episodes.jsonl"
-    mem = EpisodicMemory(store_path)
-    episodes = [e for e in mem.all_episodes() if e.symbol.upper() == ticker.upper()]
+    episodes = load_cohort(
+        ticker,
+        cache_dir=cache_dir,
+        workflow_version=workflow_version or None,
+        source=source or None,
+    )
     if not episodes:
         return JSONResponse({
             "ticker": ticker, "n_proposals": 0,
             "error": "No episodes recorded for this ticker yet — run an analysis first.",
         })
 
-    proposals: list[ActionProposal] = []
-    for ep in episodes:
-        try:
-            proposals.append(ActionProposal(**ep.action_proposal))
-        except Exception:
-            logger.warning("Skipping malformed proposal in episode %s", ep.episode_id)
+    # Default to the LATEST workflow version so the walk-forward reflects the
+    # current workflow, not a blend of older (incomparable) versions.  Skipped
+    # when the caller pins an explicit workflow_version or asks for all_versions.
+    n_all_versions = len(episodes)
+    effective_version = workflow_version or None
+    if not workflow_version and not all_versions:
+        from trading_crew.agentic.versioning import filter_episodes_by_cohort
+
+        effective_version = latest_workflow_version(episodes)
+        if effective_version:
+            episodes = filter_episodes_by_cohort(episodes, workflow_version=effective_version)
+    cohort = {
+        "workflow_version": effective_version,
+        "all_versions": bool(all_versions),
+        "n_all_versions": n_all_versions,
+    }
+
+    proposals: list[ActionProposal] = proposals_from_episodes(episodes)
     if not proposals:
         return JSONResponse({
             "ticker": ticker, "n_proposals": 0,
             "error": "All recorded episodes had invalid proposals.",
+            **cohort,
         })
 
     last_ts = max(p.decision_ts for p in proposals)
@@ -1399,6 +2039,126 @@ async def backtest(
         end_dt = datetime.utcnow()
     ohlcv = await asyncio.to_thread(_fetch_ohlcv, ticker, end_dt, 365 * lookback_years)
 
+    def _finite(v):
+        try:
+            if v != v or v in (float("inf"), float("-inf")):
+                return None
+        except Exception:
+            return None
+        return v
+
+    def _metrics_dict(m) -> dict:
+        return {
+            "total_return_pct": m.total_return_pct,
+            "cagr": m.cagr,
+            "annualised_vol": m.annualised_vol,
+            "sharpe": m.sharpe,
+            "sortino": _finite(m.sortino),
+            "calmar": _finite(m.calmar),
+            "max_drawdown": m.max_drawdown,
+            "deflated_sharpe": m.deflated_sharpe,
+            "n_periods": m.n_periods,
+            "win_rate": m.win_rate,
+            "expectancy": m.expectancy,
+            "payoff_ratio": _finite(m.payoff_ratio),
+            "profit_factor": _finite(m.profit_factor),
+            "benchmark_return_pct": m.benchmark_return_pct,
+            "alpha": m.alpha,
+            "beta": m.beta,
+            "sharpe_ci_low": m.sharpe_ci_low,
+            "sharpe_ci_high": m.sharpe_ci_high,
+        }
+
+    # L3 tune (if applied) composed with an open Hermes size experiment —
+    # same composition the live runner uses.
+    from trading_crew.agentic.tuning import load_tuned_entry, resolve_live_sizing
+
+    _sizing, _gate, _sz_meta = resolve_live_sizing(ticker, cache_dir=cache_dir)
+    _cfg_kwargs: dict = {}
+    tuned_info: dict = {
+        "applied": bool(_sz_meta.get("l3_applied")),
+        "hermes_size_scale": _sz_meta.get("hermes_size_scale"),
+    }
+    if _sizing is not None:
+        _cfg_kwargs["sizing_config"] = _sizing
+        _cfg_kwargs["gate_config"] = _gate
+        _entry = load_tuned_entry(ticker, cache_dir=cache_dir) or {}
+        tuned_info["meta"] = _entry.get("meta")
+        tuned_info["saved_ts"] = _entry.get("saved_ts")
+
+    # ---- CPCV branch ------------------------------------------------------
+    if validation == "cpcv":
+        cpcv_cfg = CPCVConfig(
+            n_groups=cpcv_groups, k_test=cpcv_k, embargo_size=embargo_size,
+        )
+        cpcv_folds = generate_cpcv_folds(n_obs=len(proposals), config=cpcv_cfg)
+        if not cpcv_folds:
+            return JSONResponse({
+                "ticker": ticker, "n_proposals": len(proposals),
+                "error": (
+                    f"Not enough proposals ({len(proposals)}) for CPCV with "
+                    f"n_groups={cpcv_groups}, k_test={cpcv_k}."
+                    + (
+                        f" (latest workflow version only — {n_all_versions - len(proposals)} "
+                        f"older-version proposals excluded; pass all_versions=1 to include them.)"
+                        if effective_version and not all_versions and n_all_versions > len(proposals)
+                        else ""
+                    )
+                ),
+                **cohort,
+            })
+        cpcv = await asyncio.to_thread(
+            run_cpcv,
+            proposals=proposals,
+            ohlcv_by_symbol={ticker: ohlcv},
+            cpcv_folds=cpcv_folds,
+            cost_model_name=cost_model,
+            **_cfg_kwargs,
+        )
+        return JSONResponse({
+            "ticker": ticker,
+            "n_proposals": len(proposals),
+            **cohort,
+            "tuned_config": tuned_info,
+            "validation": "cpcv",
+            "n_folds": len(cpcv.paths),
+            "combined_equity": cpcv.combined_equity,
+            "combined_timestamps": cpcv.combined_timestamps,
+            "combined_benchmark": cpcv.combined_benchmark,
+            "overall_metrics": _metrics_dict(cpcv.aggregate_metrics),
+            "cpcv": {
+                "oos_sharpes": [_finite(s) for s in cpcv.oos_sharpes],
+                "mean_oos_sharpe": _finite(cpcv.mean_oos_sharpe),
+                "median_oos_sharpe": _finite(cpcv.median_oos_sharpe),
+                "sharpe_std": _finite(cpcv.sharpe_std),
+                "n_paths": len(cpcv.paths),
+            },
+            "folds": [
+                {
+                    "fold_id": p.fold_id,
+                    "metrics": {
+                        "total_return_pct": p.metrics.total_return_pct,
+                        "sharpe": p.metrics.sharpe,
+                        "max_drawdown": p.metrics.max_drawdown,
+                        "n_periods": p.metrics.n_periods,
+                    },
+                    "trades": [
+                        {
+                            "ts": t.ts, "symbol": t.symbol, "side": t.side,
+                            "intent_weight": t.intent_weight,
+                            "sized_weight": t.sized_weight,
+                            "fill_qty": t.fill_qty, "fill_price": t.fill_price,
+                            "fees": t.fees, "status": t.status,
+                            "rejection_reason": t.rejection_reason,
+                        }
+                        for t in p.trades
+                    ],
+                }
+                for p in cpcv.paths
+            ],
+        })
+
+    # ---- Walk-forward branch ---------------------------------------------
     config = WalkForwardConfig(
         train_size=train_size, embargo_size=embargo_size, test_size=test_size,
     )
@@ -1409,7 +2169,14 @@ async def backtest(
             "error": (
                 f"Not enough proposals ({len(proposals)}) for "
                 f"train={train_size}+embargo={embargo_size}+test={test_size}."
+                + (
+                    f" (latest workflow version only — {n_all_versions - len(proposals)} "
+                    f"older-version proposals excluded; pass all_versions=1 to include them.)"
+                    if effective_version and not all_versions and n_all_versions > len(proposals)
+                    else ""
+                )
             ),
+            **cohort,
         })
 
     result = await asyncio.to_thread(
@@ -1418,33 +2185,41 @@ async def backtest(
         ohlcv_by_symbol={ticker: ohlcv},
         folds=folds,
         cost_model_name=cost_model,
+        **_cfg_kwargs,
     )
 
-    def _finite(v):
-        try:
-            if v != v or v in (float("inf"), float("-inf")):
-                return None
-        except Exception:
-            return None
-        return v
+    # Phase 3 — decompose realised PnL into decision / sizing / cost legs so
+    # the desk can see WHICH layer to fix, not just the headline Sharpe.
+    attribution = None
+    try:
+        from trading_crew.agentic.backtest import (
+            attribute_decisions,
+            sized_weights_from_trades,
+        )
+
+        all_trades = [t for fr in result.folds for t in fr.trades]
+        attribution = await asyncio.to_thread(
+            attribute_decisions,
+            proposals,
+            {ticker: ohlcv},
+            sized_weights=sized_weights_from_trades(all_trades),
+            cost_model_name=cost_model,
+        )
+    except Exception:  # noqa: BLE001 — attribution is diagnostic, never fatal
+        attribution = None
 
     return JSONResponse({
         "ticker": ticker,
         "n_proposals": len(proposals),
+        **cohort,
+        "tuned_config": tuned_info,
+        "validation": "walk_forward",
         "n_folds": len(result.folds),
+        "attribution": attribution.to_dict() if attribution is not None else None,
         "combined_equity": result.combined_equity,
         "combined_timestamps": result.combined_timestamps,
-        "overall_metrics": {
-            "total_return_pct": result.overall_metrics.total_return_pct,
-            "cagr": result.overall_metrics.cagr,
-            "annualised_vol": result.overall_metrics.annualised_vol,
-            "sharpe": result.overall_metrics.sharpe,
-            "sortino": _finite(result.overall_metrics.sortino),
-            "calmar": _finite(result.overall_metrics.calmar),
-            "max_drawdown": result.overall_metrics.max_drawdown,
-            "deflated_sharpe": result.overall_metrics.deflated_sharpe,
-            "n_periods": result.overall_metrics.n_periods,
-        },
+        "combined_benchmark": result.combined_benchmark,
+        "overall_metrics": _metrics_dict(result.overall_metrics),
         "folds": [
             {
                 "fold_id": fr.fold.fold_id,
@@ -1472,6 +2247,210 @@ async def backtest(
             }
             for fr in result.folds
         ],
+    })
+
+
+@app.get("/api/portfolio_backtest")
+async def portfolio_backtest(
+    tickers: str = Query(..., min_length=1, description="Comma-separated tickers, e.g. AAPL,MSFT,RELIANCE.NS"),
+    cost_model: str = Query("standard"),
+    allocation_method: str = Query("HRP", description="HRP | MEAN_VARIANCE | EQUAL_RISK"),
+    gross_budget: float = Query(0.80, ge=0.05, le=2.0, description="Max sum of |weights| across the book"),
+    max_position_weight: float = Query(0.20, ge=0.01, le=1.0),
+    lookback_years: int = Query(5, ge=1, le=10),
+    all_versions: bool = Query(False, description="Replay across ALL workflow versions instead of only the latest (default: latest-only, matches Walk forward)"),
+) -> JSONResponse:
+    """M6 + M7 — multi-asset portfolio backtest.
+
+    Loads every ticker's logged proposals, then replays them as one
+    coherent book: at each rebalance date the M7 allocator sizes the
+    cross-sectional weight vector (HRP / MV / ERC) before execution.
+    """
+    from datetime import datetime
+    from trading_crew.agentic.backtest import run_portfolio_backtest
+    from trading_crew.agentic.execution.contracts import ActionProposal
+    from trading_crew.agentic.memory import EpisodicMemory
+    from trading_crew.agentic.portfolio.allocator import (
+        AllocationMethod, AllocatorConfig,
+    )
+    from trading_crew.agentic.risk import GateConfig
+    from .charts import _fetch_ohlcv
+
+    symbols = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    if len(symbols) < 2:
+        return JSONResponse({
+            "tickers": symbols,
+            "error": "Portfolio backtest needs at least 2 tickers.",
+        })
+
+    cache_dir = os.environ.get("TRADINGCREW_CACHE_DIR") or os.path.expanduser("~/.trading_crew")
+    store_path = Path(cache_dir) / "memory" / "episodes.jsonl"
+    mem = EpisodicMemory(store_path)
+
+    from trading_crew.agentic.evaluation import (
+        latest_workflow_version,
+        proposals_from_episodes,
+    )
+    from trading_crew.agentic.versioning import filter_episodes_by_cohort
+
+    symbol_set = set(symbols)
+    all_eps = [e for e in mem.all_episodes() if e.symbol.upper() in symbol_set]
+    n_all_versions = len(all_eps)
+
+    # Default to the LATEST workflow version so the book is one coherent agent
+    # build across all names (matches Walk forward).  A single global version is
+    # used — not per-ticker — so cross-sectional weights stay comparable.
+    effective_version = None
+    if not all_versions:
+        effective_version = latest_workflow_version(all_eps)
+        if effective_version:
+            all_eps = filter_episodes_by_cohort(all_eps, workflow_version=effective_version)
+    cohort = {
+        "workflow_version": effective_version,
+        "all_versions": bool(all_versions),
+        "n_all_versions": n_all_versions,
+    }
+
+    proposals: list[ActionProposal] = []
+    per_ticker_counts: dict[str, int] = {}
+    ohlcv_by_symbol: dict = {}
+    for sym in symbols:
+        eps = [e for e in all_eps if e.symbol.upper() == sym]
+        ps = proposals_from_episodes(eps)
+        proposals.extend(ps)
+        per_ticker_counts[sym] = len(ps)
+
+    if not proposals:
+        return JSONResponse({
+            "tickers": symbols, "n_proposals": 0,
+            "error": (
+                "No episodes recorded for these tickers yet — run analyses first."
+                + (
+                    f" (latest workflow version only — {n_all_versions} older-version "
+                    f"proposals excluded; pass all_versions=1 to include them.)"
+                    if effective_version and n_all_versions > 0
+                    else ""
+                )
+            ),
+            **cohort,
+        })
+
+    try:
+        last_ts = max(p.decision_ts for p in proposals)
+        end_dt = datetime.fromisoformat(last_ts.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        end_dt = datetime.utcnow()
+
+    for sym in symbols:
+        df = await asyncio.to_thread(_fetch_ohlcv, sym, end_dt, 365 * lookback_years)
+        if df is not None and not df.empty:
+            ohlcv_by_symbol[sym] = df
+
+    if len(ohlcv_by_symbol) < 2:
+        return JSONResponse({
+            "tickers": symbols, "n_proposals": len(proposals),
+            "error": "Could not fetch OHLCV for at least 2 of the tickers.",
+        })
+
+    try:
+        method = AllocationMethod(allocation_method)
+    except ValueError:
+        method = AllocationMethod.HRP
+    alloc_cfg = AllocatorConfig(
+        method=method,
+        gross_budget=gross_budget,
+        max_position_weight=max_position_weight,
+    )
+
+    result = await asyncio.to_thread(
+        run_portfolio_backtest,
+        proposals=proposals,
+        ohlcv_by_symbol=ohlcv_by_symbol,
+        cost_model_name=cost_model,
+        gate_config=GateConfig(),
+        allocator_config=alloc_cfg,
+    )
+
+    def _finite(v):
+        try:
+            if v != v or v in (float("inf"), float("-inf")):
+                return None
+        except Exception:
+            return None
+        return v
+
+    return JSONResponse({
+        "tickers": symbols,
+        **cohort,
+        "per_ticker_proposals": per_ticker_counts,
+        "n_proposals": len(proposals),
+        "method_used": result.method_used,
+        "gross_budget": gross_budget,
+        "equity_curve": result.equity_curve,
+        "timestamps": result.timestamps,
+        "benchmark_curve": result.benchmark_curve,
+        "weights_over_time": result.weights_over_time,
+        "metrics": {
+            "total_return_pct": result.metrics.total_return_pct,
+            "cagr": result.metrics.cagr,
+            "annualised_vol": result.metrics.annualised_vol,
+            "sharpe": result.metrics.sharpe,
+            "sortino": _finite(result.metrics.sortino),
+            "calmar": _finite(result.metrics.calmar),
+            "max_drawdown": result.metrics.max_drawdown,
+            "deflated_sharpe": result.metrics.deflated_sharpe,
+            "n_periods": result.metrics.n_periods,
+            "win_rate": result.metrics.win_rate,
+            "expectancy": result.metrics.expectancy,
+            "payoff_ratio": _finite(result.metrics.payoff_ratio),
+            "profit_factor": _finite(result.metrics.profit_factor),
+            "benchmark_return_pct": result.metrics.benchmark_return_pct,
+            "alpha": result.metrics.alpha,
+            "beta": result.metrics.beta,
+            "sharpe_ci_low": result.metrics.sharpe_ci_low,
+            "sharpe_ci_high": result.metrics.sharpe_ci_high,
+        },
+        "trades": [
+            {
+                "ts": t.ts, "symbol": t.symbol, "side": t.side,
+                "intent_weight": t.intent_weight, "sized_weight": t.sized_weight,
+                "fill_qty": t.fill_qty, "fill_price": t.fill_price,
+                "fees": t.fees, "status": t.status,
+                "rejection_reason": t.rejection_reason,
+            }
+            for t in result.trades
+        ],
+    })
+
+
+@app.get("/api/crowd_positioning")
+async def crowd_positioning(
+    ticker: str = Query(..., min_length=1),
+) -> JSONResponse:
+    """Swarm crowd-positioning signal for ``ticker`` (options + insider +
+    analyst crowding fused into a score in [-1, +1])."""
+    from trading_crew.agentic.swarm.crowd import compute_crowd_signal
+    from trading_crew.agentic.swarm.crowd_fit import load_crowd_config
+    from trading_crew.tools import _gather_crowd_inputs
+
+    def _work():
+        inputs, notes = _gather_crowd_inputs(ticker)
+        signal = compute_crowd_signal(inputs, load_crowd_config())
+        return signal, notes
+
+    try:
+        signal, notes = await asyncio.to_thread(_work)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ticker": ticker, "error": str(exc)})
+
+    return JSONResponse({
+        "ticker": ticker,
+        "score": signal.score,
+        "intensity": signal.intensity,
+        "label": signal.label,
+        "components": signal.components,
+        "n_components": signal.n_components,
+        "notes": notes,
     })
 
 
@@ -1511,6 +2490,16 @@ async def api_sessions_start(payload: Dict[str, Any]) -> JSONResponse:
     ticker = (payload.get("ticker") or "").strip()
     if not ticker:
         raise HTTPException(status_code=400, detail="ticker is required")
+    asset = str(payload.get("asset_class") or "stock").lower()
+    force_rerun = bool(payload.get("force_rerun"))
+    # Same-day stock cache: a completed Prediction-index row is returned
+    # as-is. Failed rows are not hits. Commodity never uses this index.
+    if not force_rerun and asset != "commodity":
+        from . import prediction_db as db
+
+        hit = db.cached_session_payload(ticker)
+        if hit:
+            return JSONResponse(hit)
     sm = get_session_manager()
     session = await sm.start(ticker, payload)
     return JSONResponse({
@@ -1656,7 +2645,7 @@ def main() -> None:
     import uvicorn
 
     host = os.getenv("TRADINGCREW_WEB_HOST", "0.0.0.0")
-    port = int(os.getenv("TRADINGCREW_WEB_PORT", "8001"))
+    port = int(os.getenv("TRADINGCREW_WEB_PORT", "8002"))
     uvicorn.run(
         "web.backend.app:app",
         host=host,

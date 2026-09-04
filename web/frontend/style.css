@@ -194,6 +194,64 @@ select.cfg-input {
   stroke-width: 1.4;
   stroke-opacity: 0.9;
 }
+.flow-edge.skipped {
+  stroke: #64748b;
+  stroke-width: 1.2;
+  stroke-opacity: 0.55;
+  stroke-dasharray: 3 6;
+}
+.flow-edge.cycle-idle {
+  stroke: #7c3aed;
+  stroke-width: 1.35;
+  stroke-opacity: 0.7;
+  stroke-dasharray: 5 5;
+}
+.flow-edge.optional-idle {
+  stroke: #475569;
+  stroke-width: 1.1;
+  stroke-opacity: 0.4;
+  stroke-dasharray: 2 6;
+}
+.flow-node-dim {
+  opacity: 0.4;
+}
+.flow-legend {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #94a3b8;
+}
+.flow-legend span[class^="lg-"] {
+  display: inline-block;
+  width: 18px;
+  height: 0;
+  border-top: 2px solid #64748b;
+  margin-right: 6px;
+  vertical-align: middle;
+}
+.flow-legend .lg-fwd { border-top-color: #334155; }
+.flow-legend .lg-cyc { border-top-color: #7c3aed; border-top-style: dashed; }
+.flow-legend .lg-opt { border-top-color: #475569; border-top-style: dashed; }
+.flow-edge-label {
+  fill: #a78bfa;
+  font-size: 9px;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+.flow-edge.cycled {
+  stroke: #a78bfa;
+  stroke-width: 1.8;
+  stroke-opacity: 1;
+  stroke-dasharray: 5 5;
+  animation: flow-dash 0.7s linear infinite;
+  filter: drop-shadow(0 0 3px rgba(167, 139, 250, 0.45));
+}
 @keyframes flow-dash {
   to { stroke-dashoffset: -20; }
 }
@@ -225,6 +283,10 @@ select.cfg-input {
 }
 .flow-node[data-state="done"] {
   border-color: #22c55e;
+}
+.flow-node[data-state="skipped"] {
+  border-color: #64748b;
+  opacity: 0.45;
 }
 .flow-node[data-state="degraded"] {
   /* Amber border + faint wash so a degraded analyst stands out in the
@@ -262,6 +324,24 @@ select.cfg-input {
   text-transform: uppercase; letter-spacing: 0.07em;
   color: #64748b;
 }
+/* ReAct badge — marks the desks running the plan→act→observe loop. Violet so
+ * it doesn't collide with the amber/green tool-chip states or blue selection.
+ * pointer-events:none so the tile click still selects the node. */
+.flow-node .react-badge {
+  position: absolute;
+  bottom: 4px;
+  right: 5px;
+  padding: 0.5px 5px;
+  border-radius: 999px;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: rgba(168, 85, 247, 0.18);
+  border: 1px solid rgba(168, 85, 247, 0.55);
+  color: #d8b4fe;
+  pointer-events: none;
+}
 
 /* Group rectangles.  Subtle backgrounds — the LABEL is what carries the
  * information, the box itself is just a visual envelope. */
@@ -281,6 +361,53 @@ select.cfg-input {
   text-transform: uppercase; letter-spacing: 0.08em;
   color: #64748b;
   font-weight: 600;
+}
+.flow-group.caption-only {
+  border: none;
+  background: transparent;
+  pointer-events: none;
+}
+.flow-group.caption-only .group-label {
+  position: static;
+  background: transparent;
+  padding: 0;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+}
+
+/* Two-band layout (stock + commodity): chips live inside the tile so
+ * they don't force extra row gaps. Idle inventory stays hidden until
+ * a call runs. Commodity tiles are 140px so seven analysts fit at Fit. */
+.flow-layout-banded .flow-node {
+  width: 148px;
+  min-height: 44px;
+}
+.flow-layout-commodity .flow-node {
+  width: 140px;
+}
+.flow-layout-banded .tools-strip {
+  position: absolute;
+  left: 6px;
+  right: 6px;
+  top: auto;
+  bottom: 2px;
+  width: auto;
+  max-height: 14px;
+  margin: 0;
+  pointer-events: none;
+}
+.flow-layout-banded .tools-strip:empty,
+.flow-layout-banded .tools-strip:not(:has(.tool-chip:not([data-state="idle"]))) {
+  display: none;
+  margin: 0;
+}
+.flow-layout-banded .tool-chip[data-state="idle"] {
+  display: none;
+}
+.flow-layout-banded .flow-node .react-badge {
+  top: 4px;
+  bottom: auto;
+  right: 18px;
 }
 
 /* Tool-chip strip — shown beneath the node, never inside it.  Width
@@ -393,6 +520,33 @@ select.cfg-input {
   text-align: left;
 }
 .report-body tr:nth-child(even) td { background: rgba(15, 21, 37, 0.5); }
+
+/* ---- source links + provenance tags (shared: report-body, pm-rationale,
+   decision bullets, sources list) ------------------------------------------
+   Links are cyan and clearly distinct from the slate reasoning prose; the
+   display text is shortened (host + "pdf ↗") while the full URL lives in the
+   href/title.  `[source: …]` provenance tags get a muted pill so they read as
+   metadata, not argument. */
+.src-link {
+  color: #67e8f9;
+  text-decoration: underline;
+  text-decoration-color: rgba(103, 232, 249, 0.35);
+  text-underline-offset: 2px;
+  word-break: break-word;
+  white-space: nowrap;
+}
+.src-link:hover { color: #a5f3fc; text-decoration-color: rgba(103, 232, 249, 0.7); }
+.report-body a, .report-body a:visited { color: #67e8f9; }
+.src-tag {
+  color: #94a3b8;
+  background: rgba(148, 163, 184, 0.10);
+  border: 1px solid rgba(148, 163, 184, 0.20);
+  border-radius: 5px;
+  padding: 0 4px;
+  font-size: 0.88em;
+  white-space: normal;
+}
+.src-tag .src-link { color: #7dd3fc; }
 
 /* =========================================================== help system */
 
@@ -633,4 +787,14 @@ select.cfg-input {
   background: rgba(59, 130, 246, 0.28);
   border-color: #3b82f6;
   color: #fff;
+}
+
+.workflow-elapsed {
+  padding: 0 8px;
+  font-size: 10.5px;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  color: #94a3b8;
+  min-width: 3.25rem;
+  text-align: right;
+  letter-spacing: 0.02em;
 }

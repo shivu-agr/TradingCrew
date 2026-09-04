@@ -1,0 +1,159 @@
+{
+  "efficacy_backtest": {
+    "n_samples": 22230,
+    "n_tickers": 198,
+    "hurst_conditioning": {
+      "mean-revert (H<0.45)": {
+        "n": 6664,
+        "momentum_hit_rate_60d": 0.5033,
+        "avg_return_following_momentum_60d": 0.00666,
+        "avg_abs_fwd60": 0.11529
+      },
+      "random (0.45-0.55)": {
+        "n": 10721,
+        "momentum_hit_rate_60d": 0.4994,
+        "avg_return_following_momentum_60d": 0.00443,
+        "avg_abs_fwd60": 0.11435
+      },
+      "trend (H>0.55)": {
+        "n": 4845,
+        "momentum_hit_rate_60d": 0.4974,
+        "avg_return_following_momentum_60d": 0.00166,
+        "avg_abs_fwd60": 0.11528
+      }
+    },
+    "volpct_conditioning": {
+      "low": {
+        "n": 8475,
+        "avg_fwd_drawdown_60d": -0.07809,
+        "p05_fwd_drawdown_60d": -0.21695,
+        "avg_fwd_vol60": 0.26362
+      },
+      "mid": {
+        "n": 6397,
+        "avg_fwd_drawdown_60d": -0.08355,
+        "p05_fwd_drawdown_60d": -0.23326,
+        "avg_fwd_vol60": 0.28534
+      },
+      "high": {
+        "n": 7358,
+        "avg_fwd_drawdown_60d": -0.08401,
+        "p05_fwd_drawdown_60d": -0.24367,
+        "avg_fwd_vol60": 0.30405
+      }
+    },
+    "changepoint_stats": {
+      "regime_age_days_mean": 153.0,
+      "regime_age_days_median": 126.0,
+      "young_regime_threshold_days": 45.0
+    },
+    "changepoint_conditioning": {
+      "mature_regime": {
+        "n": 18895,
+        "momentum_hit_rate_60d": 0.5036,
+        "avg_fwd_drawdown_60d": -0.08152,
+        "avg_fwd_vol60": 0.28012,
+        "avg_abs_fwd60": 0.11306
+      },
+      "young_regime_(near_break)": {
+        "n": 3335,
+        "momentum_hit_rate_60d": 0.4807,
+        "avg_fwd_drawdown_60d": -0.08219,
+        "avg_fwd_vol60": 0.30097,
+        "avg_abs_fwd60": 0.12488
+      }
+    },
+    "buy_low_analysis": {
+      "baseline_all": {
+        "n": 22230,
+        "avg_fwd60": 0.0363,
+        "win_rate_fwd60": 0.5767,
+        "avg_fwd120": 0.07378,
+        "win_rate_fwd120": 0.6116
+      },
+      "sharp_dip_20d(<-8%)": {
+        "n": 2391,
+        "avg_fwd60": 0.05658,
+        "win_rate_fwd60": 0.6165,
+        "avg_fwd120": 0.10018,
+        "win_rate_fwd120": 0.6299
+      },
+      "dip_and_oversold": {
+        "n": 1043,
+        "avg_fwd60": 0.07455,
+        "win_rate_fwd60": 0.6625,
+        "avg_fwd120": 0.1225,
+        "win_rate_fwd120": 0.6663
+      },
+      "dip_and_young_regime": {
+        "n": 821,
+        "avg_fwd60": 0.0696,
+        "win_rate_fwd60": 0.6309,
+        "avg_fwd120": 0.11844,
+        "win_rate_fwd120": 0.6114
+      },
+      "dip_oversold_young(buy_low_candidate)": {
+        "n": 369,
+        "avg_fwd60": 0.08063,
+        "win_rate_fwd60": 0.6585,
+        "avg_fwd120": 0.13321,
+        "win_rate_fwd120": 0.6287
+      },
+      "dip_in_mature_regime(contrast)": {
+        "n": 946,
+        "avg_fwd60": 0.05535,
+        "win_rate_fwd60": 0.6311,
+        "avg_fwd120": 0.10768,
+        "win_rate_fwd120": 0.6744
+      }
+    }
+  },
+  "workflow_overlay": {
+    "n_decisions_matched": 1079,
+    "flip_rate_by_hurst_regime": {
+      "mean-revert (H<0.45)": {
+        "n_pairs": 275,
+        "flip_rate": 0.3164
+      },
+      "random (0.45-0.55)": {
+        "n_pairs": 409,
+        "flip_rate": 0.3545
+      },
+      "trend (H>0.55)": {
+        "n_pairs": 184,
+        "flip_rate": 0.3043
+      }
+    },
+    "overall_pair_flip_rate": 0.3318,
+    "mean_hurst_at_flip_vs_stable": {
+      "flip": 0.4905,
+      "no_flip": 0.4922
+    },
+    "mean_regime_age_days_at_flip_vs_stable": {
+      "flip": 146.61,
+      "no_flip": 149.83
+    },
+    "mean_changepoint_prob_at_flip_vs_stable": {
+      "flip": 0.004,
+      "no_flip": 0.004
+    },
+    "conviction_by_hurst_regime": {
+      "mean-revert (H<0.45)": {
+        "n": 343,
+        "avg_conviction": 0.6092
+      },
+      "random (0.45-0.55)": {
+        "n": 497,
+        "avg_conviction": 0.6161
+      },
+      "trend (H>0.55)": {
+        "n": 239,
+        "avg_conviction": 0.6339
+      }
+    }
+  },
+  "config": {
+    "tickers": 198,
+    "years": 6
+  }
+}

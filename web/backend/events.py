@@ -18,6 +18,15 @@ Event types
 * ``execution_result``  -> {order, fill, state_after, sizing, risk_gate, cost_scenarios, rejected, note}  (M2+M5)
 * ``reflection_records``-> {records, final_action, final_size_pct, revised}  (M4 — Reflective Critic per-sample audit)
 * ``episode_recorded``  -> {episode_id, regime, decision_ts, outcome_ts}  (M3 — episodic memory write)
+* ``evidence_drained``  -> {filled}  (request_evidence tool pulls filled between debate rounds)
+* ``fusion``            -> {available, sources, fused?, note?}  (optional — LLM+L4+L3+crowd fusion)
+* ``report_signals``    -> {signals[], net_bias, net_confidence, bias_score}  (reports desk trend-signal card, structured)
+* ``desk_bias_board``   -> {desks[{desk, bias}]}          (per-desk directional lean handed to the PM)
+* ``evidence_blackboard`` -> {ticker, markdown, desks, requests}  (full shared board; no clip)
+* ``debate_scratchpad`` -> {ticker, markdown, entries}  (shared bull/bear pad; compact TLDRs + turns)
+* ``signal_alignment``  -> {applied, original_action, final_action, notes[]}  (post-PM desk/computed-trend disagreement)
+* ``graph_edge``        -> {src, dst, kind}  (v3 LangGraph: activated / skipped / cycled)
+* ``graph_trace``       -> {edges[]}  (full edge list for the run)
 * ``run_completed``     -> {usage}
 * ``error``             -> {message, traceback?}
 """
@@ -47,6 +56,11 @@ NODE_KIND: Dict[str, str] = {
     "Market Analyst": "analyst",
     "News Analyst": "analyst",
     "Fundamentals Analyst": "analyst",
+    "Reports Analyst": "analyst",
+    "Playbook Router": "router",
+    "Conductor": "router",
+    "Investigator": "analyst",
+    "Shared State": "board",
     "Macro Analyst": "analyst",
     "Bullish Researcher": "bull",
     "Bearish Researcher": "bear",

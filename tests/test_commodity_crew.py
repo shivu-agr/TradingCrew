@@ -125,9 +125,6 @@ def test_get_tool_catalog_lists_all_commodity_tools():
         "get_commodity_ohlcv", "get_commodity_indicators",
         "get_futures_curve", "get_seasonality", "get_cot_report",
         "get_commodity_news", "get_commodity_geopolitical",
-        "retrieve_past_episodes_commodity",
-        # L4 RL advisor — same shape as the equity tool, just namespaced.
-        "rl_policy_recommendation_commodity",
     }
     assert set(cat.keys()) == expected
 

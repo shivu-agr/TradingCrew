@@ -2,7 +2,23 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _packaged_strategy_unless_overridden(monkeypatch):
+    """Keep unit tests on the checked-in yaml unless a test sets its own path."""
+    monkeypatch.setenv(
+        "TRADINGCREW_STRATEGY_PATH",
+        str(
+            Path(__file__).resolve().parents[1]
+            / "trading_crew"
+            / "config"
+            / "desk_strategy.yaml"
+        ),
+    )
 
 
 @pytest.fixture(autouse=True)

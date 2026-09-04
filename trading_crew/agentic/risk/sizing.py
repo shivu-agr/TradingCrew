@@ -238,3 +238,41 @@ def debate_to_risk_mult(
     mult = max(floor, min(ceiling, mult))
     explanation = " · ".join(parts) if parts else "No adjustments — full size."
     return mult, explanation
+
+
+def vol_state_to_risk_mult(
+    *,
+    vol_percentile: Optional[float] = None,
+    regime_age_days: Optional[float] = None,
+    floor: float = 0.5,
+    ceiling: float = 1.0,
+    elevated_pct: float = 0.80,
+    high_pct: float = 0.66,
+    young_regime_days: float = 45.0,
+) -> tuple[float, str]:
+    """Deterministic price-structure penalty on position size (only reduces).
+
+    Mirrors :func:`debate_to_risk_mult`: multiplicative penalties in
+    ``[floor, ceiling]``.  The 6y/198-name probe showed high realised-vol
+    percentile and a fresh BOCPD regime break both predict higher forward
+    volatility / drawdown, so each shaves size.  Direction (incl. the DIP_BUY
+    mean-reversion setup) is handled elsewhere and never inflates size here.
+
+    Returns ``(1.0, "…")`` when nothing binds (so callers can compose it with
+    the debate multiplier by taking the product / minimum without special-casing).
+    """
+    mult = 1.0
+    parts: list[str] = []
+    if vol_percentile is not None and vol_percentile == vol_percentile:  # not NaN
+        if vol_percentile >= elevated_pct:
+            mult *= 0.8
+            parts.append(f"vol pct {vol_percentile:.0%} (elevated) ×0.8")
+        elif vol_percentile >= high_pct:
+            mult *= 0.9
+            parts.append(f"vol pct {vol_percentile:.0%} (high) ×0.9")
+    if regime_age_days is not None and regime_age_days == regime_age_days \
+            and regime_age_days < young_regime_days:
+        mult *= 0.9
+        parts.append(f"fresh regime ({regime_age_days:.0f}d) ×0.9")
+    mult = max(floor, min(ceiling, mult))
+    return mult, (" · ".join(parts) if parts else "no vol-state size penalty")

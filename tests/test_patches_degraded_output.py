@@ -171,6 +171,12 @@ def reinstalled_patch(monkeypatch):
     import crewai.agent as cagent
     from trading_crew import _patches
 
+    # Default the degrade tests to *no* retries so they exercise the
+    # placeholder path directly and don't sleep on backoff.  The dedicated
+    # retry tests below opt back in via ``monkeypatch.setenv``.
+    monkeypatch.setenv("LLM_TASK_RETRIES", "0")
+    monkeypatch.setenv("LLM_TASK_RETRY_BACKOFF", "0")
+
     original = cagent.Agent.execute_task
     setattr(cagent.Agent, _patches._APPLIED_FLAG, False)
     yield cagent, _patches
@@ -491,3 +497,103 @@ def test_patched_execute_task_still_propagates_unrelated_apierror(reinstalled_pa
     fake_self = SimpleNamespace(role="Market Analyst")
     with pytest.raises(_FakeGenericAPIError):
         wrapped(fake_self, task=SimpleNamespace(name="market_task"))
+
+
+# ---------------------------------------------------------------------------
+# Retry-on-504: a transient upstream gateway error should be retried (with
+# backoff) before we fall back to the degraded placeholder.
+# ---------------------------------------------------------------------------
+
+
+class _FakeGatewayTimeout(Exception):
+    """Stand-in for an SDK-shaped 504 GatewayTimeout class."""
+
+
+class _FakeReadTimeout(Exception):
+    """Stand-in for a client-side httpx.ReadTimeout."""
+
+
+def test_retry_then_succeed_on_upstream_504(reinstalled_patch, monkeypatch, caplog):
+    """A 504 that clears on the 2nd attempt yields the real result — no
+    placeholder — proving the retry actually re-runs the task."""
+    cagent, patches = reinstalled_patch
+    monkeypatch.setenv("LLM_TASK_RETRIES", "3")
+    monkeypatch.setenv("LLM_TASK_RETRY_BACKOFF", "0")  # no sleeping in tests
+
+    calls = {"n": 0}
+
+    def inner(self, task, context=None, tools=None):
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise _FakeGatewayTimeout("upstream request timeout")
+        return "recovered report"
+
+    wrapped = _install_with_inner(cagent, patches, inner)
+    fake_self = SimpleNamespace(role="Quality Reviewer")
+    with caplog.at_level("WARNING", logger="trading_crew._patches"):
+        out = wrapped(fake_self, task=SimpleNamespace(name="quality_review"))
+    assert out == "recovered report"
+    assert calls["n"] == 2
+    assert any("retry 1/3" in rec.getMessage() for rec in caplog.records)
+
+
+def test_retry_exhausted_then_degrades(reinstalled_patch, monkeypatch):
+    """A 504 that never clears is retried the configured number of times
+    (total attempts = retries + 1) and then degrades."""
+    cagent, patches = reinstalled_patch
+    monkeypatch.setenv("LLM_TASK_RETRIES", "2")
+    monkeypatch.setenv("LLM_TASK_RETRY_BACKOFF", "0")
+
+    calls = {"n": 0}
+
+    def inner(self, task, context=None, tools=None):
+        calls["n"] += 1
+        raise _FakeGatewayTimeout("upstream request timeout")
+
+    wrapped = _install_with_inner(cagent, patches, inner)
+    fake_self = SimpleNamespace(role="News Analyst")
+    out = wrapped(fake_self, task=SimpleNamespace(name="news_task"))
+    assert isinstance(out, str)
+    assert out.startswith(DEGRADED_TIMEOUT_MARKER)
+    assert calls["n"] == 3  # 1 initial + 2 retries
+
+
+def test_rate_limit_is_not_retried(reinstalled_patch, monkeypatch):
+    """429 is transient but retrying doesn't help our setup — it degrades
+    immediately even with retries enabled (matches _common.get_llm intent)."""
+    cagent, patches = reinstalled_patch
+    monkeypatch.setenv("LLM_TASK_RETRIES", "3")
+    monkeypatch.setenv("LLM_TASK_RETRY_BACKOFF", "0")
+
+    calls = {"n": 0}
+
+    def inner(self, task, context=None, tools=None):
+        calls["n"] += 1
+        raise _FakeRateLimitError("rate limit exceeded")
+
+    wrapped = _install_with_inner(cagent, patches, inner)
+    fake_self = SimpleNamespace(role="Market Analyst")
+    out = wrapped(fake_self, task=SimpleNamespace(name="market_task"))
+    assert out.startswith(DEGRADED_TIMEOUT_MARKER)
+    assert calls["n"] == 1  # not retried
+
+
+def test_client_side_read_timeout_is_not_retried(reinstalled_patch, monkeypatch):
+    """A client-side ReadTimeout means the model is still generating; a
+    fresh attempt would leave a vLLM 'zombie request', so we degrade
+    immediately instead of retrying (only upstream 5xx/gateway are retried)."""
+    cagent, patches = reinstalled_patch
+    monkeypatch.setenv("LLM_TASK_RETRIES", "3")
+    monkeypatch.setenv("LLM_TASK_RETRY_BACKOFF", "0")
+
+    calls = {"n": 0}
+
+    def inner(self, task, context=None, tools=None):
+        calls["n"] += 1
+        raise _FakeReadTimeout("read timed out")
+
+    wrapped = _install_with_inner(cagent, patches, inner)
+    fake_self = SimpleNamespace(role="Macro Analyst")
+    out = wrapped(fake_self, task=SimpleNamespace(name="macro_task"))
+    assert out.startswith(DEGRADED_TIMEOUT_MARKER)
+    assert calls["n"] == 1  # not retried

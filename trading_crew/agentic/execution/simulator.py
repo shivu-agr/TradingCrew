@@ -316,6 +316,7 @@ def proposal_to_order(
     reference_price: float,
     *,
     risk_mult: float = 1.0,
+    allow_fractional: bool = False,
 ) -> Optional[Order]:
     """Compile an ``ActionProposal`` into an executable ``Order``.
 
@@ -328,6 +329,14 @@ def proposal_to_order(
        absolute target.
     3. **Convert dollars to shares** at ``reference_price``.
     4. **Skip HOLD / ABSTAIN** (return None — there's nothing to execute).
+
+    ``allow_fractional``: when False (live default) the delta is rounded to
+    whole shares and sub-1-share trades are skipped — real equity exchanges
+    don't accept fractions.  When True (research backtests) fractional share
+    counts are kept so a small-but-valid target weight on a high-priced name
+    still expresses its intended exposure instead of rounding away to a
+    ``NO_DELTA`` no-op — which otherwise silently zeroes out an entire book
+    of 1-2% positions and makes the backtest un-measurable.
 
     Why a helper instead of a method on ``ActionProposal``?  The proposal is
     pure intent; this conversion needs ``PortfolioState`` and a market
@@ -344,14 +353,18 @@ def proposal_to_order(
     current_dollars = state.positions[proposal.symbol].market_value if proposal.symbol in state.positions else 0.0
     delta_dollars = target_dollars - current_dollars
 
-    # If the trade is too small to round to even 1 share, skip.
     qty_signed = delta_dollars / reference_price
-    if abs(qty_signed) < 1.0:
-        return None
-
-    # Round to integer shares (the simulator handles fractional sizes fine,
-    # but real exchanges don't accept them for stocks).
-    qty_signed = math.copysign(round(abs(qty_signed)), qty_signed)
+    if allow_fractional:
+        # Keep fractional shares; only skip a truly negligible delta.
+        if abs(qty_signed) * reference_price < 1e-6 * max(1.0, state.nav):
+            return None
+    else:
+        # If the trade is too small to round to even 1 share, skip.
+        if abs(qty_signed) < 1.0:
+            return None
+        # Round to integer shares (the simulator handles fractional sizes
+        # fine, but real exchanges don't accept them for stocks).
+        qty_signed = math.copysign(round(abs(qty_signed)), qty_signed)
 
     # Verify the side matches the sign of the delta — if not, the proposal
     # is internally inconsistent and we refuse to compile it.  This is the

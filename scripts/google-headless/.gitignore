@@ -1,0 +1,6 @@
+# The Chromium download + npm deps are heavy and machine-specific; install
+# them locally via `make google-headless-setup` (npm install + npx playwright
+# install chromium). Only search.js + package.json are committed.
+node_modules/
+package-lock.json
+.DS_Store

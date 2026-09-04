@@ -1,18 +1,8 @@
-"""Inference helper: load a trained policy and score the live state.
+"""Inference helper: load a trained policy and score a state.
 
-Used by:
-
-* The CrewAI tool ``rl_policy_recommendation`` (see :mod:`trading_crew.tools`)
-  which surfaces the policy's recommendation to the Market Analyst and
-  Trader.  The LLM still owns the final decision — the policy is an
-  *advisor*.
-* The web UI's "preview" panel that lets you see what the promoted
-  policy would do today before queueing a full crew run.
-
-Why a separate module?  The trainer pulls in ``torch.optim`` and a
-~200-line PPO update; inference only needs ``torch.no_grad`` + a forward
-pass.  Splitting them keeps the ``CrewAI tool import + import the
-inference module`` path lightweight.
+Offline library only. L4 is not on the live prediction path — crew
+tools and ``/api/training/rl/*`` are unwired (HTTP 410). Kept so the
+trainer can still be A/B'd later without re-deriving the client.
 """
 
 from __future__ import annotations

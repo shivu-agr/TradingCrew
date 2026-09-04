@@ -1,0 +1,90 @@
+# Local stack: Redpanda (Kafka API) + Console + SearXNG + optional app.
+#
+# Infra only (app still on the host via ./start.sh):
+#   docker compose up -d redpanda redpanda-console searxng
+#
+# Full stack (app in a container; point .env LLM URLs at a reachable host):
+#   cp .env.example .env   # fill VLLM_LLM_* at minimum
+#   docker compose --profile app up -d --build
+#
+# UI + API:      http://localhost:8002  (v3; OpenAPI /docs, Prediction /api/v1)
+# Redpanda UI:   http://localhost:18090
+# SearXNG JSON:  http://localhost:18080/search?q=test&format=json
+# v2 control stays on host port 8001 — do not bind this app there.
+
+services:
+  redpanda:
+    image: redpandadata/redpanda:v24.2.11
+    hostname: redpanda
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --default-log-level=info
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr=internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr=internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr=internal://0.0.0.0:8081,external://0.0.0.0:18081
+    ports:
+      - "19092:19092"
+      - "18081:18081"
+      - "18082:18082"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster info -X brokers=localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redpanda-console:
+    image: redpandadata/console:v2.8.3
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "18090:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  searxng:
+    image: searxng/searxng:latest
+    environment:
+      SEARXNG_BASE_URL: http://localhost:18080/
+    ports:
+      - "18080:8080"
+    volumes:
+      - ./deploy/searxng:/etc/searxng:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/search?q=test&format=json || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  app:
+    build: .
+    ports:
+      - "${TRADINGCREW_WEB_PORT:-8002}:8002"
+    env_file:
+      - .env
+    environment:
+      TRADINGCREW_KAFKA_BOOTSTRAP: redpanda:9092
+      TRADINGCREW_KAFKA_CONSOLE_URL: http://localhost:18090
+      SEARXNG_URL: http://searxng:8080
+      TRADINGCREW_WEB_HOST: 0.0.0.0
+      TRADINGCREW_WEB_PORT: "8002"
+    volumes:
+      - tradingcrew-data:/root/.trading_crew
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      searxng:
+        condition: service_started
+    profiles:
+      - app
+
+volumes:
+  redpanda-data:
+  tradingcrew-data:

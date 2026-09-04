@@ -2,28 +2,25 @@
  *
  * LAYOUT
  * ------
- * Single-row LEFT-TO-RIGHT pipeline laid out as 5 ranks, with a 2-column
- * analyst grid so the 8 parallel analysts don't stretch the whole canvas
- * vertically:
+ * v3 stock is a LangGraph, not a left-to-right CrewAI pipe.  The stock
+ * canvas is a two-band flowchart sized to Fit at ~100% in the workbench
+ * (~1020×560), not a 1560px strip that collapses to ~30% zoom.
+ * Research: Playbook → Blackboard, analysts into the board, Bull/Bear
+ * under it. Decision: RM → Trader → risk → QR/Compliance (parallel)
+ * → PM → Decision. Cycles: debate, evidence, Neutral→Trader reopen.
+ * Reviewers sit on the same Decision row as risk (dimmed when off).
+ * Commodity uses the same two-band canvas (7 futures analysts, QR and
+ * Compliance stay on the decision spine).
  *
- *   ┌─────────────────┐  ┌────────┐  ┌─────────┐  ┌────────┐  ┌─────┐  ┌────────┐  ┌─────┐
- *   │ ANALYSTS (4×2)  │→ │ BULL   │→ │ R.MGR   │→ │ TRADER │→ │ AGG │→ │ COMPL  │→ │ DEC │
- *   │                 │  │ BEAR   │  │ Q.REV   │  │        │  │ NTR │  │ PM     │  │     │
- *   └─────────────────┘  └────────┘  └─────────┘  └────────┘  │ CON │  └────────┘  └─────┘
- *                                                              └─────┘
  *
- * Width ~1240, height ~340 (4:1 aspect — sized for wide screens).  The
- * old layout was 1480×980 (cramped), the failed serpentine was 980×1380
- * (wasted vertical space, awkward pivot).  This is what the user gets
- * by default; Ctrl+wheel / +/− buttons zoom in to read details.
- *
- * Two layouts ship with the diagram:
- *   - stock     (default) : 18-agent debate pipeline
- *   - commodity           : 17-agent futures debate pipeline
- * Both use the same shape; only the personas differ.  The right layout
- * is picked from the ``assetClass`` option passed to the
- * ``WorkflowDiagram`` constructor (read from window.location.pathname
- * in app.js). Node IDs MUST match the role strings the runner emits.
+ * Three layouts ship with the diagram:
+ *   - stock                 : LangGraph two-band (fan-out, blackboard, cycles)
+ *   - stock_deterministic   : exact v2 LTR crew (Analyst team → Researcher
+ *                             team → Trader → Risk → Compliance + PM → Decision)
+ *   - commodity             : 17-agent futures two-band crew
+ * The right layout is picked from ``assetClass`` + ``layoutId`` (app.js
+ * remounts when Settings ``run_mode`` changes). Node IDs MUST match the
+ * role strings the runner emits.
  *
  * Edges + state semantics (industry standard, mirrors React-Flow / n8n /
  * Argo / GitLab CI):
@@ -50,9 +47,17 @@
   // fall through to "no tooltip" — they don't crash.
   const AGENT_HELP_ANCHORS = {
     "Market Analyst": "agent.market_analyst",
+    "Conductor": "sidebar.run_mode",
+    "Investigator": "agent.news_analyst",
     "News Analyst": "agent.news_analyst",
     "Fundamentals Analyst": "agent.fundamentals_analyst",
+    "Reports Analyst": "agent.reports_analyst",
     "Macro Analyst": "agent.macro_analyst",
+    "Commodity Market Analyst": "agent.market_analyst",
+    "Bullish Futures Researcher": "agent.bull_researcher",
+    "Bearish Futures Researcher": "agent.bear_researcher",
+    "Futures Research Manager": "agent.research_manager",
+    "Senior Futures Trader": "agent.trader",
     "Bullish Researcher": "agent.bull_researcher",
     "Bearish Researcher": "agent.bear_researcher",
     "Research Manager": "agent.research_manager",
@@ -75,6 +80,8 @@
     bear: "#ef4444",
     manager: "#3b82f6",
     reviewer: "#facc15",
+    router: "#e879f9",
+    board: "#38bdf8",
     trader: "#a855f7",
     risk_a: "#ef4444",
     risk_n: "#f59e0b",
@@ -82,116 +89,131 @@
     decision: "#facc15",
   };
 
-  // ====================== Stock layout (18-agent debate, strict LTR) ============
-  //
-  // 10 ranks, all flowing LEFT → RIGHT, with one column per pipeline
-  // stage.  Parallel agents at the SAME stage (Bull/Bear in the debate,
-  // 3-analyst risk team) stack vertically inside their own column;
-  // every SEQUENTIAL hand-off (Research Mgr → Quality Reviewer → Trader,
-  // Compliance → PM → Decision) gets its own column to the right.
-  // No more two-row "RM on top, QR below" stacks — every step reads as
-  // a clean horizontal left-to-right pipeline.
-  //
-  //   col 1  (x=20)    : Analysts column A (Market, Social, News, Fundamentals)
-  //   col 2  (x=170)   : Analysts column B (Macro, Geopolitical, Sector, Quant)
-  //   col 3  (x=325)   : Bullish / Bearish researchers (parallel)
-  //   col 4  (x=475)   : Research Manager  (sequential)
-  //   col 5  (x=625)   : Quality Reviewer  (sequential after RM)
-  //   col 6  (x=775)   : Trader            (sequential)
-  //   col 7  (x=925)   : Risk team (Aggressive / Neutral / Conservative — parallel)
-  //   col 8  (x=1075)  : Compliance        (sequential)
-  //   col 9  (x=1225)  : Portfolio Manager (sequential after Compliance)
-  //   col 10 (x=1375)  : Decision          (sequential, final emission)
-  //
-  // Total: 1540×340 — wider than before so the extra columns fit, but
-  // still 4.5:1 aspect so it reads as a single horizontal strip.  Nodes
-  // remain compact pills (140×38) plus a short tool strip where
-  // applicable.  fit() auto-scales the diagram into the viewport width.
+  // ====================== Stock layout (LangGraph, v3) ========================
+  // Two bands so Fit stays readable (~1020px, not a 1560px LTR strip).
+  // Idle edges are the live spine + three labeled cycles.  Fan-out /
+  // extra-debate / advisory edges are drawn when the runner emits them.
 
-  const STOCK_WIDTH = 1540;
-  const STOCK_HEIGHT = 340;
-
-  // Two-column analyst grid: 4 rows × 2 columns = 8 analysts.
-  // ROW_GAP (~68) leaves room for the 30px tool-chip strip below each node.
-  const STOCK_ANALYST_ROW_GAP = 68;
-  const STOCK_ANALYST_Y0 = 25;
-  const STOCK_ANALYST_X_A = 20;
-  const STOCK_ANALYST_X_B = 170;
-
-  // Inter-column spacing past the analyst grid (each downstream column
-  // gets a steady ~150 px gap so the diagram has a regular horizontal
-  // rhythm).  Sequential stages each get their own column; parallel
-  // stages (Bull/Bear, Risk team) stack inside one.
-  const STOCK_COL_BULL_BEAR = 325;
-  const STOCK_COL_RES_MGR   = 475;
-  const STOCK_COL_Q_REV     = 625;
-  const STOCK_COL_TRADER    = 775;
-  const STOCK_COL_RISK      = 925;
-  const STOCK_COL_COMP      = 1075;
-  const STOCK_COL_PM        = 1225;
-  const STOCK_COL_DECISION  = 1375;
-
-  // All single-node columns center on the same vertical mid-line so the
-  // sequential pipeline reads as one straight horizontal track.
-  const STOCK_MID_Y = 150;
+  const STOCK_WIDTH = 1020;
+  const STOCK_HEIGHT = 500;
+  const STOCK_AX = [188, 348, 508, 668, 828];
+  const STOCK_AY = 40;
+  const STOCK_BOARD_X = 508;
+  const STOCK_BOARD_Y = 124;
+  const STOCK_PLAY_Y = 124;
+  const STOCK_DEBATE_Y = 212;
+  const STOCK_DEC_Y = 368;
+  const STOCK_RISK_X = 336;
+  const STOCK_REV_X = 508;
 
   const STOCK_NODES = [
-    // Analyst team — 4 merged desks, single column (parallel).  The
-    // labels name the merged remit so the diagram reads honestly.
-    { id: "Market Analyst",          label: "Market + Quant",  kind: "analyst",  x: STOCK_ANALYST_X_A, y: STOCK_ANALYST_Y0 + 0 * STOCK_ANALYST_ROW_GAP, hasTools: "market_analyst" },
-    { id: "News Analyst",            label: "News + Social",   kind: "analyst",  x: STOCK_ANALYST_X_A, y: STOCK_ANALYST_Y0 + 1 * STOCK_ANALYST_ROW_GAP, hasTools: "news_analyst" },
-    { id: "Fundamentals Analyst",    label: "Fund. + Sector",  kind: "analyst",  x: STOCK_ANALYST_X_A, y: STOCK_ANALYST_Y0 + 2 * STOCK_ANALYST_ROW_GAP, hasTools: "fundamentals_analyst" },
-    { id: "Macro Analyst",           label: "Macro + Geo",     kind: "analyst",  x: STOCK_ANALYST_X_A, y: STOCK_ANALYST_Y0 + 3 * STOCK_ANALYST_ROW_GAP, hasTools: "macro_analyst" },
-
-    // Researcher team — Bull / Bear stack (genuine parallel debate)
-    { id: "Bullish Researcher",      label: "Bullish",         kind: "bull",     x: STOCK_COL_BULL_BEAR, y: 80 },
-    { id: "Bearish Researcher",      label: "Bearish",         kind: "bear",     x: STOCK_COL_BULL_BEAR, y: 220 },
-
-    // Sequential hand-offs — each gets its own column, centered vertically
-    { id: "Research Manager",        label: "Research Mgr",    kind: "manager",  x: STOCK_COL_RES_MGR,   y: STOCK_MID_Y },
-    { id: "Quality Reviewer",        label: "Quality Review",  kind: "reviewer", x: STOCK_COL_Q_REV,     y: STOCK_MID_Y },
-    { id: "Trader",                  label: "Trader",          kind: "trader",   x: STOCK_COL_TRADER,    y: STOCK_MID_Y, hasTools: "trader" },
-
-    // Risk team — 3 stacked vertically (parallel risk perspectives)
-    { id: "Aggressive Risk Analyst",   label: "Aggressive",    kind: "risk_a",   x: STOCK_COL_RISK,      y: 60 },
-    { id: "Neutral Risk Analyst",      label: "Neutral",       kind: "risk_n",   x: STOCK_COL_RISK,      y: 150 },
-    { id: "Conservative Risk Analyst", label: "Conservative",  kind: "risk_c",   x: STOCK_COL_RISK,      y: 240 },
-
-    // Compliance → Portfolio Manager — sequential, each in its own column
-    { id: "Compliance Officer",      label: "Compliance",      kind: "reviewer", x: STOCK_COL_COMP,      y: STOCK_MID_Y },
-    { id: "Portfolio Manager",       label: "Portfolio Mgr",   kind: "manager",  x: STOCK_COL_PM,        y: STOCK_MID_Y },
-
-    // Decision (the final emission)
-    { id: "decision",                label: "Decision",        kind: "decision", x: STOCK_COL_DECISION,  y: STOCK_MID_Y },
+    { id: "Playbook Router",           label: "Playbook",        kind: "router",   x: 16,              y: STOCK_PLAY_Y },
+    { id: "Market Analyst",            label: "Market + Quant",  kind: "analyst",  x: STOCK_AX[0],     y: STOCK_AY, hasTools: "market_analyst" },
+    { id: "News Analyst",              label: "News + Social",   kind: "analyst",  x: STOCK_AX[1],     y: STOCK_AY, hasTools: "news_analyst" },
+    { id: "Fundamentals Analyst",      label: "Fund. + Sector",  kind: "analyst",  x: STOCK_AX[2],     y: STOCK_AY, hasTools: "fundamentals_analyst" },
+    { id: "Reports Analyst",           label: "Reports/Filings", kind: "analyst",  x: STOCK_AX[3],     y: STOCK_AY, hasTools: "reports_analyst" },
+    { id: "Macro Analyst",             label: "Macro + Geo",     kind: "analyst",  x: STOCK_AX[4],     y: STOCK_AY, hasTools: "macro_analyst" },
+    { id: "Shared State",              label: "Blackboard",      kind: "board",    x: STOCK_BOARD_X,   y: STOCK_BOARD_Y },
+    { id: "Bullish Researcher",        label: "Bullish",         kind: "bull",     x: 428,             y: STOCK_DEBATE_Y, hasTools: "bull_researcher" },
+    { id: "Bearish Researcher",        label: "Bearish",         kind: "bear",     x: 588,             y: STOCK_DEBATE_Y, hasTools: "bear_researcher" },
+    { id: "Research Manager",          label: "Research Mgr",    kind: "manager",  x: 16,              y: STOCK_DEC_Y, hasTools: "research_manager" },
+    { id: "Trader",                    label: "Trader",          kind: "trader",   x: 172,             y: STOCK_DEC_Y, hasTools: "trader" },
+    { id: "Aggressive Risk Analyst",   label: "Aggressive",      kind: "risk_a",   x: STOCK_RISK_X,    y: 312 },
+    { id: "Neutral Risk Analyst",      label: "Neutral",         kind: "risk_n",   x: STOCK_RISK_X,    y: STOCK_DEC_Y },
+    { id: "Conservative Risk Analyst", label: "Conservative",    kind: "risk_c",   x: STOCK_RISK_X,    y: 424 },
+    { id: "Quality Reviewer",          label: "Quality Review",  kind: "reviewer", x: STOCK_REV_X,     y: 312, dimmed: true },
+    { id: "Compliance Officer",        label: "Compliance",      kind: "reviewer", x: STOCK_REV_X,     y: 424, dimmed: true },
+    { id: "Portfolio Manager",         label: "Portfolio Mgr",   kind: "manager",  x: 688,             y: STOCK_DEC_Y },
+    { id: "decision",                  label: "Decision",        kind: "decision", x: 856,             y: STOCK_DEC_Y },
   ];
 
   const STOCK_EDGES = [
-    // analysts -> bull
+    { from: "Playbook Router", to: "Shared State", kind: "forward", route: "right" },
+    { from: "Market Analyst", to: "Shared State", kind: "forward", route: "down" },
+    { from: "News Analyst", to: "Shared State", kind: "forward", route: "down" },
+    { from: "Fundamentals Analyst", to: "Shared State", kind: "forward", route: "down" },
+    { from: "Reports Analyst", to: "Shared State", kind: "optional", route: "down" },
+    { from: "Macro Analyst", to: "Shared State", kind: "forward", route: "down" },
+    { from: "Shared State", to: "Bullish Researcher", kind: "forward", route: "down" },
+    { from: "Shared State", to: "Bearish Researcher", kind: "forward", route: "down" },
+    { from: "Bullish Researcher", to: "Bearish Researcher", kind: "cycle", route: "right", label: "debate" },
+    { from: "Bearish Researcher", to: "Shared State", kind: "cycle", route: "up", label: "evidence" },
+    { from: "Bearish Researcher", to: "Research Manager", kind: "forward", route: "down-rail" },
+    { from: "Research Manager", to: "Trader", kind: "forward", route: "right" },
+    { from: "Trader", to: "Aggressive Risk Analyst", kind: "forward" },
+    { from: "Trader", to: "Neutral Risk Analyst", kind: "forward", route: "right" },
+    { from: "Trader", to: "Conservative Risk Analyst", kind: "forward" },
+    { from: "Aggressive Risk Analyst", to: "Neutral Risk Analyst", kind: "forward", route: "down" },
+    { from: "Conservative Risk Analyst", to: "Neutral Risk Analyst", kind: "forward", route: "up" },
+    { from: "Neutral Risk Analyst", to: "Quality Reviewer", kind: "optional", route: "right" },
+    { from: "Neutral Risk Analyst", to: "Compliance Officer", kind: "optional", route: "right" },
+    { from: "Quality Reviewer", to: "Portfolio Manager", kind: "optional", route: "right" },
+    { from: "Compliance Officer", to: "Portfolio Manager", kind: "optional", route: "right" },
+    { from: "Neutral Risk Analyst", to: "Portfolio Manager", kind: "forward", route: "right" },
+    { from: "Neutral Risk Analyst", to: "Trader", kind: "cycle", route: "left-low", label: "reopen" },
+    { from: "Portfolio Manager", to: "decision", kind: "forward", route: "right" },
+  ];
+
+  const STOCK_GROUPS = [
+    { label: "1 · Research · LangGraph fan-out + blackboard", x: 16, y: 10, w: 988, h: 18, caption: true },
+    { label: "2 · Decision · evidence / reopen cycles", x: 16, y: 292, w: 988, h: 18, caption: true },
+  ];
+
+  // Deterministic = exact v2 LTR crew (port 8001). One column per stage;
+  // parallel desks (analysts, Bull/Bear, risk trio) stack in their column.
+  const DET_WIDTH = 1540;
+  const DET_HEIGHT = 400;
+  const DET_ANALYST_ROW_GAP = 68;
+  const DET_ANALYST_Y0 = 25;
+  const DET_ANALYST_X = 20;
+  const DET_COL_BULL_BEAR = 325;
+  const DET_COL_RES_MGR   = 475;
+  const DET_COL_Q_REV     = 625;
+  const DET_COL_TRADER    = 775;
+  const DET_COL_RISK      = 925;
+  const DET_COL_COMP      = 1075;
+  const DET_COL_PM        = 1225;
+  const DET_COL_DECISION  = 1375;
+  const DET_MID_Y = 150;
+
+  const DET_NODES = [
+    { id: "Market Analyst",            label: "Market + Quant",  kind: "analyst",  x: DET_ANALYST_X, y: DET_ANALYST_Y0 + 0 * DET_ANALYST_ROW_GAP, hasTools: "market_analyst" },
+    { id: "News Analyst",              label: "News + Social",   kind: "analyst",  x: DET_ANALYST_X, y: DET_ANALYST_Y0 + 1 * DET_ANALYST_ROW_GAP, hasTools: "news_analyst" },
+    { id: "Fundamentals Analyst",      label: "Fund. + Sector",  kind: "analyst",  x: DET_ANALYST_X, y: DET_ANALYST_Y0 + 2 * DET_ANALYST_ROW_GAP, hasTools: "fundamentals_analyst" },
+    { id: "Reports Analyst",           label: "Reports/Filings", kind: "analyst",  x: DET_ANALYST_X, y: DET_ANALYST_Y0 + 3 * DET_ANALYST_ROW_GAP, hasTools: "reports_analyst" },
+    { id: "Macro Analyst",             label: "Macro + Geo",     kind: "analyst",  x: DET_ANALYST_X, y: DET_ANALYST_Y0 + 4 * DET_ANALYST_ROW_GAP, hasTools: "macro_analyst" },
+    { id: "Bullish Researcher",        label: "Bullish",         kind: "bull",     x: DET_COL_BULL_BEAR, y: 80, hasTools: "bull_researcher" },
+    { id: "Bearish Researcher",        label: "Bearish",         kind: "bear",     x: DET_COL_BULL_BEAR, y: 220, hasTools: "bear_researcher" },
+    { id: "Research Manager",          label: "Research Mgr",    kind: "manager",  x: DET_COL_RES_MGR, y: DET_MID_Y, hasTools: "research_manager" },
+    { id: "Quality Reviewer",          label: "Quality Review",  kind: "reviewer", x: DET_COL_Q_REV, y: DET_MID_Y, dimmed: true },
+    { id: "Trader",                    label: "Trader",          kind: "trader",   x: DET_COL_TRADER, y: DET_MID_Y, hasTools: "trader" },
+    { id: "Aggressive Risk Analyst",   label: "Aggressive",      kind: "risk_a",   x: DET_COL_RISK, y: 60 },
+    { id: "Neutral Risk Analyst",      label: "Neutral",         kind: "risk_n",   x: DET_COL_RISK, y: 150 },
+    { id: "Conservative Risk Analyst", label: "Conservative",    kind: "risk_c",   x: DET_COL_RISK, y: 240 },
+    { id: "Compliance Officer",        label: "Compliance",      kind: "reviewer", x: DET_COL_COMP, y: DET_MID_Y, dimmed: true },
+    { id: "Portfolio Manager",         label: "Portfolio Mgr",   kind: "manager",  x: DET_COL_PM, y: DET_MID_Y },
+    { id: "decision",                  label: "Decision",        kind: "decision", x: DET_COL_DECISION, y: DET_MID_Y },
+  ];
+
+  const DET_EDGES = [
     ["Market Analyst", "Bullish Researcher"],
     ["News Analyst", "Bullish Researcher"],
     ["Fundamentals Analyst", "Bullish Researcher"],
+    ["Reports Analyst", "Bullish Researcher"],
     ["Macro Analyst", "Bullish Researcher"],
-    // analysts -> bear
     ["Market Analyst", "Bearish Researcher"],
     ["News Analyst", "Bearish Researcher"],
     ["Fundamentals Analyst", "Bearish Researcher"],
+    ["Reports Analyst", "Bearish Researcher"],
     ["Macro Analyst", "Bearish Researcher"],
-    // bull/bear -> Research Manager
     ["Bullish Researcher", "Research Manager"],
     ["Bearish Researcher", "Research Manager"],
-    // research -> trader (Quality Reviewer is now advisory to the PM,
-    // not a trader gate)
     ["Research Manager", "Trader"],
-    // Quality Reviewer (optional) advises the PM directly
     ["Research Manager", "Quality Reviewer"],
     ["Quality Reviewer", "Portfolio Manager"],
-    // trader -> risk (the SERPENTINE PIVOT — trader on top row, risk
-    // team directly below it on row 2; we route this with a vertical
-    // bezier instead of the horizontal LR one)
     ["Trader", "Aggressive Risk Analyst"],
     ["Trader", "Neutral Risk Analyst"],
     ["Trader", "Conservative Risk Analyst"],
-    // risk -> compliance + pm (RTL within row 2)
     ["Aggressive Risk Analyst", "Compliance Officer"],
     ["Neutral Risk Analyst", "Compliance Officer"],
     ["Conservative Risk Analyst", "Compliance Officer"],
@@ -199,152 +221,138 @@
     ["Neutral Risk Analyst", "Portfolio Manager"],
     ["Conservative Risk Analyst", "Portfolio Manager"],
     ["Compliance Officer", "Portfolio Manager"],
-    // PM -> decision (final RTL leg)
     ["Portfolio Manager", "decision"],
   ];
 
-  // Group rectangles hug their contents tightly so they read as labels,
-  // not as giant empty boxes.  Each group box wraps the cells of its
-  // column(s) with a small padding (8 px each side).
-  const STOCK_GROUPS = [
-    // Analyst grid (1 col × 4 merged desks) — spans x=12..168 / y=6..276
-    { label: "Analyst team",     x: 12,   y: 6,   w: 156, h: 270 },
-    // Researcher team wraps Bull/Bear (col 3) + Research Mgr (col 4) +
-    // Quality Reviewer (col 5).  Left edge = col_bull_bear - 8, right
-    // edge = col_q_rev + 140 + 8.
+  const DET_GROUPS = [
+    { label: "Analyst team",     x: 12,   y: 6,   w: 156, h: 360 },
     { label: "Researcher team",  x: 317,  y: 70,  w: 456, h: 200 },
-    // Trader — single node centered at mid-y
     { label: "Trader",           x: 767,  y: 140, w: 156, h: 80 },
-    // Risk team — 3 stacked vertically
     { label: "Risk management",  x: 917,  y: 50,  w: 156, h: 240 },
-    // Compliance + PM — now two side-by-side columns
     { label: "Compliance + PM",  x: 1067, y: 140, w: 306, h: 80 },
-    // Decision (the terminal)
     { label: "Decision",         x: 1367, y: 140, w: 156, h: 80 },
   ];
 
   // ====================== Commodity layout (17-agent debate) ==================
-  // Topology mirrors the stock crew (debate -> trader plan -> risk -> PM)
-  // but with futures-aware personas. ID strings MUST match the YAML
-  // ``role:`` fields in commodity_crew/config/agents.yaml — that's what
-  // the runner emits over the WebSocket.
-  //
-  // Personas reused verbatim from the stock crew (Quality Reviewer, risk
-  // team, Compliance Officer, Portfolio Manager) share their role
-  // strings so NODE_KIND can map them uniformly — only the bull / bear /
-  // research-manager / trader carry distinct futures-only IDs.
+  // Same two-band canvas as stock so Fit stays readable.  ID strings MUST
+  // match the YAML ``role:`` fields in commodity_crew/config/agents.yaml.
+  // QR and Compliance stay on the decision spine (they are in this crew).
+  // Personas reused from the stock crew keep the same role strings.
 
-  // Commodity uses the same strict-LTR shape as stock; only personas change.
-  // 7 commodity analysts vs 8 stock analysts — laid out as 2 cols × 4 rows
-  // (last cell empty) so the column structure stays consistent.  All
-  // sequential stages (Research Mgr → Quality Reviewer → Trader,
-  // Compliance → PM → Decision) each get their own column.
-  const COMM_WIDTH = 1540;
-  const COMM_HEIGHT = 340;
-  const COMM_ANALYST_ROW_GAP = 68;
-  const COMM_ANALYST_Y0 = 25;
-  const COMM_ANALYST_X_A = 20;
-  const COMM_ANALYST_X_B = 170;
-
-  const COMM_COL_BULL_BEAR = 325;
-  const COMM_COL_RES_MGR   = 475;
-  const COMM_COL_Q_REV     = 625;
-  const COMM_COL_TRADER    = 775;
-  const COMM_COL_RISK      = 925;
-  const COMM_COL_COMP      = 1075;
-  const COMM_COL_PM        = 1225;
-  const COMM_COL_DECISION  = 1375;
-
-  const COMM_MID_Y = 150;
+  const COMM_WIDTH = 1032;
+  const COMM_HEIGHT = 560;
+  const COMM_AX = [12, 156, 300, 444, 588, 732, 876];
+  const COMM_AY = 40;
+  const COMM_DEBATE_Y = 124;
+  const COMM_DEC_Y = 368;
+  const COMM_RISK_X = 448;
+  const COMM_DX = [16, 160, 304, 448, 592, 736, 880];
 
   const COMM_NODES = [
-    // Analyst team — 7 analysts split across 2 cols (col A = 4, col B = 3)
-    { id: "Commodity Market Analyst",           label: "Market",         kind: "analyst",  x: COMM_ANALYST_X_A, y: COMM_ANALYST_Y0 + 0 * COMM_ANALYST_ROW_GAP, hasTools: "market_analyst" },
-    { id: "Term Structure Analyst",             label: "Curve",          kind: "analyst",  x: COMM_ANALYST_X_A, y: COMM_ANALYST_Y0 + 1 * COMM_ANALYST_ROW_GAP, hasTools: "curve_analyst" },
-    { id: "Inventories & Stocks Analyst",       label: "Inventories",    kind: "analyst",  x: COMM_ANALYST_X_A, y: COMM_ANALYST_Y0 + 2 * COMM_ANALYST_ROW_GAP, hasTools: "inventories_analyst" },
-    { id: "Supply & Demand Analyst",            label: "Supply / Demand",kind: "analyst",  x: COMM_ANALYST_X_A, y: COMM_ANALYST_Y0 + 3 * COMM_ANALYST_ROW_GAP, hasTools: "supply_demand_analyst" },
-    { id: "Macro Analyst",                      label: "Macro",          kind: "analyst",  x: COMM_ANALYST_X_B, y: COMM_ANALYST_Y0 + 0 * COMM_ANALYST_ROW_GAP, hasTools: "macro_analyst" },
-    { id: "Geopolitical & Supply-Risk Analyst", label: "Geopolitical",   kind: "analyst",  x: COMM_ANALYST_X_B, y: COMM_ANALYST_Y0 + 1 * COMM_ANALYST_ROW_GAP, hasTools: "geopolitical_analyst" },
-    { id: "Positioning & Seasonality Quant",    label: "Positioning",    kind: "analyst",  x: COMM_ANALYST_X_B, y: COMM_ANALYST_Y0 + 2 * COMM_ANALYST_ROW_GAP, hasTools: "quant_analyst" },
+    { id: "Commodity Market Analyst",           label: "Market",         kind: "analyst",  x: COMM_AX[0], y: COMM_AY, hasTools: "market_analyst" },
+    { id: "Term Structure Analyst",             label: "Curve",          kind: "analyst",  x: COMM_AX[1], y: COMM_AY, hasTools: "curve_analyst" },
+    { id: "Inventories & Stocks Analyst",       label: "Inventories",    kind: "analyst",  x: COMM_AX[2], y: COMM_AY, hasTools: "inventories_analyst" },
+    { id: "Supply & Demand Analyst",            label: "Supply / Demand",kind: "analyst",  x: COMM_AX[3], y: COMM_AY, hasTools: "supply_demand_analyst" },
+    { id: "Macro Analyst",                      label: "Macro",          kind: "analyst",  x: COMM_AX[4], y: COMM_AY, hasTools: "macro_analyst" },
+    { id: "Geopolitical & Supply-Risk Analyst", label: "Geopolitical",   kind: "analyst",  x: COMM_AX[5], y: COMM_AY, hasTools: "geopolitical_analyst" },
+    { id: "Positioning & Seasonality Quant",    label: "Positioning",    kind: "analyst",  x: COMM_AX[6], y: COMM_AY, hasTools: "quant_analyst" },
+    { id: "Bullish Futures Researcher",         label: "Bullish",        kind: "bull",     x: 364, y: COMM_DEBATE_Y },
+    { id: "Bearish Futures Researcher",         label: "Bearish",        kind: "bear",     x: 520, y: COMM_DEBATE_Y },
+    { id: "Futures Research Manager",           label: "Research Mgr",   kind: "manager",  x: COMM_DX[0], y: COMM_DEC_Y },
+    { id: "Quality Reviewer",                   label: "Quality Review", kind: "reviewer", x: COMM_DX[1], y: COMM_DEC_Y },
+    { id: "Senior Futures Trader",              label: "Futures Trader", kind: "trader",   x: COMM_DX[2], y: COMM_DEC_Y, hasTools: "trader" },
+    { id: "Aggressive Risk Analyst",            label: "Aggressive",     kind: "risk_a",   x: COMM_RISK_X, y: 312 },
+    { id: "Neutral Risk Analyst",               label: "Neutral",        kind: "risk_n",   x: COMM_RISK_X, y: COMM_DEC_Y },
+    { id: "Conservative Risk Analyst",          label: "Conservative",   kind: "risk_c",   x: COMM_RISK_X, y: 424 },
+    { id: "Compliance Officer",                 label: "Compliance",     kind: "reviewer", x: COMM_DX[4], y: COMM_DEC_Y, hasTools: "compliance_officer" },
+    { id: "Portfolio Manager",                  label: "Portfolio Mgr",  kind: "manager",  x: COMM_DX[5], y: COMM_DEC_Y },
+    { id: "decision",                           label: "Decision",       kind: "decision", x: COMM_DX[6], y: COMM_DEC_Y },
+  ];
 
-    // Researcher team — Bull/Bear parallel stack
-    { id: "Bullish Futures Researcher",         label: "Bullish",        kind: "bull",     x: COMM_COL_BULL_BEAR, y: 80 },
-    { id: "Bearish Futures Researcher",         label: "Bearish",        kind: "bear",     x: COMM_COL_BULL_BEAR, y: 220 },
-
-    // Sequential hand-offs — each in its own column
-    { id: "Futures Research Manager",           label: "Research Mgr",   kind: "manager",  x: COMM_COL_RES_MGR,   y: COMM_MID_Y },
-    { id: "Quality Reviewer",                   label: "Quality Review", kind: "reviewer", x: COMM_COL_Q_REV,     y: COMM_MID_Y },
-    { id: "Senior Futures Trader",              label: "Futures Trader", kind: "trader",   x: COMM_COL_TRADER,    y: COMM_MID_Y, hasTools: "trader" },
-
-    // Risk team — 3 stacked vertically (parallel risk perspectives)
-    { id: "Aggressive Risk Analyst",            label: "Aggressive",     kind: "risk_a",   x: COMM_COL_RISK,      y: 60 },
-    { id: "Neutral Risk Analyst",               label: "Neutral",        kind: "risk_n",   x: COMM_COL_RISK,      y: 150 },
-    { id: "Conservative Risk Analyst",          label: "Conservative",   kind: "risk_c",   x: COMM_COL_RISK,      y: 240 },
-
-    // Compliance → PM — sequential, each in its own column
-    { id: "Compliance Officer",                 label: "Compliance",     kind: "reviewer", x: COMM_COL_COMP,      y: COMM_MID_Y, hasTools: "compliance_officer" },
-    { id: "Portfolio Manager",                  label: "Portfolio Mgr",  kind: "manager",  x: COMM_COL_PM,        y: COMM_MID_Y },
-
-    // Decision
-    { id: "decision",                           label: "Decision",       kind: "decision", x: COMM_COL_DECISION,  y: COMM_MID_Y },
+  const COMM_ANALYSTS = [
+    "Commodity Market Analyst",
+    "Term Structure Analyst",
+    "Inventories & Stocks Analyst",
+    "Supply & Demand Analyst",
+    "Macro Analyst",
+    "Geopolitical & Supply-Risk Analyst",
+    "Positioning & Seasonality Quant",
   ];
 
   const COMM_EDGES = [
-    // analysts -> bull
-    ["Commodity Market Analyst",           "Bullish Futures Researcher"],
-    ["Term Structure Analyst",             "Bullish Futures Researcher"],
-    ["Inventories & Stocks Analyst",       "Bullish Futures Researcher"],
-    ["Supply & Demand Analyst",            "Bullish Futures Researcher"],
-    ["Macro Analyst",                      "Bullish Futures Researcher"],
-    ["Geopolitical & Supply-Risk Analyst", "Bullish Futures Researcher"],
-    ["Positioning & Seasonality Quant",    "Bullish Futures Researcher"],
-    // analysts -> bear
-    ["Commodity Market Analyst",           "Bearish Futures Researcher"],
-    ["Term Structure Analyst",             "Bearish Futures Researcher"],
-    ["Inventories & Stocks Analyst",       "Bearish Futures Researcher"],
-    ["Supply & Demand Analyst",            "Bearish Futures Researcher"],
-    ["Macro Analyst",                      "Bearish Futures Researcher"],
-    ["Geopolitical & Supply-Risk Analyst", "Bearish Futures Researcher"],
-    ["Positioning & Seasonality Quant",    "Bearish Futures Researcher"],
-    // bull/bear -> Research Manager + Quality Reviewer
-    ["Bullish Futures Researcher",         "Futures Research Manager"],
-    ["Bearish Futures Researcher",         "Futures Research Manager"],
-    ["Futures Research Manager",           "Quality Reviewer"],
-    // research -> trader
-    ["Futures Research Manager",           "Senior Futures Trader"],
-    ["Quality Reviewer",                   "Senior Futures Trader"],
-    // trader -> risk
-    ["Senior Futures Trader",              "Aggressive Risk Analyst"],
-    ["Senior Futures Trader",              "Neutral Risk Analyst"],
-    ["Senior Futures Trader",              "Conservative Risk Analyst"],
-    // risk -> compliance + pm
-    ["Aggressive Risk Analyst",            "Compliance Officer"],
-    ["Neutral Risk Analyst",               "Compliance Officer"],
-    ["Conservative Risk Analyst",          "Compliance Officer"],
-    ["Aggressive Risk Analyst",            "Portfolio Manager"],
-    ["Neutral Risk Analyst",               "Portfolio Manager"],
-    ["Conservative Risk Analyst",          "Portfolio Manager"],
-    ["Compliance Officer",                 "Portfolio Manager"],
-    // PM -> decision
-    ["Portfolio Manager",                  "decision"],
+    ...COMM_ANALYSTS.map((id) => ({ from: id, to: "Bullish Futures Researcher", kind: "forward", route: "down" })),
+    ...COMM_ANALYSTS.map((id) => ({ from: id, to: "Bearish Futures Researcher", kind: "forward", route: "down" })),
+    { from: "Bullish Futures Researcher", to: "Bearish Futures Researcher", kind: "cycle", route: "right", label: "debate" },
+    { from: "Bullish Futures Researcher", to: "Futures Research Manager", kind: "forward", route: "down-rail" },
+    { from: "Bearish Futures Researcher", to: "Futures Research Manager", kind: "forward", route: "down-rail" },
+    { from: "Futures Research Manager", to: "Quality Reviewer", kind: "forward", route: "right" },
+    { from: "Quality Reviewer", to: "Senior Futures Trader", kind: "forward", route: "right" },
+    { from: "Senior Futures Trader", to: "Aggressive Risk Analyst", kind: "forward" },
+    { from: "Senior Futures Trader", to: "Neutral Risk Analyst", kind: "forward", route: "right" },
+    { from: "Senior Futures Trader", to: "Conservative Risk Analyst", kind: "forward" },
+    { from: "Aggressive Risk Analyst", to: "Neutral Risk Analyst", kind: "forward", route: "down" },
+    { from: "Conservative Risk Analyst", to: "Neutral Risk Analyst", kind: "forward", route: "up" },
+    { from: "Neutral Risk Analyst", to: "Compliance Officer", kind: "forward", route: "right" },
+    { from: "Compliance Officer", to: "Portfolio Manager", kind: "forward", route: "right" },
+    { from: "Portfolio Manager", to: "decision", kind: "forward", route: "right" },
   ];
 
   const COMM_GROUPS = [
-    { label: "Analyst team",     x: 12,   y: 6,   w: 296, h: 270 },
-    { label: "Researcher team",  x: 317,  y: 70,  w: 456, h: 200 },
-    { label: "Futures trader",   x: 767,  y: 140, w: 156, h: 80 },
-    { label: "Risk management",  x: 917,  y: 50,  w: 156, h: 240 },
-    { label: "Compliance + PM",  x: 1067, y: 140, w: 306, h: 80 },
-    { label: "Decision",         x: 1367, y: 140, w: 156, h: 80 },
+    { label: "1 · Research", x: 16, y: 10, w: 988, h: 18, caption: true },
+    { label: "2 · Decision", x: 16, y: 292, w: 988, h: 18, caption: true },
+  ];
+
+  const HARNESS_NODES = [
+    { id: "Conductor",                 label: "Conductor",       kind: "router",   x: 16,              y: STOCK_PLAY_Y },
+    { id: "Market Analyst",            label: "Market + Quant",  kind: "analyst",  x: STOCK_AX[0],     y: STOCK_AY, hasTools: "market_analyst" },
+    { id: "News Analyst",              label: "News + Social",   kind: "analyst",  x: STOCK_AX[1],     y: STOCK_AY, hasTools: "news_analyst" },
+    { id: "Fundamentals Analyst",      label: "Fund. + Sector",  kind: "analyst",  x: STOCK_AX[2],     y: STOCK_AY, hasTools: "fundamentals_analyst" },
+    { id: "Reports Analyst",           label: "Reports/Filings", kind: "analyst",  x: STOCK_AX[3],     y: STOCK_AY, hasTools: "reports_analyst" },
+    { id: "Macro Analyst",             label: "Macro + Geo",     kind: "analyst",  x: STOCK_AX[4],     y: STOCK_AY, hasTools: "macro_analyst" },
+    { id: "Shared State",              label: "Transcript",      kind: "board",    x: STOCK_BOARD_X,   y: STOCK_BOARD_Y },
+    { id: "Investigator",              label: "Investigator",    kind: "analyst",  x: 268,             y: STOCK_DEBATE_Y },
+    { id: "Bullish Researcher",        label: "Bullish",         kind: "bull",     x: 428,             y: STOCK_DEBATE_Y, hasTools: "bull_researcher" },
+    { id: "Bearish Researcher",        label: "Bearish",         kind: "bear",     x: 588,             y: STOCK_DEBATE_Y, hasTools: "bear_researcher" },
+    { id: "Research Manager",          label: "Research Mgr",    kind: "manager",  x: 16,              y: STOCK_DEC_Y, hasTools: "research_manager" },
+    { id: "Trader",                    label: "Trader",          kind: "trader",   x: 172,             y: STOCK_DEC_Y, hasTools: "trader" },
+    { id: "Aggressive Risk Analyst",   label: "Aggressive",      kind: "risk_a",   x: STOCK_RISK_X,    y: 312 },
+    { id: "Neutral Risk Analyst",      label: "Neutral",         kind: "risk_n",   x: STOCK_RISK_X,    y: STOCK_DEC_Y },
+    { id: "Conservative Risk Analyst", label: "Conservative",    kind: "risk_c",   x: STOCK_RISK_X,    y: 424 },
+    { id: "Portfolio Manager",         label: "Portfolio Mgr",   kind: "manager",  x: 688,             y: STOCK_DEC_Y },
+    { id: "decision",                  label: "Decision",        kind: "decision", x: 856,             y: STOCK_DEC_Y },
+  ];
+  const HARNESS_EDGES = [
+    { from: "Conductor", to: "Shared State", kind: "forward", route: "right" },
+    { from: "Conductor", to: "Investigator", kind: "optional", route: "right" },
+    { from: "Market Analyst", to: "Shared State", kind: "forward", route: "down" },
+    { from: "News Analyst", to: "Shared State", kind: "forward", route: "down" },
+    { from: "Fundamentals Analyst", to: "Shared State", kind: "forward", route: "down" },
+    { from: "Reports Analyst", to: "Shared State", kind: "optional", route: "down" },
+    { from: "Macro Analyst", to: "Shared State", kind: "forward", route: "down" },
+    { from: "Investigator", to: "Shared State", kind: "forward", route: "right" },
+    { from: "Shared State", to: "Bullish Researcher", kind: "optional", route: "down" },
+    { from: "Shared State", to: "Bearish Researcher", kind: "optional", route: "down" },
+    { from: "Bullish Researcher", to: "Bearish Researcher", kind: "cycle", route: "right", label: "debate" },
+    { from: "Research Manager", to: "Trader", kind: "optional", route: "right" },
+    { from: "Trader", to: "Neutral Risk Analyst", kind: "optional", route: "right" },
+    { from: "Aggressive Risk Analyst", to: "Conservative Risk Analyst", kind: "cycle", route: "right", label: "risk" },
+    { from: "Conservative Risk Analyst", to: "Neutral Risk Analyst", kind: "cycle", route: "right" },
+    { from: "Portfolio Manager", to: "decision", kind: "forward", route: "right" },
+  ];
+  const HARNESS_GROUPS = [
+    { label: "1 · Harness · conductor picks tools and sub-agents", x: 16, y: 10, w: 988, h: 18, caption: true },
+    { label: "2 · Decision · PM writes the primary ticket", x: 16, y: 292, w: 988, h: 18, caption: true },
   ];
 
   const LAYOUTS = {
-    stock:     { width: STOCK_WIDTH, height: STOCK_HEIGHT, NODES: STOCK_NODES, EDGES: STOCK_EDGES, GROUPS: STOCK_GROUPS },
-    commodity: { width: COMM_WIDTH,  height: COMM_HEIGHT,  NODES: COMM_NODES,  EDGES: COMM_EDGES,  GROUPS: COMM_GROUPS },
+    stock:                 { width: STOCK_WIDTH, height: STOCK_HEIGHT, NODES: STOCK_NODES, EDGES: STOCK_EDGES, GROUPS: STOCK_GROUPS },
+    stock_deterministic:   { width: DET_WIDTH,   height: DET_HEIGHT,   NODES: DET_NODES,   EDGES: DET_EDGES,   GROUPS: DET_GROUPS },
+    stock_harness:         { width: STOCK_WIDTH, height: STOCK_HEIGHT, NODES: HARNESS_NODES, EDGES: HARNESS_EDGES, GROUPS: HARNESS_GROUPS },
+    commodity:             { width: COMM_WIDTH,  height: COMM_HEIGHT,  NODES: COMM_NODES,  EDGES: COMM_EDGES,  GROUPS: COMM_GROUPS },
   };
 
   function el(tag, attrs, ...children) {
-    const isSvg = ["svg", "path", "rect", "circle", "line", "polygon", "defs", "marker", "g"].includes(tag);
+    const isSvg = ["svg", "path", "rect", "circle", "line", "polygon", "defs", "marker", "g", "text"].includes(tag);
     const node = isSvg
       ? document.createElementNS("http://www.w3.org/2000/svg", tag)
       : document.createElement(tag);
@@ -375,20 +383,24 @@
       this.container = container;
       const opts = options || {};
       const assetClass = (opts.assetClass === "commodity") ? "commodity" : "stock";
-      const layout = LAYOUTS[assetClass];
+      const layoutId = opts.layoutId
+        || (assetClass === "commodity" ? "commodity" : "stock");
       this.assetClass = assetClass;
-      this.LAYOUT_WIDTH = layout.width;
-      this.LAYOUT_HEIGHT = layout.height;
-      this.NODES = layout.NODES;
-      this.EDGES = layout.EDGES;
-      this.GROUPS = layout.GROUPS;
+      this._applyLayout(layoutId);
       this.nodesById = {};
       this.toolStrips = {};
       this.edges = {};
+      this.dynamicEdges = [];
+      this.edgeLive = {};
+      this.edgeSpecs = {};
       this.selected = null;
       this.selectListeners = [];
       this.scaleListeners = [];    // notified on zoom changes (UI percentage)
       this.nodeRunCount = {};      // role -> # task_completed events received
+      this.qualityReview = false;
+      this.compliance = false;
+      this.runMode = "autonomous";
+      this.orchestrator = assetClass === "commodity" ? "crewai" : "langgraph";
       // Zoom state.  ``fitScale`` is what fits the diagram into the
       // viewport width; ``userZoom`` is the multiplier the user applies
       // on top via the +/- toolbar or Ctrl+wheel.  Effective scale is
@@ -398,6 +410,30 @@
       this.MIN_USER_ZOOM = 0.4;
       this.MAX_USER_ZOOM = 3.0;
       this.render();
+    }
+
+    _applyLayout(layoutId) {
+      const layout = LAYOUTS[layoutId] || LAYOUTS.stock;
+      this.layoutId = LAYOUTS[layoutId] ? layoutId : "stock";
+      this.LAYOUT_WIDTH = layout.width;
+      this.LAYOUT_HEIGHT = layout.height;
+      this.NODES = layout.NODES;
+      this.EDGES = layout.EDGES;
+      this.GROUPS = layout.GROUPS;
+    }
+
+    setLayout(layoutId) {
+      if (!layoutId || layoutId === this.layoutId) return false;
+      this._applyLayout(layoutId);
+      this.nodesById = {};
+      this.toolStrips = {};
+      this.edges = {};
+      this.dynamicEdges = [];
+      this.edgeLive = {};
+      this.edgeSpecs = {};
+      this.nodeRunCount = {};
+      this.render();
+      return true;
     }
 
     render() {
@@ -412,12 +448,18 @@
       inner.style.height = this.LAYOUT_HEIGHT + "px";
       inner.style.transformOrigin = "top left";
       this.inner = inner;
+      if (this.layoutId === "stock" || this.layoutId === "commodity") {
+        inner.classList.add("flow-layout-banded");
+      }
+      if (this.assetClass === "commodity") inner.classList.add("flow-layout-commodity");
+      if (this.layoutId === "stock_deterministic") inner.classList.add("flow-layout-v2");
       this.container.appendChild(inner);
 
-      // Group rectangles
+      // Group rectangles (stock uses caption-only stage labels, no boxes)
+      this.groupEls = [];
       this.GROUPS.forEach((g) => {
         const grp = document.createElement("div");
-        grp.className = "flow-group";
+        grp.className = g.caption ? "flow-group caption-only" : "flow-group";
         grp.style.left = g.x + "px";
         grp.style.top = g.y + "px";
         grp.style.width = g.w + "px";
@@ -427,6 +469,7 @@
         lbl.textContent = g.label;
         grp.appendChild(lbl);
         inner.appendChild(grp);
+        this.groupEls.push({ cfg: g, el: grp, label: lbl });
       });
 
       // SVG with edges
@@ -465,6 +508,7 @@
         node.dataset.nodeId = cfg.id;
         node.dataset.kind = cfg.kind;
         node.dataset.state = "idle";
+        if (cfg.dimmed) node.classList.add("flow-node-dim");
         node.style.left = cfg.x + "px";
         node.style.top = cfg.y + "px";
         node.style.color = NODE_COLORS[cfg.kind] || "#94a3b8";
@@ -485,7 +529,10 @@
 
         const subtitle = document.createElement("div");
         subtitle.className = "subtitle";
-        subtitle.textContent = cfg.kind.replace("_", " ");
+        if (cfg.dimmed) subtitle.textContent = "off";
+        else if (cfg.kind === "router") subtitle.textContent = "router";
+        else if (cfg.kind === "board") subtitle.textContent = "shared state";
+        else subtitle.textContent = cfg.kind.replace("_", " ");
         node.appendChild(subtitle);
 
         if (helpAnchor) {
@@ -516,11 +563,13 @@
         if (cfg.hasTools) {
           const strip = document.createElement("div");
           strip.className = "tools-strip";
-          strip.style.left = cfg.x + "px";
-          // 40 = 38 px node body + 2 px gap.  Strip itself is height-capped
-          // by CSS so a tool-heavy analyst can't crowd the next row.
-          strip.style.top = (cfg.y + 40) + "px";
-          inner.appendChild(strip);
+          if (this.layoutId === "stock_deterministic") {
+            strip.style.left = cfg.x + "px";
+            strip.style.top = (cfg.y + 40) + "px";
+            inner.appendChild(strip);
+          } else {
+            node.appendChild(strip);
+          }
           this.toolStrips[cfg.id] = { el: strip, agentKey: cfg.hasTools, chips: {}, counters: {} };
         }
       });
@@ -528,28 +577,22 @@
       // Edges (after nodes so we know their actual heights)
       this.renderEdges();
 
-      // Auto-fit on resize.
       this.fit();
+      this._bindViewportOnce();
+    }
+
+    _bindViewportOnce() {
+      if (this._viewportBound) return;
+      this._viewportBound = true;
       window.addEventListener("resize", () => this.refit());
-      // ResizeObserver picks up the container going from display:none -> visible
-      // when the user switches tabs (Alpine x-show toggles display). Without
-      // this, fit() last ran with clientWidth=0 (because the tab was hidden
-      // mid-run) and the diagram stays collapsed to height 0 even after the
-      // user returns. The observer refires fit() the moment the container
-      // gets a real width again. Guarded by typeof check so the diagram still
-      // boots in environments without ResizeObserver (jsdom etc.).
       if (typeof ResizeObserver !== "undefined") {
         try {
+          if (this._resizeObserver) this._resizeObserver.disconnect();
           this._resizeObserver = new ResizeObserver(() => this.refit());
-          this._resizeObserver.observe(this.container);
-        } catch (_) {
-          // ignore — refit() will still recover when the user resizes.
-        }
+          const vp = this.container.parentElement || this.container;
+          this._resizeObserver.observe(vp);
+        } catch (_) { /* refit() still recovers on window resize */ }
       }
-
-      // Ctrl + wheel = zoom (anchored at the cursor position).  We
-      // listen on the SVG layer so panning by scrolling normally
-      // (without Ctrl) still works through the parent overflow:auto.
       this.container.addEventListener("wheel", (ev) => {
         if (!(ev.ctrlKey || ev.metaKey)) return;
         ev.preventDefault();
@@ -563,33 +606,277 @@
      * LTR — every edge exits the right side of A and enters the left
      * side of B at their respective vertical mid-points.
      */
-    edgeAnchors(a, b) {
+    _normEdge(e) {
+      if (Array.isArray(e)) return { from: e[0], to: e[1], kind: e[2] || "forward" };
+      return {
+        from: e.from,
+        to: e.to,
+        kind: e.kind || "forward",
+        route: e.route,
+        label: e.label,
+      };
+    }
+
+    _lookupEdgeSpec(from, to, kind) {
+      const found = (this.EDGES || []).map((raw) => this._normEdge(raw))
+        .find((e) => e.from === from && e.to === to);
+      return found || { from, to, kind: kind || "forward" };
+    }
+
+    edgeAnchors(a, b, route) {
       const ax = parseFloat(a.style.left);
       const ay = parseFloat(a.style.top);
       const aw = a.offsetWidth;
       const ah = a.offsetHeight;
       const bx = parseFloat(b.style.left);
       const by = parseFloat(b.style.top);
+      const bw = b.offsetWidth;
       const bh = b.offsetHeight;
+      const aCx = ax + aw / 2;
+      const aCy = ay + ah / 2;
+      const bCx = bx + bw / 2;
+      const bCy = by + bh / 2;
+
+      if (this.layoutId === "stock_deterministic") {
+        return { x1: ax + aw, y1: aCy, x2: bx, y2: bCy };
+      }
+      if (this.assetClass === "stock" || this.assetClass === "commodity") {
+        const forced = route || "";
+        if (forced === "down") {
+          return { x1: aCx, y1: ay + ah, x2: bCx, y2: by, elbow: true, vertFirst: true };
+        }
+        if (forced === "down-rail") {
+          return { x1: aCx, y1: ay + ah, x2: bCx, y2: by, elbow: true, railY: ay + ah + 16 };
+        }
+        if (forced === "up") {
+          return { x1: aCx, y1: ay, x2: bCx, y2: by + bh, elbow: true, vertFirst: true };
+        }
+        if (forced === "right") {
+          return { x1: ax + aw, y1: aCy, x2: bx, y2: bCy, elbow: true };
+        }
+        if (forced === "left") {
+          return { x1: ax, y1: aCy, x2: bx + bw, y2: bCy, elbow: true };
+        }
+        if (forced === "left-low") {
+          return { x1: ax, y1: aCy + 10, x2: bx + bw, y2: bCy + 10, elbow: true };
+        }
+        const dx = bCx - aCx;
+        const dy = bCy - aCy;
+        if (Math.abs(dx) >= Math.abs(dy)) {
+          if (dx >= 0) return { x1: ax + aw, y1: aCy, x2: bx, y2: bCy, elbow: true };
+          return { x1: ax, y1: aCy, x2: bx + bw, y2: bCy, elbow: true };
+        }
+        if (dy >= 0) return { x1: aCx, y1: ay + ah, x2: bCx, y2: by, elbow: true, vertFirst: true };
+        return { x1: aCx, y1: ay, x2: bCx, y2: by + bh, elbow: true, vertFirst: true };
+      }
+
+      if (Math.abs(bx - ax) < 24) {
+        return { x1: ax + aw, y1: ay + ah / 2, x2: bx + bw, y2: by + bh / 2, loop: "right" };
+      }
+      if (bx + 8 < ax) {
+        return { x1: ax, y1: ay + ah / 2, x2: bx + bw, y2: by + bh / 2, reverse: true };
+      }
       return { x1: ax + aw, y1: ay + ah / 2, x2: bx, y2: by + bh / 2 };
+    }
+
+    _pathForAnchors(anchors) {
+      const { x1, y1, x2, y2, reverse, loop, elbow, vertFirst } = anchors;
+      if (elbow) {
+        if (anchors.railY != null) {
+          return `M ${x1} ${y1} L ${x1} ${anchors.railY} L ${x2} ${anchors.railY} L ${x2} ${y2}`;
+        }
+        if (anchors.drop) {
+          const y = Math.max(y1, y2) + anchors.drop;
+          return `M ${x1} ${y1} L ${x1} ${y} L ${x2} ${y} L ${x2} ${y2}`;
+        }
+        if (Math.abs(x1 - x2) < 2 || Math.abs(y1 - y2) < 2) {
+          return `M ${x1} ${y1} L ${x2} ${y2}`;
+        }
+        if (vertFirst) {
+          const my = (y1 + y2) / 2;
+          return `M ${x1} ${y1} L ${x1} ${my} L ${x2} ${my} L ${x2} ${y2}`;
+        }
+        const mx = (x1 + x2) / 2;
+        return `M ${x1} ${y1} L ${mx} ${y1} L ${mx} ${y2} L ${x2} ${y2}`;
+      }
+      if (loop === "right") {
+        const bulge = 42;
+        return `M ${x1} ${y1} C ${x1 + bulge} ${y1}, ${x2 + bulge} ${y2}, ${x2} ${y2}`;
+      }
+      if (reverse) {
+        const lift = Math.max(36, Math.abs(y2 - y1) * 0.35 + 28);
+        return `M ${x1} ${y1} C ${x1 - 48} ${y1 - lift}, ${x2 + 48} ${y2 - lift}, ${x2} ${y2}`;
+      }
+      return curvePath(x1, y1, x2, y2);
+    }
+
+    _styleIdleEdge(path, kind) {
+      path.classList.remove("active", "done", "skipped", "cycled", "cycle-idle", "optional-idle");
+      if (kind === "cycle") path.classList.add("cycle-idle");
+      if (kind === "optional") path.classList.add("optional-idle");
+      path.setAttribute("marker-end", "url(#arrow)");
+    }
+
+    _drawEdge(spec) {
+      const from = spec.from;
+      const to = spec.to;
+      const kind = spec.kind || "forward";
+      const a = this.nodesById[from];
+      const b = this.nodesById[to];
+      if (!a || !b) return null;
+      const anchors = this.edgeAnchors(a, b, spec.route);
+      const path = el("path", {
+        d: this._pathForAnchors(anchors),
+        class: "flow-edge",
+        "marker-end": "url(#arrow)",
+      });
+      this._styleIdleEdge(path, kind);
+      this.edgesGroup.appendChild(path);
+      if (spec.label) {
+        const lx = (anchors.x1 + anchors.x2) / 2;
+        const ly = (anchors.y1 + anchors.y2) / 2 - 7;
+        const text = el("text", {
+          class: "flow-edge-label",
+          x: lx,
+          y: ly,
+          "text-anchor": "middle",
+        });
+        text.textContent = spec.label;
+        this.edgesGroup.appendChild(text);
+      }
+      return path;
     }
 
     renderEdges() {
       this.edges = {};
+      this.dynamicEdges = [];
+      this.edgeSpecs = this.edgeSpecs || {};
       this.edgesGroup.innerHTML = "";
-      this.EDGES.forEach(([from, to]) => {
-        const a = this.nodesById[from];
-        const b = this.nodesById[to];
-        if (!a || !b) return;
-        const { x1, y1, x2, y2 } = this.edgeAnchors(a, b);
-        const path = el("path", {
-          d: curvePath(x1, y1, x2, y2),
-          class: "flow-edge",
-          "marker-end": "url(#arrow)",
-        });
-        this.edgesGroup.appendChild(path);
-        this.edges[`${from}->${to}`] = path;
+      this.EDGES.forEach((raw) => {
+        const e = this._normEdge(raw);
+        const path = this._drawEdge(e);
+        if (path) {
+          this.edges[`${e.from}->${e.to}`] = path;
+          this.edgeSpecs[`${e.from}->${e.to}`] = e;
+        }
       });
+      Object.entries(this.edgeLive || {}).forEach(([key, live]) => {
+        const [from, to] = key.split("->");
+        if (!this.edges[key]) {
+          const spec = this._lookupEdgeSpec(from, to, live === "cycled" ? "cycle" : "forward");
+          const path = this._drawEdge(spec);
+          if (path) {
+            this.edges[key] = path;
+            this.edgeSpecs[key] = spec;
+            this.dynamicEdges.push(key);
+          }
+        }
+        if (this.edges[key]) this._applyLive(this.edges[key], live, from);
+      });
+    }
+
+    _applyLive(path, kind, from) {
+      path.classList.remove("active", "done", "skipped", "cycled");
+      if (kind === "skipped") {
+        path.classList.add("skipped");
+        const node = from && this.nodesById[from];
+        if (node) node.dataset.state = "skipped";
+      } else if (kind === "cycled") {
+        path.classList.add("cycled", "active");
+        path.setAttribute("marker-end", "url(#arrow-active)");
+      } else {
+        path.classList.add("active");
+        path.setAttribute("marker-end", "url(#arrow-active)");
+      }
+    }
+
+    activateEdge(from, to, kind) {
+      kind = kind || "activated";
+      const key = `${from}->${to}`;
+      this.edgeLive[key] = kind;
+      let path = this.edges[key];
+      if (!path) {
+        const spec = this._lookupEdgeSpec(from, to, kind === "cycled" ? "cycle" : "forward");
+        path = this._drawEdge(spec);
+        if (!path) return;
+        this.edges[key] = path;
+        this.edgeSpecs[key] = spec;
+        this.dynamicEdges.push(key);
+      }
+      this._applyLive(path, kind, from);
+    }
+
+    setGraphMeta(meta) {
+      meta = meta || {};
+      if (meta.qualityReview !== undefined) this.qualityReview = !!meta.qualityReview;
+      if (meta.compliance !== undefined) this.compliance = !!meta.compliance;
+      if (meta.runMode) this.runMode = meta.runMode;
+      if (meta.orchestrator) this.orchestrator = meta.orchestrator;
+      this._applyReviewerVisibility();
+      this._applyOrchestratorChrome();
+      const router = this.nodesById["Playbook Router"];
+      if (router && this.orchestrator !== "crewai") {
+        router.dataset.state = "done";
+        const sub = router.querySelector(".subtitle");
+        if (sub) sub.textContent = meta.playbookAction || "default";
+      }
+      if (meta.skipReports && this.orchestrator !== "crewai") {
+        this.activateEdge("Playbook Router", "Reports Analyst", "skipped");
+        this.activateEdge("Reports Analyst", "Shared State", "skipped");
+        const reports = this.nodesById["Reports Analyst"];
+        if (reports) reports.dataset.state = "skipped";
+      }
+    }
+
+    _advisoryOn() {
+      return !!(this.qualityReview || this.compliance);
+    }
+
+    _applyReviewerVisibility() {
+      if (this.assetClass !== "stock") return;
+      const flags = {
+        "Quality Reviewer": !!this.qualityReview,
+        "Compliance Officer": !!this.compliance,
+      };
+      Object.keys(flags).forEach((id) => {
+        const node = this.nodesById[id];
+        if (!node) return;
+        const on = flags[id];
+        node.classList.toggle("flow-node-dim", !on);
+        const sub = node.querySelector(".subtitle");
+        if (sub) sub.textContent = on ? "advisory" : "off";
+      });
+      if (this.layoutId === "stock_deterministic") {
+        if (this.qualityReview) {
+          this.activateEdge("Research Manager", "Quality Reviewer", "activated");
+          this.activateEdge("Quality Reviewer", "Portfolio Manager", "activated");
+        }
+        if (this.compliance) {
+          this.activateEdge("Compliance Officer", "Portfolio Manager", "activated");
+        }
+        return;
+      }
+      if (this.qualityReview) {
+        this.activateEdge("Neutral Risk Analyst", "Quality Reviewer", "activated");
+        this.activateEdge("Quality Reviewer", "Portfolio Manager", "activated");
+      }
+      if (this.compliance) {
+        this.activateEdge("Neutral Risk Analyst", "Compliance Officer", "activated");
+        this.activateEdge("Compliance Officer", "Portfolio Manager", "activated");
+      }
+      if (this._advisoryOn()) {
+        this.activateEdge("Neutral Risk Analyst", "Portfolio Manager", "skipped");
+      }
+    }
+
+    _applyOrchestratorChrome() {
+      if (this.assetClass !== "stock") return;
+      const router = this.nodesById["Playbook Router"];
+      if (!router) return;
+      const sequential = this.orchestrator === "crewai" || this.runMode === "deterministic";
+      router.classList.toggle("flow-node-dim", sequential);
+      const sub = router.querySelector(".subtitle");
+      if (sub && sequential) sub.textContent = "sequential";
     }
 
     /**
@@ -599,19 +886,30 @@
      * Called from the resize observer and from the toolbar "Fit" button
      * (which also resets userZoom to 1).
      */
+    _viewportBox() {
+      const vp = this.container.parentElement;
+      const w = (vp && vp.clientWidth) || this.container.clientWidth;
+      return { w, h: window.innerHeight * 0.8 };
+    }
+
+    _computeFitScale() {
+      const { w, h } = this._viewportBox();
+      if (w <= 0) return this.fitScale;
+      const byW = (w - 8) / this.LAYOUT_WIDTH;
+      const byH = (h - 8) / this.LAYOUT_HEIGHT;
+      return Math.min(1, byW, byH);
+    }
+
     fit() {
-      const containerWidth = this.container.clientWidth;
-      if (containerWidth <= 0) return;
-      this.fitScale = Math.min(1, containerWidth / this.LAYOUT_WIDTH);
+      const next = this._computeFitScale();
+      if (!(next > 0)) return;
+      this.fitScale = next;
       this.applyScale();
     }
 
     // Recompute fitScale without touching userZoom (resize-driven path).
     refit() {
-      const containerWidth = this.container.clientWidth;
-      if (containerWidth <= 0) return;
-      this.fitScale = Math.min(1, containerWidth / this.LAYOUT_WIDTH);
-      this.applyScale();
+      this.fit();
     }
 
     /** Total effective scale = fit-to-width × user zoom. */
@@ -770,6 +1068,28 @@
      * Seed each agent's tool strip with idle pre-configured chips so the
      * user can see the tool inventory before the run.
      */
+    /* Tag the tiles whose desks run ReAct-style planning (plan→act→observe).
+     * ``roles`` is the list of node ids from /api/options#react_agents, so the
+     * badge reflects the LIVE backend config (empty when planning is off) —
+     * never a hardcoded assumption.  Idempotent: safe to call on reload. */
+    setReactAgents(roles) {
+      const want = new Set(roles || []);
+      Object.entries(this.nodesById).forEach(([nodeId, node]) => {
+        const existing = node.querySelector(".react-badge");
+        if (want.has(nodeId)) {
+          if (!existing) {
+            const badge = document.createElement("span");
+            badge.className = "react-badge";
+            badge.textContent = "ReAct";
+            badge.title = "Runs a plan → act → observe/replan loop before deciding";
+            node.appendChild(badge);
+          }
+        } else if (existing) {
+          existing.remove();
+        }
+      });
+    }
+
     setActiveTools(agentToTools) {
       Object.entries(agentToTools || {}).forEach(([agentKey, tools]) => {
         // Find the node id whose tools-strip belongs to this agent
@@ -814,26 +1134,40 @@
     }
 
     reset() {
+      this.qualityReview = false;
+      this.compliance = false;
       Object.values(this.nodesById).forEach((n) => (n.dataset.state = "idle"));
       Object.values(this.toolStrips).forEach((s) => {
         s.el.innerHTML = "";
         s.chips = {};
         s.counters = {};
       });
-      Object.values(this.edges).forEach((p) => {
-        p.classList.remove("active");
-        p.classList.remove("done");
-        p.setAttribute("marker-end", "url(#arrow)");
+      this.edgeLive = {};
+      (this.dynamicEdges || []).forEach((key) => {
+        const p = this.edges[key];
+        if (p && p.parentNode) p.parentNode.removeChild(p);
+        delete this.edges[key];
+      });
+      this.dynamicEdges = [];
+      this.EDGES.forEach((raw) => {
+        const e = this._normEdge(raw);
+        const p = this.edges[`${e.from}->${e.to}`];
+        if (p) this._styleIdleEdge(p, e.kind);
       });
       this.nodeRunCount = {};
-      // restore subtitles
       this.NODES.forEach((cfg) => {
         const node = this.nodesById[cfg.id];
         if (!node) return;
         const sub = node.querySelector(".subtitle");
-        if (sub) sub.textContent = cfg.kind.replace("_", " ");
+        if (!sub) return;
+        if (cfg.dimmed) sub.textContent = "off";
+        else if (cfg.kind === "router") sub.textContent = "router";
+        else if (cfg.kind === "board") sub.textContent = "shared state";
+        else sub.textContent = cfg.kind.replace("_", " ");
       });
       this.setDecision("");
+      this._applyReviewerVisibility();
+      this._applyOrchestratorChrome();
     }
   }
 

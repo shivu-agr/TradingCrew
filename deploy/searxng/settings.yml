@@ -1,0 +1,25 @@
+# Minimal SearXNG config for programmatic JSON search.
+# JSON is OFF upstream by default; TradingCrew's web_research backend needs it.
+# Rotate `secret_key` on any public deployment (`openssl rand -hex 32`).
+use_default_settings: true
+server:
+  secret_key: "change-me-on-first-deploy"
+  limiter: false
+  image_proxy: false
+search:
+  formats:
+    - html
+    - json
+  suspended_times:
+    SearxEngineAccessDenied: 60
+    SearxEngineCaptcha: 60
+    SearxEngineTooManyRequests: 120
+    cf_SearxEngineCaptcha: 60
+    cf_SearxEngineAccessDenied: 60
+    recaptcha_SearxEngineCaptcha: 60
+outgoing:
+  request_timeout: 6.0
+  max_request_timeout: 15.0
+  pool_connections: 100
+  pool_maxsize: 20
+  enable_http2: true

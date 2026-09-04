@@ -1,0 +1,85 @@
+# =============================================================================
+# Programmatic Prediction API — run knobs
+# =============================================================================
+# Used by POST /api/v1/runs. The request body supplies ticker, and
+# debate_rounds / risk_rounds when run_mode is not harness. Everything
+# else is read from this file.
+#
+# Override the path with TRADINGCREW_API_CONFIG (absolute or repo-relative).
+#
+# Agent / task copy is NOT in this file — it is large and already split:
+#   trading_crew/config/agents.yaml
+#   trading_crew/config/tasks.yaml
+#   trading_crew/config/run_mode_prompts.yaml
+# Operator overlays (Settings page): $TRADINGCREW_CACHE_DIR/v3/prompt_overlay.yaml
+# =============================================================================
+
+asset_class: stock
+run_mode: harness          # autonomous | deterministic | harness
+quality_review: false
+compliance: false
+critic_enabled: true
+fusion_enabled: false
+fusion_include_crowd: false
+book: paper
+# Desk LLM. Overridden by TRADINGCREW_LLM_PRESET in .env when that is set.
+llm_preset: local-vllm
+force_rerun: false
+
+# Per-desk tools. An empty mapping means the crew uses its packaged defaults.
+# Omit a desk key to leave that desk on packaged defaults; set a desk to []
+# to run it with no tools.
+tools_enabled:
+  market_analyst:
+    - get_stock_data
+    - get_indicators
+    - get_options_summary
+    - get_analyst_recommendations
+    - get_crowd_positioning
+  news_analyst:
+    - get_market_context
+    - get_news
+    - get_global_news
+    - get_corporate_actions
+    - get_insider_transactions
+    - research_web
+  fundamentals_analyst:
+    - get_fundamentals
+    - get_balance_sheet
+    - get_cashflow
+    - get_income_statement
+    - get_shareholding_pattern
+    - get_long_term_thesis
+    - get_forward_estimates
+    - get_market_context
+    - get_sector_peers
+  reports_analyst:
+    - get_report_insights
+    - get_market_context
+    - get_forward_estimates
+  macro_analyst:
+    - get_market_context
+    - get_macro_data
+    - get_global_news
+    - get_geopolitical_news
+    - get_supply_chain_risk
+  bull_researcher:
+    - read_scratchpad
+    - write_scratchpad
+    - research_web
+    - get_news
+    - get_event_proximity
+    - request_evidence
+  bear_researcher:
+    - read_scratchpad
+    - write_scratchpad
+    - research_web
+    - get_news
+    - get_event_proximity
+    - request_evidence
+  research_manager:
+    - read_scratchpad
+    - lookup_blackboard
+    - request_evidence
+  trader:
+    - get_event_proximity

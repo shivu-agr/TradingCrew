@@ -1,0 +1,261 @@
+# =============================================================================
+# Desk strategy — EDIT THIS FILE
+# =============================================================================
+# This is the live playbook the desks read and the self-learning loop scores
+# against.  Change a threshold, a rule, or the active experiment here; the
+# next run and the next Resolve sweep pick it up.  Nothing in this file is
+# crypto-specific: the book is cash equities + listed commodity futures.
+#
+# Dual clocks (do not collapse them):
+#   * LEARNING clock  — 30 calendar days (~21 trading sessions).  This is
+#     what the self-learn loop prices, labels, and scores.  It exists so
+#     the book can improve before a 180-day MEDIUM thesis has resolved.
+#   * THESIS clock    — SHORT / MEDIUM / LONG as the PM already emits.
+#     Medium and long predictions stay on the decision; they are scored
+#     later, they are not deleted by the 30-day review.
+#
+# Self-learning contract (adapted from goal-driven trading agents, not
+# from 24/7 crypto rebalancers):
+#   1. Accuracy     — only embargoed, point-in-time tape.  No look-ahead.
+#   2. Reliability  — one LOSS never rewrites production (same Mass gate).
+#   3. Defined goals — success AND failure are numeric, below.
+#   4. Scientific method — change ONE knob at a time; keep only what beats
+#      the current 30-day book on the success bars.
+# =============================================================================
+
+name: cashflow_positioning_book
+version: 1
+
+mandate: >
+  Run a cash-market book (listed equities and commodity futures), not a
+  24/7 crypto rebalancer.  Predict a directional side AND a thesis
+  horizon.  The 30-day tape is the learning signal; the MEDIUM/LONG
+  thesis is the investment signal.  A 30-day WIN that violates the
+  drawdown bar is still a book-level failure.  A 30-day LOSS that
+  leaves a LONG compounder thesis intact is a timing miss, not a
+  reason to flip the multi-year view.
+
+asset_classes:
+  - equity
+  - commodity
+
+# ---- Clocks ----------------------------------------------------------------
+learning:
+  # ~21 trading sessions ≈ 30 calendar days.  The resolve loop uses
+  # calendar_days so weekends/holidays do not starve the clock.
+  calendar_days: 30
+  trading_days: 21
+  embargo_days: 0
+  label: short
+
+thesis:
+  short:
+    trading_days: 21
+    calendar_days: 30
+    note: Dated catalyst only (earnings print, buyback close, FDA, index add).
+  medium:
+    trading_days: 126
+    calendar_days: 180
+    note: Quarterly-to-annual earnings / margin / sector-rotation thesis.
+  long:
+    trading_days: 504
+    calendar_days: 730
+    note: Multi-year compounder or structural-break thesis. Outcome accounting still caps at 1260d.
+
+# ---- Success / failure (book-level, 30-day learning cohort) ----------------
+# Per-trade WIN/LOSS is still signed vs the predicted side.  The BOOK is
+# scored on the bars below.  Edit the numbers; do not leave a key out —
+# the loader requires every field listed here.
+objectives:
+  short:
+    min_n: 12
+    success:
+      min_hit_rate: 0.55
+      min_mean_alpha: 0.0
+      # Drawdowns are negative.  Success means mean peak-to-trough is
+      # no worse than this (e.g. -0.08 = average loser path ≤ 8%).
+      max_mean_drawdown: -0.08
+      min_expectancy: 0.0
+      min_profit_factor: 1.15
+    failure:
+      hit_rate_below: 0.45
+      mean_alpha_below: -0.01
+      mean_drawdown_below: -0.12
+    look_ahead:
+      # Reject a "perfect" short window on a small n — the crypto bots
+      # that overfit a year of candles fail this the same way.
+      min_n_for_trust: 20
+      hit_rate_above: 0.90
+      mean_alpha_above: 0.25
+  medium:
+    min_n: 8
+    success:
+      min_hit_rate: 0.53
+      min_mean_alpha: 0.0
+      max_mean_drawdown: -0.15
+      min_expectancy: 0.0
+      min_profit_factor: 1.10
+    failure:
+      hit_rate_below: 0.42
+      mean_alpha_below: -0.02
+      mean_drawdown_below: -0.22
+    look_ahead:
+      min_n_for_trust: 16
+      hit_rate_above: 0.88
+      mean_alpha_above: 0.40
+  long:
+    min_n: 6
+    success:
+      min_hit_rate: 0.52
+      min_mean_alpha: 0.0
+      max_mean_drawdown: -0.25
+      min_expectancy: 0.0
+      min_profit_factor: 1.05
+    failure:
+      hit_rate_below: 0.40
+      mean_alpha_below: -0.03
+      mean_drawdown_below: -0.35
+    look_ahead:
+      min_n_for_trust: 12
+      hit_rate_above: 0.85
+      mean_alpha_above: 0.80
+
+# ---- Playbook rules the desks must follow ----------------------------------
+rules:
+  shared:
+    - Goals beat raw predictions.  Cite the 30-day success/failure bars when you size; do not treat a single tape print as the whole story.
+    - Change one process knob at a time.  If an experiment is open, do not invent a second one.
+    - Never use a future-known return.  Do not "remember" a later close.
+    - A look-ahead-suspect book (hit-rate > 90% on n < 20 with huge alpha) is discarded, not celebrated.
+    - HOLD on a true split (bullish count == bearish count, both > 0) or a majority of directional desks opposed to the call. Neutrals do not create a split. Override a dissent only with tagged evidence that desk missed.
+    - Size from evidence breadth (how many independent lenses agree), not from how loud the last headline was.
+  equity:
+    - Prefer cash-flow quality + guidance alignment (revenue/EPS trajectory, ROCE, filings) over tape-chasing.
+    - SHORT thesis only for a dated catalyst.  Do not shrink a MEDIUM/LONG thesis to 30 days just to feed the learning loop — the loop snapshots the 30-day path automatically.
+    - Survive the catalyst rather than race it: if days_to_event < 60, keep horizon_days >= 60 unless the entire trade IS the event.
+    - "India: treat promoter/FII/DII drift and Ind-AS prints as first-class. US 8-K / 10-Q guidance and revisions."
+    - Fade a crowded options/insider/analyst extreme unless fundamentals and guidance confirm the same side.
+    - A 30-day path that disagrees with a LONG compounder is a timing lesson (error_class timing_early / timing_late), not an automatic flip of the multi-year view.
+  commodity:
+    - Curve first (backwardation / contango and the nearby spread), then COT extremes, then seasonality.  There is no earnings analog — do not invent one.
+    - Score roll-aware front-month moves.  A contract roll is not alpha.
+    - Fade a one-sided COT extreme only when the curve and inventory/supply lens agree; otherwise stand down.
+    - Energy / metals / grains have different inventory clocks.  Do not copy an equity 30-day earnings playbook onto a grain seasonality trade.
+    - Geo shocks (OPEC, wars, export bans) are SHORT-thesis events; the structural deficit/surplus is MEDIUM/LONG.
+
+# ---- Scientific method -----------------------------------------------------
+scientific_method:
+  one_variable_at_a_time: true
+  min_reviews_to_change: 12
+  never_promote_from_single_loss: true
+  # User-seeded experiment.  Leave knob empty to let the loop pick the
+  # next unused knob after a FAILURE.  The runtime journal (not this
+  # file) stores the live experiment so your edits stay reviewable.
+  seed_experiment:
+    knob: ""
+    hypothesis: ""
+
+# Experiment catalog.  Hermes may open a desk_prompt or a topology change
+# from Resolve evidence instead of walking this list in order.  The list
+# is the menu (and the fallback when evidence does not pick a unused
+# experiment).  One experiment at a time.  `apply: prompt` prepends the
+# hypothesis to trader/PM/RM.  `apply: playbook` also sets the live graph
+# action for the A/B window.  Legacy Mass install is scripts/promote_graph.py.
+knobs:
+  - id: size_scale_down
+    enabled: true
+    apply: prompt
+    size_scale: 0.75
+    description: >
+      Cut directional size 25% on the live Kelly/vol sizer (and in the
+      trader/PM prompt) until the 30-day book clears the success bars.
+      Use when hit-rate is acceptable but drawdown/expectancy fail.
+      Composes with an L3 applied tune: L3 is the per-ticker base, this
+      scale multiplies on top.
+  - id: extra_debate_on_split
+    enabled: true
+    apply: playbook
+    playbook_action: extra_debate_on_split
+    description: >
+      Force an extra bull/bear round when the desk-bias board is split.
+      Use when LOSSes cluster on mixed boards that still produced a BUY/SELL.
+  - id: debate_rounds_2
+    enabled: true
+    apply: playbook
+    playbook_action: debate_rounds_2
+    description: >
+      Run two full debate rounds.  Use when the 30-day miss is a thesis
+      error (wrong side) rather than a sizing error.
+  - id: debate_rounds_1
+    enabled: true
+    apply: playbook
+    playbook_action: debate_rounds_1
+    description: >
+      Cut debate to one bull/bear round.  Use when extra debate added
+      noise or the miss is not a split-board thesis error.
+  - id: skip_reports
+    enabled: true
+    apply: playbook
+    playbook_action: skip_reports
+    description: >
+      Drop the Reports desk this window.  Use when filings/guidance
+      tools were unhelpful or over-weighted on LOSSes.
+  - id: evidence_budget_0
+    enabled: true
+    apply: playbook
+    playbook_action: evidence_budget_0
+    description: >
+      Close the debate evidence drain.  Use when request_evidence or
+      extra web pulls pushed the book onto the wrong side.
+  - id: evidence_budget_1
+    enabled: true
+    apply: playbook
+    playbook_action: evidence_budget_1
+    description: >
+      Cap debate re-queries at one.  Use when the miss needed a single
+      targeted pull rather than an open evidence loop.
+  - id: no_trader_reopen
+    enabled: true
+    apply: playbook
+    playbook_action: no_trader_reopen
+    description: >
+      Do not cycle Neutral Risk back to the trader.  Use when the
+      reopen flipped a call onto the wrong side.
+  - id: risk_rounds_2
+    enabled: true
+    apply: playbook
+    playbook_action: risk_rounds_2
+    description: >
+      Run two risk-wing rounds.  Use when a single risk pass missed a
+      sizing or drawdown constraint that later failed the book.
+  - id: fade_crowded_consensus
+    enabled: true
+    apply: prompt
+    description: >
+      When crowd-positioning is one-sided and guidance/curve does not
+      confirm, fade or sit out.  Use when WINs are crowded-chase givebacks.
+  - id: guidance_weight
+    enabled: true
+    apply: prompt
+    description: >
+      Weight filings/guidance (NET_GUIDANCE_BIAS, forward estimates) at
+      least as heavily as tape and news.  Equity-only; skip on futures.
+  - id: catalyst_survive_not_race
+    enabled: true
+    apply: prompt
+    description: >
+      If an earnings/event is inside 60 days, keep the thesis horizon
+      and widen the stop; do not collapse to a binary event ticket.
+  - id: commodity_curve_first
+    enabled: true
+    apply: prompt
+    description: >
+      Commodity only: refuse a directional ticket that does not cite the
+      curve (backwardation/contango) before COT or seasonality.
+  - id: min_reward_risk
+    enabled: true
+    apply: prompt
+    description: >
+      Require a stated reward:risk of at least 1.5 after the volatility
+      stop is grounded.  Use when expectancy is negative because targets
+      are too close to the noise band.

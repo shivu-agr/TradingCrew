@@ -58,7 +58,8 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-}"
 LORA_NAME="${LORA_NAME:-rlmf}"
 DTYPE="${DTYPE:-bfloat16}"
-VLLM_PY_ENV="${VLLM_PY_ENV:-/home/gpt_user/.pyenv/versions/gpt_vllm_new}"
+# Optional path to a venv that contains `vllm`. Empty = use `vllm` on $PATH.
+VLLM_PY_ENV="${VLLM_PY_ENV:-}"
 
 # Tool-calling support.  CrewAI (and any agent framework that sets
 # ``tool_choice=auto``) requires vLLM to be launched with the auto-tool
@@ -207,8 +208,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ---- vllm binary resolution ----------------------------------------------
-VLLM_BIN="$VLLM_PY_ENV/bin/vllm"
-if [ ! -x "$VLLM_BIN" ]; then
+if [ -n "$VLLM_PY_ENV" ] && [ -x "$VLLM_PY_ENV/bin/vllm" ]; then
+  VLLM_BIN="$VLLM_PY_ENV/bin/vllm"
+else
   VLLM_BIN="$(command -v vllm || true)"
 fi
 if [ -z "$VLLM_BIN" ] || [ ! -x "$VLLM_BIN" ]; then

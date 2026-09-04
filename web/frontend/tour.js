@@ -1,7 +1,7 @@
 /* TradingCrew first-run guided tour.
  *
- * Walks new users through Workflow -> Reports -> Memory -> Backtest ->
- * RL Training -> Help drawer on their first visit.  Gated by
+ * Walks new users through Workflow -> Memory -> Backtest ->
+ * Training -> Help drawer on their first visit.  Gated by
  * `localStorage.tcTourCompleted` so it only fires once.  Re-launchable
  * from the Help drawer footer (TcTour.start()).
  *
@@ -35,9 +35,9 @@
     },
     {
       selector: "aside.sidebar .info-i[data-help='sidebar.tools']",
-      fallbackSelector: "aside.sidebar .advanced-group",
-      title: "Configure tools + dialogue",
-      body: "Open Advanced settings to toggle per-agent tools and dial in how many debate / risk rounds the crew runs. More rounds = thorough but more LLM cost.",
+      fallbackSelector: "aside.sidebar .info-i[data-help='sidebar.dialogue']",
+      title: "Configure run + tools",
+      body: "Pick autonomous or deterministic, then toggle per-agent tools. Debate/risk sliders appear only for deterministic stock and commodity.",
       tab: null,
       placement: "right",
     },
@@ -51,22 +51,15 @@
     {
       selector: "main nav .info-i[data-help='tab.workflow']",
       title: "Workflow tab",
-      body: "Live SVG diagram of every agent + the deterministic risk / sizing / execution pipeline that runs after the LLM crew. Edges light up as agents progress.",
+      body: "Everything for a name in one place: the live SVG diagram of every agent + the deterministic risk / sizing / execution pipeline, each agent's full markdown report (with inline [source: …] tags and the Firefly-style trend-signal card), the final decision, and the activity log. All of it streams live and is replayed from the saved run when you reopen a completed tile.",
       tab: "workflow",
       placement: "bottom",
     },
     {
-      selector: "main nav .info-i[data-help='tab.reports']",
-      title: "Reports tab",
-      body: "Each agent's full markdown report with inline [source: …] tags. Finance jargon (RSI, MACD, Kelly, CVaR, Sharpe) is auto-highlighted — hover the dotted underline for an inline definition.",
-      tab: "reports",
-      placement: "bottom",
-    },
-    {
-      selector: "main nav .info-i[data-help='tab.memory']",
-      title: "Memory tab",
-      body: "Audit-grade episodic memory. After a horizon elapses, click Resolve outcomes & reflect to score realised return + alpha and let the LLM write a one-paragraph lesson that future runs retrieve.",
-      tab: "memory",
+      selector: "main nav .info-i[data-help='tab.episodes']",
+      title: "Episodes tab",
+      body: "The tape: retrieval plus Resolve. Labelling the 30-day path lives here. Hermes training (prompts, topology, size) is on the Training tab.",
+      tab: "episodes",
       placement: "bottom",
     },
     {
@@ -78,8 +71,8 @@
     },
     {
       selector: "main nav .info-i[data-help='tab.training']",
-      title: "RL Training tab",
-      body: "L4 — closed-loop reinforcement learning. Agents act, the simulator pays out, gradients flow into the policy. Promote a run to expose it to the LLM crew.",
+      title: "Training tab",
+      body: "Hermes trains prompts, topology, and size from the Resolve tape. L3 Apply is the per-ticker size base Hermes can scale. L4 PPO is not on the live path.",
       tab: "training",
       placement: "bottom",
     },

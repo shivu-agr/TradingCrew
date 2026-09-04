@@ -67,6 +67,11 @@ class OrderTimeInForce(str, Enum):
     IOC = "IOC"
 
 
+# Canonical score -> tier boundaries (see :meth:`ConvictionTier.from_score`).
+CONVICTION_MEDIUM_FLOOR = 0.33
+CONVICTION_HIGH_FLOOR = 0.66
+
+
 class ConvictionTier(str, Enum):
     """Coarse-grained conviction for the M4 reflection budget router.
 
@@ -78,6 +83,25 @@ class ConvictionTier(str, Enum):
     LOW = "LOW"
     MEDIUM = "MEDIUM"
     HIGH = "HIGH"
+
+    @staticmethod
+    def from_score(score: float) -> "ConvictionTier":
+        """Bucket a continuous ``conviction_score`` in [0, 1] into a tier.
+
+        ``<0.33 -> LOW``, ``[0.33, 0.66) -> MEDIUM``, ``>=0.66 -> HIGH``.
+
+        This is the SINGLE SOURCE OF TRUTH for the bucketing: the
+        ``ActionProposal`` validator and every producer (e.g. the CrewAI->M1
+        bridge) must derive the tier through here so their thresholds can
+        never drift apart — a past drift (bridge used 0.35/0.65 while the
+        validator used 0.33/0.66) silently downgraded valid decisions whose
+        score landed in [0.33, 0.35) or [0.65, 0.66) to ABSTAIN.
+        """
+        if score < CONVICTION_MEDIUM_FLOOR:
+            return ConvictionTier.LOW
+        if score < CONVICTION_HIGH_FLOOR:
+            return ConvictionTier.MEDIUM
+        return ConvictionTier.HIGH
 
 
 class SizingBasis(str, Enum):
@@ -307,21 +331,15 @@ class ActionProposal(BaseModel):
                 "use BUY for a long position."
             )
 
-        # Soft consistency between score and tier (warn-by-error so the LLM
-        # learns to keep them aligned):
-        if self.conviction_score < 0.33 and self.conviction_tier != ConvictionTier.LOW:
+        # Consistency between score and tier (raise-by-error so a producer
+        # that emits a mismatched tier — e.g. a direct LLM structured output —
+        # surfaces as an M4 reflection signal).  Both this check and every
+        # producer share ``ConvictionTier.from_score`` so the bucketing can
+        # never silently drift.
+        expected_tier = ConvictionTier.from_score(self.conviction_score)
+        if self.conviction_tier != expected_tier:
             raise ValueError(
-                f"conviction_score={self.conviction_score} implies LOW tier, "
-                f"got {self.conviction_tier}"
-            )
-        if 0.33 <= self.conviction_score < 0.66 and self.conviction_tier != ConvictionTier.MEDIUM:
-            raise ValueError(
-                f"conviction_score={self.conviction_score} implies MEDIUM tier, "
-                f"got {self.conviction_tier}"
-            )
-        if self.conviction_score >= 0.66 and self.conviction_tier != ConvictionTier.HIGH:
-            raise ValueError(
-                f"conviction_score={self.conviction_score} implies HIGH tier, "
+                f"conviction_score={self.conviction_score} implies {expected_tier.value} tier, "
                 f"got {self.conviction_tier}"
             )
         return self

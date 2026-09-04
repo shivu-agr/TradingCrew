@@ -4,17 +4,22 @@ The 18-agent crew talks to whichever OpenAI-compatible endpoint the
 ``.env`` resolves via ``get_llm()``.  This module gives the **UI** a
 typed catalog of presets the user can pick from (open-source local
 vLLM, hosted vLLM, closed-source OpenAI / Anthropic, …) and a
-thread-local override that ``get_llm()`` consults *before* falling back
+context-var override that ``get_llm()`` consults *before* falling back
 to the env chain.
 
-Why thread-local?
-=================
+Why a ContextVar (not process env, not bare threading.local)?
+=============================================================
 A single FastAPI process can be running multiple WS-driven analyses
 concurrently (one thread per session via ``AnalysisRunner``).  Each
 session may pick a different LLM.  Process-global env mutation would
-race; ``contextvars`` is task-bound not thread-bound; ``threading.local``
-binds cleanly to the worker thread the runner blocks on, which is also
-the thread that builds the CrewAI agents.
+race.  ``threading.local`` stays on the runner thread, so graph
+``ThreadPoolExecutor`` workers (parallel analysts / risk wings) that
+call ``get_llm()`` mid-tool — ``research_web`` summarize — silently
+fall through to ``VLLM_LLM_*`` while the desks use the selected
+preset.  Report map-reduce uses ``REPORT_PROCESS_*`` from the environment via
+``get_report_process_llm()``.  A ContextVar copied into those workers
+(``submit_in_active_context``) keeps one selected desk endpoint for
+the rest of the run.
 
 Per-preset shape
 ================
@@ -25,8 +30,11 @@ and never crosses the WS boundary).
 
 Adding a new preset
 ===================
-* Open-source / hosted vLLM: copy ``"hosted-vllm-oss"`` and edit
+* Open-source / hosted vLLM: copy ``"hosted-vllm"`` and edit
   the URL / model / api_env. Set ``kind="open-source"``.
+* Open-source / llama.cpp: copy ``"llamacpp-deepseek-v4"`` and edit
+  the URL / model / api_env.  ``llama-server``'s OpenAI-compatible
+  endpoint ignores the model name, so ``model`` is just a friendly label.
 * Closed-source: set ``provider="openai"`` (works for OpenAI proper) or
   ``provider="anthropic"`` (LiteLLM routes via ``anthropic/<model>``),
   point ``api_env`` at the secret env var the user sets in .env, set
@@ -39,10 +47,12 @@ applies the user's selection via ``set_active(preset_id)`` before
 
 from __future__ import annotations
 
+import contextvars
 import os
 import threading
 from dataclasses import asdict, dataclass, field
-from typing import Dict, List, Optional
+from functools import partial
+from typing import Any, Callable, Dict, List, Optional
 
 
 @dataclass(frozen=True)
@@ -82,9 +92,27 @@ class LlmPreset:
 # ---------------------------------------------------------------------------
 
 BUILTIN_PRESETS: Dict[str, LlmPreset] = {
+    "hosted-vllm": LlmPreset(
+        id="hosted-vllm",
+        label="Hosted vLLM (VLLM_LLM_*)",
+        kind="open-source",
+        provider="hosted_vllm",
+        model=os.environ.get("VLLM_LLM_MODEL"),
+        base_url=os.environ.get("VLLM_LLM_BASE_URL"),
+        api_env="VLLM_LLM_API_KEY",
+        description=(
+            "Any OpenAI-compatible vLLM-style endpoint you point "
+            "VLLM_LLM_BASE_URL / VLLM_LLM_MODEL / VLLM_LLM_API_KEY at "
+            "in .env. Desks, planner, and critic use this endpoint when "
+            "this preset is active. Report map-reduce uses "
+            "REPORT_PROCESS_* from .env."
+        ),
+        context_window=131_072,
+        tags=["default", "vLLM", "long-context"],
+    ),
     "hosted-vllm-oss": LlmPreset(
         id="hosted-vllm-oss",
-        label="Hosted vLLM (VLLM_LLM_*)",
+        label="Hosted vLLM OSS (VLLM_LLM_*)",
         kind="open-source",
         provider="hosted_vllm",
         # Entirely env-driven — no deployment-specific URL baked into
@@ -109,11 +137,9 @@ BUILTIN_PRESETS: Dict[str, LlmPreset] = {
         label="Local vLLM (LOCAL_LLM_*)",
         kind="open-source",
         provider="hosted_vllm",
-        # Env-driven too — the user supplies the model + URL via
-        # ``LOCAL_LLM_*`` in .env.  Falls back to ``localhost:8081``
-        # which is the conventional vLLM ``--port`` default.
+        # Env-driven — model + URL come from ``LOCAL_LLM_*`` in .env.
         model=os.environ.get("LOCAL_LLM_MODEL"),
-        base_url=os.environ.get("LOCAL_LLM_BASE_URL", "http://localhost:8081/v1"),
+        base_url=os.environ.get("LOCAL_LLM_BASE_URL"),
         # vLLM accepts any non-empty bearer token; the local server doesn't auth.
         api_env="OPENAI_API_KEY",
         description=(
@@ -125,6 +151,31 @@ BUILTIN_PRESETS: Dict[str, LlmPreset] = {
         ),
         context_window=None,
         tags=["local", "vLLM", "tool-calling"],
+    ),
+    "llamacpp-deepseek-v4": LlmPreset(
+        id="llamacpp-deepseek-v4",
+        label="Llama.cpp · DeepSeek-V4 (LLAMACPP_LLM_*)",
+        kind="open-source",
+        provider="hosted_vllm",
+        # Env-driven — point ``LLAMACPP_LLM_BASE_URL`` at a llama.cpp
+        # ``llama-server`` OpenAI-compatible endpoint (default port 8001).
+        # llama.cpp serves the single loaded model and ignores the model
+        # name sent in the request, so ``LLAMACPP_LLM_MODEL`` is just the
+        # friendly label shown in the UI.
+        model=os.environ.get("LLAMACPP_LLM_MODEL"),
+        base_url=os.environ.get("LLAMACPP_LLM_BASE_URL", "http://localhost:8001/v1"),
+        # llama.cpp accepts any non-empty bearer token; the server doesn't auth.
+        api_env="LLAMACPP_LLM_API_KEY",
+        description=(
+            "A llama.cpp server you launched yourself with "
+            "`llama-server -m <model>.gguf --port 8001` (or wherever "
+            "LLAMACPP_LLM_BASE_URL points).  OpenAI-compatible. "
+            "Long context window (131K n_ctx by default).  Watch "
+            "debate-round token budgets — llama.cpp is CPU/GPU-hosted "
+            "and slower than a hosted vLLM on big prompts."
+        ),
+        context_window=131_072,
+        tags=["local", "llama.cpp", "deepseek", "long-context"],
     ),
     "openai-gpt-4o-mini": LlmPreset(
         id="openai-gpt-4o-mini",
@@ -208,6 +259,17 @@ def _resolve_preset(preset_id: str) -> Optional[LlmPreset]:
     return rt or BUILTIN_PRESETS.get(preset_id)
 
 
+def resolve_preset(preset_id: str) -> Optional[LlmPreset]:
+    """Read-only lookup of a preset by id (runtime registry, then built-ins).
+
+    Unlike :func:`set_active` this does NOT touch the thread-local override —
+    for callers that only need a preset's static fields (e.g. the scale
+    runner's LLM readiness gate, which must probe the endpoint the batch
+    will actually use without activating it on the request thread).
+    """
+    return _resolve_preset(preset_id)
+
+
 def list_presets() -> List[Dict[str, object]]:
     """Serialisable preset list for ``/api/options``.
 
@@ -228,6 +290,13 @@ def list_presets() -> List[Dict[str, object]]:
         # entry isn't selectable when the user hasn't configured anything.
         if preset.id == "local-vllm":
             configured = bool(os.environ.get("LOCAL_LLM_MODEL"))
+        # llama.cpp doesn't auth either; it lights up once the operator
+        # points at a server (base_url) or names the loaded model.
+        elif preset.id == "llamacpp-deepseek-v4":
+            configured = bool(
+                os.environ.get("LLAMACPP_LLM_MODEL")
+                or os.environ.get("LLAMACPP_LLM_BASE_URL")
+            )
         # Runtime presets point at a server we just launched locally; the
         # vLLM endpoint ignores the bearer token, so they're always usable.
         if preset.id in _RUNTIME_PRESETS:
@@ -240,47 +309,63 @@ def list_presets() -> List[Dict[str, object]]:
 
 
 # ---------------------------------------------------------------------------
-# Thread-local active override.  ``get_llm()`` consults this *before* the
-# env chain so a WS session can swap LLMs without touching ``os.environ``.
+# Per-run active override.  ``get_llm()`` consults this *before* the env
+# chain so a WS session can swap LLMs without touching ``os.environ``.
+# ContextVar so graph thread-pool workers can inherit it (see
+# ``submit_in_active_context``).  Concurrent runner threads still each
+# see their own value.
 # ---------------------------------------------------------------------------
 
-_active = threading.local()
+_active_preset: contextvars.ContextVar[Optional[LlmPreset]] = contextvars.ContextVar(
+    "tradingcrew_llm_preset", default=None
+)
 
 
 def set_active(preset_id: Optional[str]) -> Optional[LlmPreset]:
-    """Mark ``preset_id`` as active for the current thread.
+    """Mark ``preset_id`` as active for the current context.
 
     Pass ``None`` (or an unknown id) to clear the override — the env-var
     chain then takes over again.  Returns the resolved ``LlmPreset`` for
     logging convenience, or ``None`` when the override was cleared.
     """
     if not preset_id:
-        _active.preset = None
+        _active_preset.set(None)
         return None
     preset = _resolve_preset(preset_id)
-    _active.preset = preset
+    _active_preset.set(preset)
     return preset
 
 
 def clear_active() -> None:
-    _active.preset = None
+    _active_preset.set(None)
 
 
 def get_active_overrides() -> Dict[str, Optional[str]]:
     """Return the kwargs ``get_llm()`` should overlay on top of its env defaults.
 
-    Empty dict when no preset is active on this thread.  ``base_url=None``
+    Empty dict when no preset is active on this context.  ``base_url=None``
     is intentionally preserved for closed-source presets (OpenAI /
     Anthropic via LiteLLM route by provider+model, no base_url override)
     so the caller can explicitly clear it instead of accidentally
     inheriting the local vLLM endpoint from ``.env``.
     """
-    preset = getattr(_active, "preset", None)
+    preset = _active_preset.get()
     if preset is None:
         return {}
     return preset.to_overrides()
 
 
 def get_active_preset_id() -> Optional[str]:
-    preset = getattr(_active, "preset", None)
+    preset = _active_preset.get()
     return preset.id if preset is not None else None
+
+
+def submit_in_active_context(executor: Any, fn: Callable, /, *args: Any, **kwargs: Any):
+    """``executor.submit`` that copies the current LLM preset into the worker.
+
+    Bare ``ThreadPoolExecutor`` drops ContextVars. Parallel graph desks
+    that call ``get_llm()`` (tool summarize) would otherwise hit
+    ``VLLM_LLM_*`` while the selected preset is local.
+    """
+    ctx = contextvars.copy_context()
+    return executor.submit(ctx.run, partial(fn, *args, **kwargs))

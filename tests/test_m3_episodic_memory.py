@@ -128,6 +128,30 @@ def test_abandon_marks_status_but_keeps_record(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_retrieval_includes_pending_with_resolved_short_review(tmp_path):
+    mem = EpisodicMemory(tmp_path / "ep.jsonl")
+    mem.add(_make_episode(
+        episode_id="reviewed",
+        decision_ts="2026-01-01T00:00:00+00:00",
+        outcome_ts="2026-07-01T00:00:00+00:00",
+        status=OutcomeStatus.PENDING,
+        realised_return=None,
+    ))
+    ep = mem.get("reviewed")
+    ep.review_ts = "2026-01-31T00:00:00+00:00"
+    ep.review_status = "RESOLVED"
+    ep.review_embargo_days = 0
+    ep.review = {"outcome_label": "WIN", "realised_return": 0.03, "reflection": "30d path held"}
+    mem.add(ep)
+    results = mem.retrieve(
+        "AAPL fundamentals strong sentiment positive",
+        as_of="2026-02-15T00:00:00+00:00",
+        k=5,
+    )
+    ids = [r.episode.episode_id for r in results]
+    assert "reviewed" in ids
+
+
 def test_retrieval_excludes_pending_episodes(tmp_path):
     mem = EpisodicMemory(tmp_path / "ep.jsonl")
     mem.add(_make_episode(episode_id="resolved", status=OutcomeStatus.RESOLVED))

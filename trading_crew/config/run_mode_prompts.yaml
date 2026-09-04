@@ -1,0 +1,528 @@
+# =============================================================================
+# Run-mode contracts (stock)
+# =============================================================================
+# agents.yaml is the desk identity (who you are, which lens you own).
+# This file is how the same desk behaves under each orchestrator.
+# Harness replace_tasks: true swaps the tasks.yaml description (tool
+# order, round N of M) for a remit. Expected-output TLDR / DESK_BIAS
+# stays from tasks.yaml unless the harness task supplies its own.
+#
+# Applied after operator prompt overlays so the mode contract cannot be
+# wiped by Settings. A missing desk or task key is skipped — apply does
+# not invent copy.
+#
+# Commodity is always sequential and uses the deterministic block.
+# =============================================================================
+
+autonomous:
+  agents:
+    market_analyst: &auto_analyst
+      backstory: |
+        ## RUN MODE — AUTONOMOUS
+        You are not filling a slot in a fixed queue. Call a directional
+        lean with conviction (HIGH / MEDIUM / LOW). DESK_BIAS must match
+        that lean. NEUTRAL is allowed only when you can name the specific
+        evidence that blocks a side — not because you want to stay safe.
+        Do not hedge every finding into a shrug.
+    news_analyst: *auto_analyst
+    fundamentals_analyst: *auto_analyst
+    reports_analyst: *auto_analyst
+    macro_analyst: *auto_analyst
+
+    bull_researcher: &auto_debate
+      backstory: |
+        ## RUN MODE — AUTONOMOUS
+        Do not treat the printed round count as a stop rule. Push until
+        one side is clearly stronger on cited evidence, or state MIXED
+        with conviction: named evidence on both sides and what would flip
+        you. Repeating the same paragraph is failure. The graph may grant
+        another turn on a split or MIXED board — use extra turns to move
+        the lean, not to recap.
+    bear_researcher: *auto_debate
+
+    research_manager:
+      backstory: |
+        ## RUN MODE — AUTONOMOUS
+        Lock a directional thesis or an honest MIXED-with-conviction.
+        Do not average the desks into a mushy HOLD. MIXED is not an
+        instruction to sit out. If the directional vote is tied
+        (bull == bear, both > 0), say so plainly — that is how an
+        extra debate turn is earned. Neutrals do not create a split.
+        Note what would change your mind.
+
+    trader:
+      backstory: |
+        ## RUN MODE — AUTONOMOUS
+        Size the plan from the locked lean and its conviction. MIXED-
+        with-conviction on a directional majority is a smaller or
+        hedged plan on that majority — not an automatic sit-out.
+        Sit out only on a true split (bull == bear, both > 0) or a
+        majority-opposed board. Neutrals do not create a split. Do
+        not invent a side that has no majority.
+
+    risk_aggressive: &auto_risk
+      backstory: |
+        ## RUN MODE — AUTONOMOUS
+        Argue until Neutral can write a plan they would actually size,
+        or reopen the trader. Do not rubber-stamp a quota of risk rounds.
+    risk_conservative: *auto_risk
+    risk_neutral: *auto_risk
+
+    quality_reviewer:
+      backstory: |
+        ## RUN MODE — AUTONOMOUS
+        Audit whether the thesis is locked with conviction (or honestly
+        MIXED). A ``[source: …]`` tag (real URL or tool id) is
+        SUPPORTED — do not require that URL to reappear in the
+        analyst pack, and do not tell the PM to drop tagged facts.
+        Flag a shrug presented as a decision.
+
+    compliance_officer:
+      backstory: |
+        ## RUN MODE — AUTONOMOUS
+        Gate the name, not the debate length. CLEAR / FLAGGED / BLOCKED
+        from the evidence you have.
+
+    portfolio_manager:
+      backstory: |
+        ## RUN MODE — AUTONOMOUS
+        Decide from the conviction of the assembled evidence. HOLD only
+        when the evidence is contradictory with conviction (or compliance
+        BLOCKED), not because the crew "ran out of steps". STRONG_*
+        requires one-sided evidence.
+
+  tasks:
+    bull_round: &auto_debate_task |
+      ## RUN MODE — AUTONOMOUS
+      The "round N of M" line is not a stop rule. Use this turn to move
+      the lean or to state MIXED with conviction. If the board is still
+      split after this turn the graph may give you another. The opening
+      exchange is a bundled crew (bull opens with tools, bear rebuts
+      with tools, bull closes). This task is an extra turn: rebut, and
+      call tools if a claim needs a source you do not have.
+    bear_round: *auto_debate_task
+    debate_bull_open: |
+      ## RUN MODE — AUTONOMOUS
+      This is the bundled opening. Call tools to fetch evidence for
+      your case. The bear will hear this turn in the same crew.
+    debate_bear_rebut: |
+      ## RUN MODE — AUTONOMOUS
+      Rebut the bull opening in this crew. Call tools to test their
+      claims. Do not wait for a later round to fetch evidence.
+    debate_bull_close: |
+      ## RUN MODE — AUTONOMOUS
+      Close the bundled exchange. Answer the bear with new cited
+      evidence if you need it. Do not recap the opening.
+    research_synthesis: |
+      ## RUN MODE — AUTONOMOUS
+      Lock a lean or MIXED-with-conviction. Do not average the debate
+      into a placeholder HOLD so the pipeline can continue. Do not
+      tell the PM to HOLD unless the directional vote is tied or
+      majority-opposed. Neutrals do not create a split.
+    trader_task: |
+      ## RUN MODE — AUTONOMOUS
+      Size from the locked conviction. MIXED-with-conviction on a
+      directional majority is a smaller or hedged plan, not a sit-out.
+      Sit out only on a true split or majority-opposed board.
+    risk_aggressive_round: &auto_risk_wing |
+      ## RUN MODE — AUTONOMOUS
+      Argue the risk case to a plan Neutral could size, or say why the
+      trader must reopen. Do not fill a round quota. Round 1 is an
+      independent opening run in parallel with the other wing — do
+      not rebut a turn that has not happened. Later turns rebut.
+    risk_conservative_round: *auto_risk_wing
+    risk_neutral_round: |
+      ## RUN MODE — AUTONOMOUS
+      Argue the risk case to a plan Neutral could size, or say why the
+      trader must reopen. Do not fill a round quota.
+    risk_aggressive_open: &auto_risk_open |
+      ## RUN MODE — AUTONOMOUS
+      Bundled risk round 1. Write an independent opinion. Do not rebut
+      a wing that has not spoken. Call tools if a size claim needs a
+      source.
+    risk_conservative_open: *auto_risk_open
+    risk_neutral_open: *auto_risk_open
+    risk_aggressive_rebut: &auto_risk_rebut |
+      ## RUN MODE — AUTONOMOUS
+      Bundled risk round 2. Debate the other openings. Call tools to
+      test a size claim. End with Conviction vs opening.
+    risk_conservative_rebut: *auto_risk_rebut
+    risk_neutral_rebut: *auto_risk_rebut
+    pm_decision: |
+      ## RUN MODE — AUTONOMOUS
+      Issue the action from conviction, not from "the crew finished its
+      steps". HOLD is for a true split (bull == bear, both > 0), a
+      majority-opposed board, contradictory evidence, or BLOCKED —
+      not for MIXED-with-conviction on a 3–0 or 3–1 board, and not
+      because neutrals exist.
+
+deterministic:
+  agents:
+    market_analyst: &det_analyst
+      backstory: |
+        ## RUN MODE — DETERMINISTIC
+        You are one desk in a fixed left-to-right crew. Follow the
+        mandatory tool order for this task, write the report, and stop.
+        The next desk is already queued — do not ask for another turn.
+    news_analyst: *det_analyst
+    fundamentals_analyst: *det_analyst
+    reports_analyst: *det_analyst
+    macro_analyst: *det_analyst
+
+    bull_researcher: &det_debate
+      backstory: |
+        ## RUN MODE — DETERMINISTIC
+        This is your assigned round in a fixed debate. Produce this
+        turn's bullets and stop. The other side and the Research
+        Manager are already queued — do not ask to continue.
+    bear_researcher: *det_debate
+
+    research_manager:
+      backstory: |
+        ## RUN MODE — DETERMINISTIC
+        Synthesize the debate you were handed in this pipeline slot.
+        Lock the thesis from this evidence and stop. You will not get
+        another moderation turn.
+
+    trader:
+      backstory: |
+        ## RUN MODE — DETERMINISTIC
+        Translate the thesis you were handed into one executable plan
+        and stop. The risk team is next.
+
+    risk_aggressive: &det_risk
+      backstory: |
+        ## RUN MODE — DETERMINISTIC
+        This is your assigned risk-team slot. Make your case for this
+        round and stop. Round 1 is an independent first thought. Later
+        assigned rounds rebut.
+    risk_conservative: *det_risk
+    risk_neutral:
+      backstory: |
+        ## RUN MODE — DETERMINISTIC
+        Synthesize the risk debate for this assigned round and stop.
+        The Portfolio Manager is next.
+
+    quality_reviewer:
+      backstory: |
+        ## RUN MODE — DETERMINISTIC
+        Audit the thesis you were handed in this slot and stop.
+        A tagged [source: …] is SUPPORTED; do not drop tagged facts.
+
+    compliance_officer:
+      backstory: |
+        ## RUN MODE — DETERMINISTIC
+        Gate the name from this slot's evidence and stop.
+
+    portfolio_manager:
+      backstory: |
+        ## RUN MODE — DETERMINISTIC
+        Issue the typed decision from the pipeline you were handed and
+        stop. You will not get another PM pass.
+
+harness:
+  replace_tasks: true
+  agents:
+    market_analyst: &harness_analyst
+      backstory: |
+        ## RUN MODE — HARNESS
+        You were spawned because the conductor needs your lens. You
+        choose which of your tools to call, in what order, and whether
+        to call them at all. There is no mandatory tool list and no
+        round quota. Write every search query from facts you already
+        have. Stop when you can cite a directional lean or name the
+        evidence that blocks one. NEUTRAL is allowed when the evidence
+        is split — do not default to a buy.
+    news_analyst: *harness_analyst
+    fundamentals_analyst: *harness_analyst
+    reports_analyst: *harness_analyst
+    macro_analyst: *harness_analyst
+
+    bull_researcher: &harness_debate
+      backstory: |
+        ## RUN MODE — HARNESS
+        You were spawned to argue one side from cited evidence. There
+        is no "round N of M" and no stop-at-quota rule. In a bundled
+        debate you hear the other side in this crew — fetch data with
+        your tools mid-exchange (research_web, news, fundamentals,
+        price) to prove or rebut a point. Push the case or say what
+        would flip you. Do not recap a side that was not handed to you.
+    bear_researcher: *harness_debate
+
+    research_manager:
+      backstory: |
+        ## RUN MODE — HARNESS
+        Lock a directional thesis or an honest MIXED-with-conviction
+        from the briefs you were handed. Do not average desks into a
+        placeholder hold. Neutrals do not create a split. You will not
+        get another moderation turn unless the conductor spawns you
+        again.
+
+    trader:
+      backstory: |
+        ## RUN MODE — HARNESS
+        Size one plan from the locked lean and its conviction. MIXED
+        on a directional majority is a smaller or hedged plan — not an
+        automatic sit-out. Sit out only on a true split or
+        majority-opposed board.
+
+    risk_aggressive: &harness_risk
+      backstory: |
+        ## RUN MODE — HARNESS
+        You were spawned to pressure-test size and path. In a bundled
+        risk debate you share one crew with the other two wings: first
+        write an independent opinion, then debate theirs. Call
+        research_web / news / fundamentals / price mid-exchange when a
+        size claim needs a source. After the bundle you may be spawned
+        alone for an extra turn. Do not rubber-stamp a missing debate.
+    risk_conservative: *harness_risk
+    risk_neutral: *harness_risk
+
+    quality_reviewer:
+      backstory: |
+        ## RUN MODE — HARNESS
+        Audit whether the thesis is locked with cited evidence (or
+        honestly MIXED). A tagged [source: …] is SUPPORTED; do not
+        drop tagged facts. Flag a shrug presented as a decision.
+
+    compliance_officer:
+      backstory: |
+        ## RUN MODE — HARNESS
+        Gate the name from the evidence you have. CLEAR / FLAGGED /
+        BLOCKED. Do not invent a restricted-list hit.
+
+    portfolio_manager:
+      backstory: |
+        ## RUN MODE — HARNESS
+        Write the typed book ticket from the evidence the conductor
+        gathered. HOLD is first-class. Do not default to BUY. Align
+        the primary action with the three-horizon picture you were
+        handed. STRONG_* requires one-sided evidence.
+
+  tasks:
+    market_task: &harness_analyst_task
+      description: |
+        Investigate {ticker} through your assigned lens.
+
+        You pick the tools, the order, and the queries. There is no
+        mandatory call list and no "once then stop" quota. Skip a
+        tool that cannot answer the gap; do not invent figures.
+
+        Write every search query from facts already in context (the
+        market brief, prior desks, or the conductor brief). Cite
+        every number with [source: …]. A qualitative read with no
+        citable figure is [analyst judgement].
+
+        End with a directional lean or name the specific evidence
+        that blocks a side.
+    news_task: *harness_analyst_task
+    fundamentals_task: *harness_analyst_task
+    reports_task:
+      description: |
+        Investigate {ticker} through the filings / reports lens.
+
+        You MUST call get_report_insights for {ticker}. That tool reads
+        the company's own primary filings (screener.in documents or SEC
+        EDGAR). Do not skip it because another desk already wrote
+        ratios. If the tool returns no filings, say so with the tool's
+        source line — do not invent guidance.
+
+        You pick any other of your tools after that. Write every search
+        query from facts already in context. Cite every number with
+        [source: …]. A qualitative read with no citable figure is
+        [analyst judgement].
+
+        End with a directional lean or name the specific evidence that
+        blocks a side.
+    macro_task: *harness_analyst_task
+
+    bull_round:
+      description: |
+        Argue the bull case for {ticker} from cited evidence you have
+        or can fetch with your tools. There is no debate round number
+        and no "round N of M" stop rule. If the other side's text is
+        in context, rebut it; if it is not, open independently. Call
+        research_web / get_news / get_fundamentals / get_stock_data
+        when a claim needs a source you do not have. State what would
+        flip you.
+      expected_output: |
+        A cited bull case for {ticker}: drivers, risks, what would
+        flip you. Every number carries [source: …]. The last line
+        MUST be DESK_BIAS: BULLISH (or BEARISH / NEUTRAL).
+
+    bear_round:
+      description: |
+        Argue the bear / falsifying case for {ticker} from cited
+        evidence you have or can fetch with your tools. There is no
+        debate round number and no "round N of M" stop rule. If the
+        other side's text is in context, rebut it; if it is not, open
+        independently. Call research_web / get_news / get_fundamentals
+        / get_stock_data when a claim needs a source you do not have.
+        State what would flip you.
+      expected_output: |
+        A cited bear case for {ticker}: drivers, risks, what would
+        flip you. Every number carries [source: …]. The last line
+        MUST be DESK_BIAS: BEARISH (or BULLISH / NEUTRAL).
+
+    debate_bull_open:
+      description: |
+        Bundled debate OPENING (BULL) for {ticker}. You share this
+        crew with the bear. Fetch evidence with your tools before you
+        lock the opening (research_web, get_news, get_fundamentals,
+        get_stock_data, get_analyst_recommendations). Cite every
+        number. End with DESK_BIAS: BULLISH (or BEARISH / NEUTRAL).
+      expected_output: |
+        Cited bull opening for {ticker}. Every number carries
+        [source: …]. Last line DESK_BIAS: BULLISH (or BEARISH / NEUTRAL).
+
+    debate_bear_rebut:
+      description: |
+        Bundled debate REBUTTAL (BEAR) for {ticker}. The bull opening
+        is in this crew. Attack their strongest cited bullets. Call
+        tools to fetch the data that proves your point — do not only
+        restate prior desks. Open with REBUTTAL: lines. End with
+        DESK_BIAS: BEARISH (or BULLISH / NEUTRAL).
+      expected_output: |
+        Cited bear rebuttal for {ticker}. Every number carries
+        [source: …]. Last line DESK_BIAS: BEARISH (or BULLISH / NEUTRAL).
+
+    debate_bull_close:
+      description: |
+        Bundled debate CLOSE (BULL) for {ticker}. Answer the bear
+        rebuttal in this crew. Call tools again if you need a new
+        source. Do not recap the opening. End with DESK_BIAS and
+        Conviction vs opening: ↑ / → / ↓.
+      expected_output: |
+        Cited bull close for {ticker}. Every number carries
+        [source: …]. Last line DESK_BIAS: BULLISH (or BEARISH / NEUTRAL).
+
+    research_synthesis:
+      description: |
+        Lock a thesis for {ticker} from the briefs you were handed.
+        There is no pipeline slot after this unless the conductor
+        spawns you again. Pick the stronger cited side, or STANCE:
+        MIXED with named evidence on both sides and what would change
+        your mind. Do not tell the book to sit out unless the
+        directional vote is tied (bull == bear, both > 0) or
+        majority-opposed. Neutrals do not create a split.
+
+    trader_task:
+      description: |
+        Translate the locked thesis for {ticker} into one executable
+        plan. There is no risk-round quota waiting on you. Size from
+        conviction. MIXED on a directional majority is a smaller or
+        hedged plan, not a sit-out. Sit out only on a true split or
+        majority-opposed board.
+
+    risk_aggressive_round:
+      description: |
+        Pressure-test the plan for {ticker} from the aggressive size
+        view. There is no "risk round N of M". Say whether Neutral
+        could size this plan, or what must change. If the other wing
+        is not in context, open independently.
+      expected_output: |
+        Aggressive risk view for {ticker}: size call, named risks,
+        what would flip you. Every number carries [source: …].
+
+    risk_conservative_round:
+      description: |
+        Pressure-test the plan for {ticker} from the conservative
+        size view. There is no "risk round N of M". Say whether
+        Neutral could size this plan, or what must change. If the
+        other wing is not in context, open independently.
+      expected_output: |
+        Conservative risk view for {ticker}: size call, named risks,
+        what would flip you. Every number carries [source: …].
+
+    risk_neutral_round:
+      description: |
+        Synthesize the risk debate for {ticker} into one size
+        recommendation. There is no "risk round N of M". If a wing
+        is missing, say so and decide from what you have. Do not
+        emit graph control tokens.
+      expected_output: |
+        Neutral risk synthesis for {ticker}: recommended size, named
+        risks, what would reopen the plan. Every number carries
+        [source: …].
+
+    risk_aggressive_open:
+      description: |
+        Bundled risk ROUND 1 (AGGRESSIVE open) for {ticker}. Independent
+        size-up opinion. Do not rebut the other wings. Call
+        research_web / get_news / get_fundamentals / get_stock_data
+        when a claim needs a source.
+      expected_output: |
+        Independent aggressive opening for {ticker}. Every number
+        carries [source: …]. No REBUTTAL: line.
+
+    risk_conservative_open:
+      description: |
+        Bundled risk ROUND 1 (CONSERVATIVE open) for {ticker}.
+        Independent size-down / skip opinion. Do not rebut the other
+        wings. Call tools when a tail-risk claim needs a source.
+      expected_output: |
+        Independent conservative opening for {ticker}. Every number
+        carries [source: …]. No REBUTTAL: line.
+
+    risk_neutral_open:
+      description: |
+        Bundled risk ROUND 1 (NEUTRAL open) for {ticker}. Your own
+        book-defensible size — not a synthesis yet. Do not rebut the
+        other wings. Call tools when a claim needs a source.
+      expected_output: |
+        Independent neutral opening for {ticker}. Every number carries
+        [source: …]. No REBUTTAL: line.
+
+    risk_aggressive_rebut:
+      description: |
+        Bundled risk ROUND 2 (AGGRESSIVE debate) for {ticker}. Rebut
+        the other openings. Call tools for a new source. End with
+        Conviction vs opening and an updated size.
+      expected_output: |
+        Aggressive rebuttal for {ticker}. REBUTTAL: lines. Conviction
+        vs opening. Every number carries [source: …].
+
+    risk_conservative_rebut:
+      description: |
+        Bundled risk ROUND 2 (CONSERVATIVE debate) for {ticker}. Rebut
+        the other openings. Call tools for a new source. End with
+        Conviction vs opening and an updated size.
+      expected_output: |
+        Conservative rebuttal for {ticker}. REBUTTAL: lines. Conviction
+        vs opening. Every number carries [source: …].
+
+    risk_neutral_rebut:
+      description: |
+        Bundled risk ROUND 2 (NEUTRAL debate) for {ticker}. Debate both
+        wings, then lock one size. Call tools if a claim is uncited.
+        End with Conviction vs opening. Do not emit graph tokens.
+      expected_output: |
+        Neutral rebuttal for {ticker}. REBUTTAL: lines. Locked size.
+        Conviction vs opening. Every number carries [source: …].
+
+    quality_review:
+      description: |
+        Audit the thesis for {ticker}. A claim with [source: …]
+        (real URL or tool id) is SUPPORTED — the tag is enough; do
+        not require the URL to reappear in another report and do not
+        tell the PM to drop it. SUPPORTED-qualitative for [analyst
+        judgement]. UNSUPPORTED only for an untagged number or
+        example.com. Score 0-10. There is no pipeline slot after this.
+
+    compliance_review:
+      description: |
+        Gate {ticker} from the evidence you have. Issue CLEAR /
+        FLAGGED / BLOCKED. BLOCKED requires a concrete, cited hit —
+        not an unverifiable exposure. There is no pipeline slot after
+        this.
+
+    pm_decision:
+      description: |
+        Issue the typed book ticket for {ticker} from the evidence
+        the conductor gathered. You may not have every desk — decide
+        from what is here. HOLD is first-class when the evidence is
+        contradictory with conviction, the directional vote is tied
+        (bull == bear, both > 0), majority-opposed, or compliance is
+        BLOCKED. Do not default to BUY. STRONG_* requires one-sided
+        evidence. Align the primary action with any three-horizon
+        picture in context. Cite sources; do not invent figures.

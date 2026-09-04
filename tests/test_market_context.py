@@ -1,15 +1,7 @@
 """Unit tests for the ticker resolver + market-profile + dynamic query layer.
 
-These cover the two user-reported bugs:
-
-1. Indian (NSE) tickers must resolve from bare input — typing
-   ``MAZDOCK`` should turn into ``MAZDOCK.NS`` end-to-end, with the
-   downstream tools using the canonical symbol.
-2. News + macro queries must be ticker-aware — a US name still gets
-   Fed/UST/DXY context, but a non-US name gets its own
-   country-specific macro themes (RBI, INR, Union Budget, …) and the
-   industry-specific seeds (shipbuilder → Strait of Hormuz / Make-in-
-   India naval orders).
+These cover ticker resolution, facts-only market profiles, analyst-written
+search queries, and the live (not dictionary) peer universe.
 
 We stub yfinance so the tests are deterministic and run offline.
 """
@@ -152,7 +144,7 @@ def test_resolver_short_circuits_company_name(monkeypatch, caplog):
     "AAAAAAAAAAAAAA",            # length > 12
     "TICKER?",                   # ? not allowed
     "SOME/THING",                # / not allowed
-    "X.X.X.X",                   # length OK but multiple dots is suspicious
+    "X.X.X.X",                   # already-dotted; pass-through, no probe
 ])
 def test_resolver_rejects_a_range_of_non_tickers(monkeypatch, garbage):
     """Belt-and-braces — every shape of "obviously not a ticker" input
@@ -167,9 +159,9 @@ def test_resolver_rejects_a_range_of_non_tickers(monkeypatch, garbage):
 
     monkeypatch.setattr(mc.yf, "Ticker", _counting_factory)
     out = mc.resolve_ticker(garbage)
-    # "X.X.X.X" is rejected for length (> 12 chars).  Everything else
-    # is rejected for whitespace or disallowed punctuation.  In all
-    # cases we must NOT probe.
+    # Whitespace / punctuation / over-long bare symbols fail the
+    # structural check. Dotted junk (``X.X.X.X``) is treated as already
+    # suffixed and passed through. In all cases we must NOT probe.
     assert calls == [], (
         f"non-ticker {garbage!r} should not have triggered yf calls; got {calls}"
     )
@@ -228,9 +220,10 @@ def test_profile_for_us_name_uses_us_macro_basket(monkeypatch):
     assert prof.peer_index == "^GSPC"
     assert "us_10y_treasury_yield" in prof.macro_tickers
     assert prof.macro_tickers["us_10y_treasury_yield"] == "^TNX"
-    # Industry seeds for semis must be present (TSMC / Taiwan / chip export).
-    seeds = " ".join(prof.industry_themes).lower()
-    assert "tsmc" in seeds or "chip export" in seeds
+    # Facts only — no canned TSMC / export-control phrasebook.
+    assert prof.industry.lower().startswith("semiconductor")
+    q = prof.geopolitical_query().lower()
+    assert "nvidia" in q and "tariff" in q
 
 
 def test_profile_for_indian_shipbuilder_uses_india_basket_and_ship_seeds(monkeypatch):
@@ -258,15 +251,13 @@ def test_profile_for_indian_shipbuilder_uses_india_basket_and_ship_seeds(monkeyp
     assert "usd_inr" in prof.macro_tickers
     assert prof.macro_tickers["usd_inr"] == "INR=X"
     assert "us_10y_treasury_yield" not in prof.macro_tickers
-    # Macro themes must include RBI / INR / Union Budget — not Fed terms.
-    themes_joined = " ".join(prof.macro_themes).lower()
-    assert "rbi" in themes_joined or "reserve bank" in themes_joined
-    assert "inr" in themes_joined or "rupee" in themes_joined.replace("inr", "")
-    assert "fed" not in themes_joined
-    # Industry seeds must include shipbuilding-specific phrases.
-    industry_joined = " ".join(prof.industry_themes).lower()
-    assert "shipbuilding" in industry_joined or "naval" in industry_joined
-    assert "hormuz" in industry_joined or "shipping" in industry_joined
+    # Brief is facts (India + aerospace), not a Hormuz/RBI phrasebook.
+    brief = prof.to_brief().lower()
+    assert "india" in brief
+    assert "aerospace" in brief or "defense" in brief
+    assert "hormuz" not in brief
+    assert "federal reserve" not in brief
+    assert "no canned theme list" in brief or "query contract" in brief
 
 
 def test_profile_falls_back_to_exchange_when_country_missing(monkeypatch):
@@ -302,14 +293,14 @@ def test_country_news_query_for_indian_name_contains_india_themes(monkeypatch):
     )
     q = get_market_profile("MAZDOCK.NS").country_news_query().lower()
     assert "mazagon" in q
-    assert "rbi" in q or "reserve bank" in q or "rupee" in q or "inr" in q
     assert "federal reserve" not in q
     assert "treasury yield" not in q
 
 
-def test_geopolitical_query_for_shipbuilder_does_not_default_to_china_taiwan(monkeypatch):
-    """The old hard-coded ``"China Taiwan export controls"`` is gone —
-    a shipbuilder gets shipping / naval / Hormuz instead."""
+def test_macro_news_query_is_country_macro_not_company_news(monkeypatch):
+    """``macro_news_query`` is for get_global_news — country macro, framed as
+    recent news, and NOT prefixed with the company name (that prefix diluted
+    the search into generic/navigational home pages for broad macro terms)."""
     from trading_crew.market_context import get_market_profile
     _patch_yf(
         monkeypatch,
@@ -322,13 +313,67 @@ def test_geopolitical_query_for_shipbuilder_does_not_default_to_china_taiwan(mon
             }
         },
     )
-    q = get_market_profile("MAZDOCK.NS").geopolitical_query().lower()
-    assert "shipbuilding" in q or "naval" in q
-    assert "hormuz" in q or "shipping" in q
-    # We don't insist China/Taiwan are absent (defence sector globally is
-    # entangled with both), but they must NOT be the *anchor* of the
-    # query — the company name + industry words come first.
+    q = get_market_profile("MAZDOCK.NS").macro_news_query().lower()
+    assert "mazagon" not in q                       # not company news
+    assert "india" in q
+    assert "central bank" in q or "inflation" in q
+
+
+def test_geopolitical_query_for_shipbuilder_uses_facts_not_china_taiwan(monkeypatch):
+    """Default geo query is name + country + industry + lens verbs.
+    Hormuz / China-Taiwan are the *agent's* job to add via query=."""
+    from trading_crew.market_context import get_market_profile
+    _patch_yf(
+        monkeypatch,
+        history_map={},
+        info_map={
+            "MAZDOCK.NS": {
+                "country": "India", "exchange": "NSI",
+                "longName": "Mazagon Dock Shipbuilders Limited",
+                "sector": "Industrials", "industry": "Aerospace & Defense",
+            }
+        },
+    )
+    prof = get_market_profile("MAZDOCK.NS")
+    q = prof.geopolitical_query().lower()
     assert q.startswith("mazagon dock shipbuilders limited")
+    assert "india" in q
+    assert "aerospace" in q or "defense" in q
+    assert "tariff" in q or "sanction" in q
+    assert "taiwan" not in q
+    written = prof.geopolitical_query("Mazagon Dock Hormuz Red Sea naval sanctions").lower()
+    assert "hormuz" in written and "mazagon" in written
+
+
+def test_ntnx_default_query_is_facts_only_agent_query_wins(monkeypatch):
+    """No industry phrasebook. Default = name/country/industry/lens verbs.
+    An agent-written query is used verbatim."""
+    from trading_crew.market_context import compose_search_query, get_market_profile
+    _patch_yf(
+        monkeypatch,
+        history_map={},
+        info_map={
+            "NTNX": {
+                "country": "United States", "exchange": "NMS",
+                "longName": "Nutanix, Inc.",
+                "sector": "Technology", "industry": "Software - Infrastructure",
+            }
+        },
+    )
+    prof = get_market_profile("NTNX")
+    q = prof.geopolitical_query().lower()
+    assert q.startswith("nutanix")
+    assert "united states" in q
+    assert "software" in q
+    assert "tariff" in q or "sanction" in q
+    assert "enterprise it spending" not in q
+    assert "capital expenditure cycle" not in q
+    assert len(q.split()) <= 16
+    written = "Nutanix US China AI hardware export controls"
+    assert compose_search_query(prof, lens="geo", agent_query=written) == written
+    sq = prof.supply_chain_query().lower()
+    assert "nutanix" in sq and "supply chain" in sq
+    assert "enterprise it spending" not in sq
 
 
 def test_supply_chain_query_uses_industry_words(monkeypatch):
@@ -344,29 +389,192 @@ def test_supply_chain_query_uses_industry_words(monkeypatch):
             }
         },
     )
-    q = get_market_profile("NVDA").supply_chain_query().lower()
+    prof = get_market_profile("NVDA")
+    q = prof.supply_chain_query().lower()
     assert "nvidia" in q
-    # Semis profile keeps TSMC / ASML / Taiwan seeds.
-    assert "tsmc" in q or "asml" in q or "taiwan" in q
+    assert "supply chain" in q
+    assert "semiconductor" in q
+    written = prof.supply_chain_query("NVIDIA TSMC ASML fab capacity")
+    assert "TSMC" in written
 
 
 # ---------------------------------------------------------------------------
-# 4. Peer basket
+# 4. Live peer universe (no per-ticker dictionary)
 # ---------------------------------------------------------------------------
 
 
-def test_peer_basket_for_indian_shipbuilder_returns_indian_peers():
-    from trading_crew.market_context import peer_basket
-    peers = peer_basket("MAZDOCK.NS")
-    assert "MAZDOCK.NS" in peers
-    # Must include Indian comparables — NOT US semis.
-    assert any(p.endswith(".NS") for p in peers if p != "MAZDOCK.NS")
-    assert all("NVDA" not in p for p in peers)
+def _profile(**overrides):
+    from trading_crew.market_context import MarketProfile
+
+    base = dict(
+        symbol="MAZDOCK.NS",
+        raw_input="MAZDOCK.NS",
+        long_name="Mazagon Dock Shipbuilders Limited",
+        country="India",
+        currency="INR",
+        exchange="NSI",
+        sector="Industrials",
+        industry="Aerospace & Defense",
+        industry_key="aerospace-defense",
+        market_cap=1.1e11,
+        peer_index="^NSEI",
+        macro_tickers={"usd_inr": "INR=X"},
+    )
+    base.update(overrides)
+    return MarketProfile(**base)
 
 
-def test_peer_basket_falls_back_to_self_when_unknown():
-    from trading_crew.market_context import peer_basket
-    assert peer_basket("ZZZUNKNOWN") == ["ZZZUNKNOWN"]
+def test_no_hardcoded_sector_peer_dictionary():
+    import trading_crew.market_context as mc
+
+    assert not hasattr(mc, "_SECTOR_PEERS")
+
+
+def test_long_nse_listings_are_valid_tickers():
+    from trading_crew.market_context import _looks_like_ticker
+
+    assert _looks_like_ticker("COCHINSHIP.NS")
+    assert _looks_like_ticker("TATAMOTORS.NS")
+    assert _looks_like_ticker("BHARTIARTL.NS")
+    assert not _looks_like_ticker("LARSEN & TOUBRO LIMITED")
+
+
+def test_yahoo_region_from_exchange_and_suffix():
+    from trading_crew.market_context import yahoo_region_for
+
+    assert yahoo_region_for(exchange="NSI") == "in"
+    assert yahoo_region_for(exchange="NMS") == "us"
+    assert yahoo_region_for(symbol="MAZDOCK.NS") == "in"
+    assert yahoo_region_for(country="Japan") == "jp"
+
+
+def test_screener_industry_matches_yahoo_enum_not_a_phrasebook():
+    from trading_crew.market_context import _screener_industry_name
+
+    name = _screener_industry_name(
+        "Software - Infrastructure", "software-infrastructure", "Technology",
+    )
+    assert name == "Software—Infrastructure"
+
+
+def test_agent_peers_win_and_do_not_call_the_live_screen(monkeypatch):
+    from trading_crew import market_context as mc
+
+    monkeypatch.setattr(mc, "resolve_ticker", lambda s: s.strip().upper())
+
+    def _boom(*_a, **_k):
+        raise AssertionError("live screen must not run when peers= is set")
+
+    monkeypatch.setattr(mc, "_run_equity_screen", _boom)
+    uni = mc.discover_peers(
+        "NTNX",
+        extra_peers="PSTG, NTAP",
+        profile=_profile(
+            symbol="NTNX", raw_input="NTNX", long_name="Nutanix, Inc.",
+            country="United States", currency="USD", exchange="NMS",
+            sector="Technology", industry="Software - Infrastructure",
+            industry_key="software-infrastructure", market_cap=1.8e10,
+            peer_index="^GSPC",
+        ),
+    )
+    assert uni.method == "agent"
+    assert uni.symbols == ["NTNX", "PSTG", "NTAP"]
+
+
+def test_live_screen_ranks_same_listing_ahead_of_foreign_mega_cap(monkeypatch):
+    """MAZDOCK must pick Indian aerospace names from the screen, not a
+    curated COCHINSHIP list and not a US semi dictionary."""
+    from trading_crew import market_context as mc
+
+    def _screen(query, **_kwargs):
+        return {
+            "quotes": [
+                {"symbol": "MAZDOCK.NS", "marketCap": 1.1e11},
+                {"symbol": "COCHINSHIP.NS", "marketCap": 9.0e10},
+                {"symbol": "GRSE.NS", "marketCap": 5.0e10},
+                {"symbol": "LMT", "marketCap": 1.2e12},
+            ]
+        }
+
+    monkeypatch.setattr(mc, "_run_equity_screen", _screen)
+    uni = mc.discover_peers("MAZDOCK.NS", profile=_profile())
+    assert uni.method.startswith("industry+")
+    assert "COCHINSHIP.NS" in uni.symbols
+    assert "GRSE.NS" in uni.symbols
+    assert "NVDA" not in uni.symbols
+    # Same listing (.NS) ranks ahead of Lockheed.
+    others = [s for s in uni.symbols if s != "MAZDOCK.NS"]
+    assert others[0].endswith(".NS")
+
+
+def test_ntnx_live_screen_is_not_the_old_dell_hpe_dictionary(monkeypatch):
+    from trading_crew import market_context as mc
+
+    def _screen(query, **_kwargs):
+        return {
+            "quotes": [
+                {"symbol": "NTNX", "marketCap": 1.8e10},
+                {"symbol": "PSTG", "marketCap": 2.0e10},
+                {"symbol": "NTAP", "marketCap": 2.2e10},
+                {"symbol": "CRWD", "marketCap": 8.0e10},
+            ]
+        }
+
+    monkeypatch.setattr(mc, "_run_equity_screen", _screen)
+    uni = mc.discover_peers(
+        "NTNX",
+        profile=_profile(
+            symbol="NTNX", raw_input="NTNX", long_name="Nutanix, Inc.",
+            country="United States", currency="USD", exchange="NMS",
+            sector="Technology", industry="Software - Infrastructure",
+            industry_key="software-infrastructure", market_cap=1.8e10,
+            peer_index="^GSPC",
+        ),
+    )
+    assert "PSTG" in uni.symbols
+    assert "DELL" not in uni.symbols
+    assert "HPE" not in uni.symbols
+    assert "IBM" not in uni.symbols
+
+
+def test_peer_basket_focus_only_when_screen_empty(monkeypatch):
+    from trading_crew import market_context as mc
+
+    monkeypatch.setattr(mc, "_info_safe", lambda _s: {})
+    monkeypatch.setattr(mc, "_run_equity_screen", lambda *_a, **_k: {"quotes": []})
+    uni = mc.discover_peers("ZZZUNKNOWN")
+    assert uni.symbols == ["ZZZUNKNOWN"]
+    assert uni.method == "focus_only"
+
+
+def test_format_peer_comparison_computes_alpha_and_flags_mismatch():
+    from trading_crew.market_context import (
+        PeerRow,
+        PeerUniverse,
+        format_peer_comparison,
+    )
+
+    uni = PeerUniverse(
+        symbols=["NTNX", "PSTG", "DELL"],
+        method="industry+region",
+        industry="Software—Infrastructure",
+        region="us",
+        notes="test",
+    )
+    text = format_peer_comparison("NTNX", uni, [
+        PeerRow("NTNX", 10.0, 5.0, 1.8e10, 40.0,
+                "Software - Infrastructure", "United States"),
+        PeerRow("PSTG", 20.0, 8.0, 2.0e10, 30.0,
+                "Software - Infrastructure", "United States"),
+        PeerRow("DELL", 200.0, 50.0, 8.0e10, 15.0,
+                "Computer Hardware", "United States"),
+    ])
+    assert "INDUSTRY_MISMATCH" in text
+    assert "Focus alpha vs median YTD: -10.00 pp" in text
+    assert "Median peer YTD (ex-focus, matched industry): +20.00%" in text
+    # Hardware outlier must not enter the median the PM will quote.
+    assert "Focus alpha vs median YTD: + " not in text
+    assert "do not recompute" in text.lower() or "Quote the alpha" in text or "re-call with peers=" in text
 
 
 # ---------------------------------------------------------------------------
@@ -389,10 +597,13 @@ def test_brief_renders_country_currency_exchange_macro_lines(monkeypatch):
     )
     brief = get_market_profile("MAZDOCK.NS").to_brief()
     # Single brief should be self-contained — country, currency, exchange,
-    # peer index, peer basket, and macro tickers are all visible to the
-    # analyst so they can phrase searches grounded in the brief.
+    # peer index, live-peer contract, and macro tickers are all visible.
     assert "India" in brief
     assert "INR" in brief
     assert "^NSEI" in brief
     assert "INR=X" in brief
     assert "Mazagon Dock" in brief
+    assert "get_sector_peers" in brief
+    assert "not a ticker dictionary" in brief
+    assert "COCHINSHIP" not in brief
+    assert "DELL" not in brief

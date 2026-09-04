@@ -20,9 +20,13 @@ parameter sweep.
 
 from .metrics import (
     BacktestMetrics,
+    bootstrap_sharpe_ci,
+    compute_benchmark_stats,
     compute_metrics,
     deflated_sharpe,
     max_drawdown_pct,
+    probability_edge,
+    probability_of_backtest_overfitting,
 )
 from .walk_forward import (
     CPCVConfig,
@@ -43,10 +47,21 @@ from .manifest import (
 )
 from .engine import (
     BacktestResult,
+    CPCVPathResult,
+    CPCVResult,
     FoldResult,
+    PortfolioBacktestResult,
     TradeRecord,
     run_backtest,
+    run_cpcv,
+    run_portfolio_backtest,
     run_walk_forward,
+)
+from .attribution import (
+    AttributionResult,
+    DecisionAttribution,
+    attribute_decisions,
+    sized_weights_from_trades,
 )
 
 __all__ = [
@@ -54,6 +69,10 @@ __all__ = [
     "compute_metrics",
     "deflated_sharpe",
     "max_drawdown_pct",
+    "probability_edge",
+    "compute_benchmark_stats",
+    "bootstrap_sharpe_ci",
+    "probability_of_backtest_overfitting",
     "Fold",
     "WalkForwardConfig",
     "generate_folds",
@@ -68,8 +87,17 @@ __all__ = [
     "hash_data_dir",
     "hash_text",
     "BacktestResult",
+    "CPCVPathResult",
+    "CPCVResult",
     "FoldResult",
+    "PortfolioBacktestResult",
     "TradeRecord",
     "run_backtest",
+    "run_cpcv",
+    "run_portfolio_backtest",
     "run_walk_forward",
+    "AttributionResult",
+    "DecisionAttribution",
+    "attribute_decisions",
+    "sized_weights_from_trades",
 ]

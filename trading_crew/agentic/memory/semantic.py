@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -145,17 +146,24 @@ class SemanticKnowledgeBase:
     # -------------------------------------------------------------- internals
 
     def _rewrite(self, docs: Sequence[KnowledgeDoc]) -> None:
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        # Unique tmp per writer — a shared ``.jsonl.tmp`` races when two
+        # harness runs ingest the same corpus and one replace() deletes
+        # the other's file (ENOENT).
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=self.path.name + ".",
+            suffix=".tmp",
+            dir=str(self.path.parent),
+        )
         try:
-            with tmp.open("w", encoding="utf-8") as fh:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 for d in docs:
                     fh.write(json.dumps(d.to_dict(), sort_keys=True) + "\n")
-            os.replace(tmp, self.path)
+            os.replace(tmp_name, self.path)
         except OSError as exc:
             logger.warning("could not persist semantic KB to %s: %s", self.path, exc)
             try:
-                if tmp.exists():
-                    tmp.unlink()
+                if os.path.exists(tmp_name):
+                    os.unlink(tmp_name)
             except OSError:
                 pass
             raise

@@ -50,7 +50,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-_DEFAULT_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+_DEFAULT_FORMAT = "%(asctime)s %(levelname)s [%(trace_id)s] %(name)s: %(message)s"
 _DEFAULT_LEVEL = "INFO"
 _DEFAULT_MAX_BYTES = 20 * 1024 * 1024  # 20 MB
 _DEFAULT_BACKUP_COUNT = 5
@@ -119,6 +119,14 @@ def configure_logging(
         for handler in list(root.handlers):
             root.removeHandler(handler)
 
+        # Stamps every record with the active session ``trace_id`` so the
+        # ``[%(trace_id)s]`` field always resolves (even for third-party
+        # records that never touch our contextvar) — enables group-by-session
+        # log analysis.  See trading_crew/observability/trace.py.
+        from trading_crew.observability.trace import TraceLogFilter
+
+        trace_filter = TraceLogFilter()
+
         file_handler = logging.handlers.RotatingFileHandler(
             log_path,
             maxBytes=max_bytes,
@@ -127,11 +135,13 @@ def configure_logging(
         )
         file_handler.setFormatter(formatter)
         file_handler.setLevel(level_value)
+        file_handler.addFilter(trace_filter)
         root.addHandler(file_handler)
 
         stream_handler = logging.StreamHandler(stream=sys.stdout)
         stream_handler.setFormatter(formatter)
         stream_handler.setLevel(level_value)
+        stream_handler.addFilter(trace_filter)
         root.addHandler(stream_handler)
 
         _reattach_uvicorn_loggers(level_value)

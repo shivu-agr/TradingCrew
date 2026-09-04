@@ -56,7 +56,7 @@ class CommodityCrew:
         risk_rounds: int = 1,
         step_callback: Optional[Callable[[Any], None]] = None,
         task_callback: Optional[Callable[[Any], None]] = None,
-        memory: bool = True,
+        memory: bool = False,
         tools_enabled: Optional[Dict[str, List[str]]] = None,
     ) -> None:
         self.ticker = ticker
@@ -311,6 +311,7 @@ class CommodityCrew:
         risk_tasks: List[Task] = []
         risk_ctx: List[Task] = [trader_t, research_synthesis, quality_review]
         for r in range(1, self.risk_rounds + 1):
+            opening = r == 1
             aggr = Task(
                 description=aggr_cfg["description"].format(
                     round_num=r, total_rounds=self.risk_rounds, ticker=self.ticker
@@ -320,6 +321,7 @@ class CommodityCrew:
                 ),
                 agent=self.risk_aggressive(),
                 context=list(risk_ctx),
+                async_execution=opening,
             )
             cons = Task(
                 description=cons_cfg["description"].format(
@@ -329,7 +331,8 @@ class CommodityCrew:
                     round_num=r, total_rounds=self.risk_rounds, ticker=self.ticker
                 ),
                 agent=self.risk_conservative(),
-                context=list(risk_ctx) + [aggr],
+                context=list(risk_ctx) if opening else list(risk_ctx) + [aggr],
+                async_execution=opening,
             )
             neut = Task(
                 description=neut_cfg["description"].format(
@@ -391,6 +394,11 @@ class CommodityCrew:
             crew_kwargs["memory"] = True
             crew_kwargs["embedder"] = get_embedder_config()
             crew_kwargs["name"] = f"commodity-crew-{self.ticker}"
+        from trading_crew.agentic.harness import apply_harness
+
+        apply_harness(
+            crew_kwargs["agents"], book="commodity", run_mode="deterministic"
+        )
         return Crew(**crew_kwargs)
 
 

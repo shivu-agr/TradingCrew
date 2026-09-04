@@ -17,6 +17,10 @@ function tradingCrewApp() {
     assetClass: (() => {
       const p = (typeof window !== "undefined" && window.location && window.location.pathname) || "";
       if (p.startsWith("/commodity")) return "commodity";
+      if (p === "/settings" || p.startsWith("/settings/")) {
+        const book = new URLSearchParams(window.location.search).get("book") || "";
+        if (book === "commodity") return "commodity";
+      }
       return "stock";
     })(),
 
@@ -28,8 +32,6 @@ function tradingCrewApp() {
     llm: {},
     llmPresets: [],         // [{ id, label, kind, provider, model, base_url, description, api_key_configured, ... }]
     selectedLlmPreset: "",  // id of the preset to use on the next run; persisted to localStorage
-    embeddingPresets: [],   // mirror of llmPresets for the embedding endpoint
-    selectedEmbeddingPreset: "",
     tavily: false,
     // Surface bootstrap failures so the user sees a clear retry affordance
     // instead of an empty sidebar (e.g. when /api/options is unreachable
@@ -41,13 +43,18 @@ function tradingCrewApp() {
     /* ---------------------------------------------------------- form */
     form: {
       ticker: "NTNX",
-      trade_date: new Date().toISOString().slice(0, 10),
+      trade_date: (() => {
+        const n = new Date();
+        const m = String(n.getMonth() + 1).padStart(2, "0");
+        const d = String(n.getDate()).padStart(2, "0");
+        return `${n.getFullYear()}-${m}-${d}`;
+      })(),
       max_debate_rounds: 2,
       max_risk_rounds: 1,
-      // Memory defaults OFF — its per-task LLM analyze passes were the
-      // biggest single source of calls.  The toggle stays in the UI so
-      // it can be opted back in.
-      memory: false,
+      // Stock-only: autonomous = LangGraph; deterministic = sequential CrewAI;
+      // harness = observe/dispatch conductor loop.
+      // Prediction batch reads the same field via _bulkCfgFromForm.
+      run_mode: "autonomous",
       // Optional advisory reviewers (async, feed the PM).  Default OFF
       // for a lean run.
       quality_review: false,
@@ -55,6 +62,12 @@ function tradingCrewApp() {
       // Reflective critic — on by default but single-pass (the 3-temp
       // consistency vote is skipped unless critic_samples is raised).
       critic_enabled: true,
+      // Optional signal fusion (folded in from the old Signals tab).  When
+      // on, the workflow fuses its decision with the L4 policy / L3 edge /
+      // crowd view and surfaces a guardrailed FusedSignal in the Workflow
+      // tab.  Advisory only — never changes the PM's action/size.
+      fusion_enabled: false,
+      fusion_include_crowd: true,
       tools_enabled: {},   // agent_key -> [tool_name, ...]
       // Phase 2B.3 — partition the on-disk portfolio between a
       // sandboxed "paper" book and a live "prod" book.  Defaults to
@@ -64,7 +77,6 @@ function tradingCrewApp() {
 
     /* ---------------------------------------------------------- collapsible state */
     sidebarCollapsed: false,
-    advancedOpen: true,
     openSections: {
       ticker: true,
       date: false,
@@ -80,8 +92,6 @@ function tradingCrewApp() {
     loadedRunId: null,
     clearingRecentRuns: false,
     sections: [
-      { id: "ticker", title: "Ticker", icon: "T" },
-      { id: "date", title: "Date", icon: "D" },
       { id: "llm", title: "LLM", icon: "L" },
       { id: "dialogue", title: "Dialogue", icon: "M" },
       { id: "tools", title: "Tools", icon: "⚙" },
@@ -98,22 +108,96 @@ function tradingCrewApp() {
     currentNode: "",
     finalDecision: "",
     decisionPayload: null,
-    activeTab: "workflow",
+    activeTab: "prediction",
+    // When reached via /run/{ticker} (from a Prediction tile), this holds the
+    // most recent batch prediction stored in the DB so the Workflow tab can
+    // show it immediately, before/without a fresh live run.
+    storedPrediction: null,
+    storedPredictionTicker: "",
     // The "Futures" tab is rendered only for commodity dashboards; the
     // x-show guards in index.html honour ``assetClass``.  We keep it in
     // the array so the order is stable; the template just hides it for
     // stock dashboards.
+    // ``scope`` splits high-level tabs (shown on the /stocks | /commodity page)
+    // from instrument-specific tabs (shown on the focused /run page).
+    // ``asset`` (optional) restricts a tab to one asset class — Prediction &
+    // Names/Portfolio are stock-only; Contracts is commodity-only; Training &
+    // Episodes are cross-asset.  ``desk`` splits the live universe
+    // (/stocks: Prediction · Training · Episodes) from a dated prediction
+    // run (/stocks/history/{date}: Names · Portfolio).  ``commodityOnly``
+    // gates an instrument tab.
     tabs: [
-      { id: "workflow", label: "Workflow" },
-      { id: "charts", label: "Charts" },
-      { id: "futures", label: "Futures", commodityOnly: true },
-      { id: "reports", label: "Reports" },
-      { id: "memory", label: "Memory" },
-      { id: "portfolio", label: "Portfolio" },
-      { id: "backtest", label: "Backtest" },
-      { id: "training", label: "RL Training" },
-      { id: "logs", label: "Logs" },
+      { id: "prediction", label: "Prediction", scope: "global", asset: "stock", desk: "live" },
+      { id: "contracts", label: "Contracts", scope: "global", asset: "commodity" },
+      { id: "training", label: "Training", scope: "global", desk: "live" },
+      { id: "episodes", label: "Episodes", scope: "global", desk: "live" },
+      { id: "run-names", label: "Names", scope: "global", asset: "stock", desk: "review" },
+      { id: "portfolio", label: "Portfolio", scope: "global", asset: "stock", desk: "review" },
+      // Reports + Logs are no longer standalone tabs — both are folded into
+      // the Workflow tab so clicking a tile shows the report AND the activity
+      // log during the run and after it completes (both are persisted in the
+      // run record and replayed on reopen).
+      { id: "workflow", label: "Workflow", scope: "stock" },
+      { id: "charts", label: "Charts", scope: "stock" },
+      { id: "futures", label: "Futures", scope: "stock", commodityOnly: true },
+      { id: "backtest", label: "Backtest", scope: "stock" },
     ],
+    // Whether a specific stock is "open" (via a Prediction tile or /run/{t}).
+    // Gates the stock-specific tabs + drives the header title.
+    stockActive: false,
+    // Hierarchical page mode: true ⇒ the focused per-instrument workbench
+    // (URL /run/{ticker} for stocks, /commodity/run/{contract} for commodity)
+    // — no left pane, instrument tabs only, a back button to the high-level
+    // page.  false ⇒ the high-level page (/stocks or /commodity) with the left
+    // pane + global tabs.  Applies to BOTH asset classes.
+    focusPage: false,
+    // Dedicated /settings page: left pane = run config, right pane = strategy + prompts.
+    settingsPage: (() => {
+      const p = (typeof window !== "undefined" && window.location && window.location.pathname) || "";
+      return p === "/settings" || p.startsWith("/settings/");
+    })(),
+    // Left sidebar mode: "history" (run dates) | "settings" (full run config).
+    sidebarMode: (() => {
+      const p = (typeof window !== "undefined" && window.location && window.location.pathname) || "";
+      if (p === "/settings" || p.startsWith("/settings/")) return "settings";
+      return "history";
+    })(),
+    settingsSaving: false,
+    settingsError: "",
+    settingsPromptBlock: "",
+    settingsSource: "",
+    settingsLivePath: "",
+    settingsPackagedPath: "",
+    bulkCfgError: "",
+
+    // Signal fusion result — populated by the optional in-run "fusion" event
+    // (folded in from the old Signals tab) and rendered on the Workflow tab.
+    fusionResult: null,
+
+    // Structured report trend signals (Firefly-style card) — populated by the
+    // "report_signals" event live and rehydrated by loadRun, rendered on the
+    // Workflow tab beside the analyst reports.
+    reportSignals: null,
+
+    // Deterministic price-structure signals (vol-state / regime-age / oversold
+    // DIP_BUY / Hurst) computed from OHLCV.  Populated by the "price_signals"
+    // event and rehydrated by loadRun; rendered on the Workflow tab.
+    priceSignals: null,
+
+    // Per-desk bias board — each analyst desk's directional lean handed to the
+    // PM ([{desk, bias}, ...]).  Populated by the "desk_bias_board" event and
+    // rehydrated by loadRun; rendered in the Decision-node panel.
+    deskBiasBoard: null,
+
+    // Full evidence blackboard (UI shows full reports; debate tools see compact).
+    evidenceBlackboard: null,
+
+    // Shared bull/bear scratch pad (analyst TLDRs + debate turns + notes).
+    debateScratchpad: null,
+
+    // Display role strings for desks running ReAct-style planning (from
+    // /api/options).  Drives the ReAct tile badge in the workflow diagram.
+    reactAgents: [],
 
     /* --------------------------------------------- commodity-only state */
     curveData: null,
@@ -159,13 +243,27 @@ function tradingCrewApp() {
     pruneLoading: false,
     pruneResult: null,
 
-    // M7 — Portfolio tab
-    portfolio: null,
-    allocatorMethod: "HRP",       // HRP / MV / EQR (Phase 2B.1)
-
     // L2 agentic training — outcome resolution + reflections
     resolveResult: null,
     resolveLoading: false,
+    strategyBoard: null,
+    strategyDraft: null,
+    strategySaving: false,
+    strategyError: "",
+    promptKey: "trader",
+    promptDraft: { goal: "", backstory: "" },
+    promptSaving: false,
+    promptError: "",
+    experimentKnob: "",
+    hermesBusy: false,
+    hermesError: "",
+    hermesEditor: "strategy",
+
+    // L2 analytics — conviction calibration panel
+    calibration: null,
+    calibrationBasis: "return",   // "return" | "alpha"
+    calibrationCohort: "current", // "current" | "all"
+    calibrationTickerOnly: false,
 
     // M6 — Backtest tab
     backtestConfig: { train_size: 3, embargo_size: 1, test_size: 1 },
@@ -179,17 +277,38 @@ function tradingCrewApp() {
     // L3 agentic training — grid search "Auto-tune"
     gridSearchSize: "coarse",
     gridSearchRankBy: "deflated_sharpe",
+    applyTune: false,   // persist the winning config → live inference + walk-forward
     // Phase 2C — extra grid axes / robustness toggles.
     gridSweepMaxLeverage: false,
     gridSweepDrawdownKill: false,
     gridSweepCostModel: false,
     backtestValidation: "walk_forward",   // walk_forward | cpcv
     backtestCostModel: "standard",
+    // CPCV geometry (used when backtestValidation === "cpcv")
+    cpcvGroups: 6,
+    cpcvK: 2,
     seedN: 20,
     seedLoading: false,
     seedResult: null,
     gridSearchResult: null,
     gridSearchLoading: false,
+    // Swarm intelligence — optimizer choice + PSO + consensus controls
+    backtestOptimizer: "grid",             // grid | pso
+    swarmSize: 12,
+    swarmIterations: 8,
+    swarmSeed: 0,
+    gridConsensus: false,                  // fuse top-K into a consensus ensemble
+    consensusTopK: 5,
+    // Multi-asset portfolio backtest (M7 allocator)
+    portfolioTickers: "",
+    portfolioAllocMethod: "HRP",           // HRP | MEAN_VARIANCE | EQUAL_RISK
+    portfolioGrossBudget: 0.8,
+    portfolioResult: null,
+    portfolioLoading: false,
+    portfolioChart: null,
+    // Crowd-positioning chip (swarm crowd signal for the current ticker)
+    crowdSignal: null,
+    crowdLoading: false,
 
     // L4 agentic training — PPO on the M2 simulator
     rlConfig: {
@@ -225,39 +344,54 @@ function tradingCrewApp() {
     rlActionChart: null,
     rlPollTimer: null,
 
-    // ---- RLMF (LLM fine-tune from market feedback) --------------------
-    rlmfBaseModels: [
-      "Qwen/Qwen3-32B",
-      "Qwen/Qwen2.5-7B-Instruct",
-      "Qwen/Qwen2.5-1.5B-Instruct",
-      "meta-llama/Llama-3.1-8B-Instruct",
-      "google/gemma-2-9b-it",
-      "mistralai/Mistral-7B-Instruct-v0.3",
-    ],
-    rlmfLora: {
-      base_model: "Qwen/Qwen2.5-1.5B-Instruct",
-      symbol: "",
-      epochs: 1,
-      learning_rate: 0.0002,
-      lora_r: 16,
-      lora_alpha: 32,
-      max_seq_len: 2048,
+    // Forward collection (scale) — live crew over the 200-stock universe
+    scaleStatus: null,
+    scaleForm: { universe: "all200", workers: 6, useCustom: false, tickers: "" },
+    scaleLoading: false,
+    scaleError: "",
+    scalePollTimer: null,
+    // Per-session web-search backend counters for the active batch (trace_id
+    // == batch job_id).  Populated by loadSearchStats() alongside scale status.
+    searchStats: null,
+    get scaleActive() {
+      return ["running", "pausing", "stopping"].includes(this.scaleStatus?.status);
     },
-    rlmfLoraStatus: null,
-    rlmfSummary: null,
-    // Default serve port is 8091 (NOT 8081) so it doesn't collide with a
-    // primary vLLM already serving the run-config model on 8081.  gpu_mem_util
-    // / max_num_seqs are exposed so a small served model can be squeezed into
-    // whatever VRAM a primary tenant leaves free (else vLLM OOMs on warmup).
-    rlmfServe: { mode: "with_lora", base_model: "Qwen/Qwen3-32B", port: 8091, adapter_dir: "", max_model_len: null, gpu_mem_util: null, max_num_seqs: null },
-    rlmfServeStatus: null,
-    rlmfAdapters: null,
-    rlmfEpisodeData: null,
-    rlmfEpisodeFilter: { symbol: "", status: "" },
-    rlmfExpanded: null,
-    rlmfLoading: { dataset: false, export: false, loraStart: false, episodes: false, serveStart: false, sample: false },
-    rlmfError: "",
-    rlmfPollTimer: null,
+
+    /* ---------------- Prediction tab (universe grid + batch) ------------- */
+    predUniverse: { markets: { IN: [], US: [] } },
+    predProgress: { total: 0, done: 0, failed: 0 },
+    predRunDate: "",
+    predExpanded: {},
+    predMarket: "all",       // grid filter + batch scope: all | IN | US
+    predMode: "bulk",        // Prediction tab: bulk universe | single name
+    predForceRerun: false,   // ignore today's done cache on the next single/bulk
+    predWorkers: 5,
+    // Bulk/scale prediction runs a SAVED snapshot of the Settings form
+    // (dialogue rounds + tool select/unselect + LLM preset), so a batch is
+    // reproducible even if Settings change mid-run.  Saved with the "Save
+    // bulk settings" button; defaults to the current Settings on first load.
+    bulkCfg: {},
+    bulkCfgSaved: false,
+    bulkToolsOpen: false,
+    predError: "",
+    predSearch: { q: "", market: "IN", results: [], open: false, loading: false, adding: "" },
+    predHistoryDays: [],
+    predHistDate: "",        // "" = live/today; else viewing a historical day
+    reviewReturnTab: "run-names",  // Names | Portfolio to restore after /run/{ticker}
+
+    /* ---------- Virtual portfolio (₹10L growth-weighted paper book) ---------- */
+    portfolio: null,          // { run_date, capital, holdings[], totals{}, fx }
+    portfolioDate: "",        // run_date currently shown (kept in sync w/ predHistDate)
+    portfolioMarket: "all",   // universe filter: all | IN | US (full ₹10L per view)
+    portfolioLoading: false,
+    portfolioError: "",
+    // Click-to-sort state for the holdings table (SQL-viewer style).
+    portfolioSort: { key: "current_value", dir: "desc" },
+    predHist: { sectors: [], action_counts: {}, total: 0, done: 0, failed: 0 },
+    // Action-distribution filter on the history view: null = show All, else a
+    // five-tier action key (e.g. "STRONG_BUY") that hides every other tile.
+    predActionFilter: null,
+    _predEnrichRunning: false,
 
     logs: [],
     pendingLogCount: 0,
@@ -295,6 +429,10 @@ function tradingCrewApp() {
     sessions: [],                  // [{ run_id, ticker, status, started_at, completed_at, final_action, error, event_count, subscribers, cfg }]
     activeRunId: null,
     sessionsPollTimer: null,
+    runStartedAt: null,
+    runCompletedAt: null,
+    clockNow: Date.now(),
+    elapsedTickTimer: null,
 
     /* ---------------------------------------------------------- display helpers */
     // Human-friendly rendering of the 5-tier PortfolioDecision.action field.
@@ -305,11 +443,32 @@ function tradingCrewApp() {
     // value directly.
     displayAction(a) {
       if (a === null || a === undefined || a === "") return "";
-      const s = String(a).toUpperCase();
-      const legacy = { OVERWEIGHT: "BUY", UNDERWEIGHT: "SELL", NEUTRAL: "HOLD" };
-      const canonical = legacy[s] || s;
-      // Render underscores as spaces so "STRONG_BUY" shows as "STRONG BUY".
-      return canonical.replace(/_/g, " ");
+      return this._canonAction(a).replace(/_/g, " ");
+    },
+    localCalendarDate() {
+      const n = new Date();
+      return `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, "0")}-${String(n.getDate()).padStart(2, "0")}`;
+    },
+    // Day the live Prediction index is actually on (server calendar, from
+    // /api/predict/universe). Browser midnight can differ from the server.
+    get liveRunDate() {
+      return this.predRunDate || this.localCalendarDate();
+    },
+    get predHistoryPastDays() {
+      const live = this.liveRunDate;
+      return (this.predHistoryDays || []).filter((d) => d && d.run_date !== live);
+    },
+    get onRunReviewPage() {
+      return !!(this.predHistDate && !this.focusPage && !this.settingsPage);
+    },
+    deskTabs() {
+      const desk = this.predHistDate ? "review" : "live";
+      return (this.tabs || []).filter((t) => (
+        t.scope === "global"
+        && !this.focusPage
+        && (!t.asset || t.asset === this.assetClass)
+        && (!t.desk || t.desk === desk)
+      ));
     },
 
     /* ---------- Horizon helpers ---------- */
@@ -333,24 +492,126 @@ function tradingCrewApp() {
     /* ---------------------------------------------------------- boot */
     async init() {
       await this.loadOptions();
+      // Bulk/scale runs use a saved snapshot of Settings; seed it (from
+      // localStorage, or the current Settings on first load) now that the
+      // selected LLM preset is known.
+      this._initBulkCfg();
+      // Restore the previously-selected concurrency (survives server restart).
+      this._initScaleWorkers();
 
-      this.diagram = new WorkflowDiagram(
-        document.getElementById("workflow-diagram"),
-        { assetClass: this.assetClass },
-      );
-      this.diagram.setActiveTools(this.form.tools_enabled);
-      this.diagram.onSelect((id) => (this.selectedNode = id));
-      // Keep the toolbar's "%" label in sync with the diagram's actual
-      // effective scale (fit * userZoom) so the number is always the
-      // truth, not a stale UI guess.
-      this.diagramScale = this.diagram.scale;
-      this.diagram.onScale((s) => { this.diagramScale = s; });
+      // Routing off the URL path (hierarchical multi-page, both asset classes):
+      //   /run/{ticker} | /commodity/run/{c}  -> focused workbench (no left pane)
+      //   /settings[?book=]                   -> run config + strategy/prompts
+      //   /stocks/history/{date}              -> run review (Names · Portfolio)
+      //   /stocks | /commodity | /            -> live high-level dashboard
+      const path = window.location.pathname || "";
+      const runMatch = path.match(/^\/(?:commodity\/)?run\/(.+)$/);
+      const histMatch = path.match(/^\/(?:stocks|predict)\/history\/(.+)$/);
+      const onSettings = path === "/settings" || path.startsWith("/settings/");
+      const dateParam = new URLSearchParams(window.location.search).get("date") || "";
+      let deepLinkTicker = "";
+      if (onSettings) {
+        this.settingsPage = true;
+        this.focusPage = false;
+        this.sidebarMode = "settings";
+        const book = new URLSearchParams(window.location.search).get("book") || "";
+        if (book === "commodity") this.assetClass = "commodity";
+        else if (book === "equity" || book === "stock") this.assetClass = "stock";
+      } else if (runMatch) {
+        const t = decodeURIComponent(runMatch[1]).trim().toUpperCase();
+        if (t) {
+          deepLinkTicker = t;
+          this.form.ticker = t;
+          this.stockActive = true;
+          this.focusPage = true;
+          this.activeTab = "workflow";
+          this.sidebarMode = "settings";
+          if (dateParam) {
+            this.predHistDate = dateParam;
+            this.portfolioDate = dateParam;
+          }
+          // Hydrate AFTER refreshSessions so a live single-run session
+          // wins over the cached Prediction-index HOLD (otherwise
+          // loadLatestRun paints "completed" on top of a still-running
+          // kickoff).
+        }
+      } else if (histMatch) {
+        this.predHistDate = decodeURIComponent(histMatch[1]);
+        this.portfolioDate = this.predHistDate;
+        this.activeTab = (new URLSearchParams(window.location.search).get("tab") === "portfolio")
+          ? "portfolio"
+          : "run-names";
+        this.reviewReturnTab = this.activeTab;
+      } else if (this.assetClass === "commodity") {
+        // Commodity high-level default view is the Contracts picker (its
+        // Prediction / Names / Portfolio analogs don't apply).
+        this.activeTab = "contracts";
+      }
+
+      // Browser back/forward: reload only when crossing the page boundary
+      // (focused ⇄ high-level) so each URL behaves like a real page while
+      // same-page history entries (e.g. tab/date changes) stay instant.
+      window.addEventListener("popstate", () => {
+        const p = window.location.pathname || "";
+        const onFocusPage = /^\/(?:commodity\/)?run\//.test(p);
+        const onSettingsPage = p === "/settings" || p.startsWith("/settings/");
+        if (onFocusPage !== this.focusPage || onSettingsPage !== this.settingsPage) {
+          window.location.reload();
+          return;
+        }
+        if (this.focusPage || this.settingsPage || this.assetClass !== "stock") return;
+        const hist = p.match(/^\/(?:stocks|predict)\/history\/(.+)$/);
+        const date = hist ? decodeURIComponent(hist[1]) : "";
+        if (date) this.enterRunReview(date, { push: false });
+        else if (this.predHistDate) this.backToLive({ push: false });
+      });
+
+      // Bootstrap the high-level front page (universe grid, history list, batch
+      // status polling).  Skipped on the focused per-instrument page, and the
+      // stock-universe loads are skipped for the commodity dashboard (its
+      // Contracts grid comes from loadOptions()).
+      if (!this.focusPage && !this.settingsPage && this.assetClass === "stock") {
+        this.loadPredHistory();
+        this.loadPredUniverse();
+        if (this.predHistDate) {
+          this.loadPredHistDay();
+          if (this.activeTab === "portfolio") this.loadPortfolio();
+        } else {
+          this.predEnrichLoop();
+        }
+      }
+      if (this.settingsPage) {
+        this.loadSettingsPage();
+      } else {
+        this._hydrateBulkFromServer();
+      }
+      // Batch inflight map is a second source of live run_ids (scale
+      // workers). Single-run sessions are handled after refreshSessions.
+      this.initScale().then(() => {
+        if (!deepLinkTicker) return;
+        if (this._sessionIsLive(this.activeRunId)) return;
+        const runId = this.predRunIdFor(deepLinkTicker);
+        if (runId && this.activeRunId !== runId) {
+          this.attachToSession(runId);
+        }
+      });
+
+      this.mountWorkflowDiagram();
 
       this.$watch("form.ticker", () => this.loadChart());
       this.$watch("form.trade_date", () => this.loadChart());
       this.$watch("enabledIndicators", () => this.rebuildCharts());
       this.$watch("activeTab", (v) => {
         if (v === "charts") setTimeout(() => this.rebuildCharts(), 60);
+        // Episodes tab (replaces the old Memory tab): hydrate both the
+        // top-k retrieval inspector and the full-store table on open.
+        if (v === "episodes") {
+          this.loadMemoryRetrieval();
+          this.loadCalibration();
+        }
+        if (v === "training") {
+          this.loadStrategyBoard();
+        }
         // Re-fit the workflow diagram whenever the user returns to its
         // tab. The container's clientWidth is 0 while x-show hides it, so
         // any fit() call (window resize, ResizeObserver, etc.) during a
@@ -362,8 +623,12 @@ function tradingCrewApp() {
         }
       });
       this.$watch("form.tools_enabled", () => {
-        this.diagram.setActiveTools(this.form.tools_enabled);
+        if (this.diagram) this.diagram.setActiveTools(this.form.tools_enabled);
       }, { deep: true });
+      this.$watch("form.run_mode", () => {
+        if (this.assetClass !== "stock") return;
+        this.mountWorkflowDiagram();
+      });
 
       // Glossary highlighter — re-annotate the Reports tab whenever the
       // analyst outputs or the final PM rationale change.  Wrapped in
@@ -379,10 +644,20 @@ function tradingCrewApp() {
       this.$watch("reports", annotate, { deep: true });
       this.$watch("reportsByRound", annotate, { deep: true });
       this.$watch("decisionPayload", annotate);
-      this.$watch("activeTab", (v) => { if (v === "reports") annotate(); });
+      this.$watch("activeTab", (v) => {
+        if (v === "workflow") annotate();
+        if (v === "reports") this.hydrateAllReports();
+      });
+      this.$watch("selectedNode", (id) => {
+        if (id && id !== "decision") this.hydrateRoleReports(id);
+      });
 
-      this.loadChart();
-      this.loadRecentRuns();
+      // Charts are a stock/commodity view; the sidebar "Recent runs" panel only
+      // exists on the high-level/commodity layouts.  Skip both on the focused
+      // per-stock page's first paint (the chart still lazy-loads when its tab
+      // opens via the form.ticker watcher) so /run/{ticker} boots fast.
+      if (this.focusPage || this.assetClass === "commodity") this.loadChart();
+      if (!this.focusPage) this.loadRecentRuns();
 
       // Session manager bootstrap — grab the list of live/recent
       // background runs and re-attach to whichever one the tab was
@@ -391,18 +666,31 @@ function tradingCrewApp() {
       const savedActive = (typeof localStorage !== "undefined"
         ? localStorage.getItem("tc.activeRunId")
         : null);
-      if (savedActive && this.sessions.some((s) => s.run_id === savedActive)) {
+      if (deepLinkTicker) {
+        const live = this.liveSessionForTicker(deepLinkTicker);
+        const saved = savedActive
+          ? this.sessions.find((s) => s.run_id === savedActive)
+          : null;
+        const savedMatches = saved
+          && String(saved.ticker || "").toUpperCase() === deepLinkTicker;
+        const attachId = (savedMatches && this._sessionIsLive(savedActive))
+          ? savedActive
+          : (live && live.run_id);
+        if (attachId) {
+          this.attachToSession(attachId);
+        } else {
+          this._hydrateStoredRun(deepLinkTicker, this.predHistDate || dateParam || "");
+        }
+      } else if (savedActive && this.sessions.some((s) => s.run_id === savedActive)) {
         this.attachToSession(savedActive);
       }
       // Poll the sessions list so the sidebar reflects promotion
       // (queued -> running) and completion without a manual refresh.
       // Cheap: single JSON round-trip returning at most ~20 rows.
       this.sessionsPollTimer = setInterval(() => this.refreshSessions(), 3000);
-
-      // Sidebar "Serve a local model" panel is always visible, so hydrate
-      // its state on boot (which model is being served + adapter readiness).
-      this.refreshRlmfServe();
-      this.loadRlmfAdapters();
+      this.clockNow = Date.now();
+      if (this.elapsedTickTimer) clearInterval(this.elapsedTickTimer);
+      this.elapsedTickTimer = setInterval(() => { this.clockNow = Date.now(); }, 1000);
 
       // First-run guided tour (Phase 1E).  Fires on a fresh browser
       // (`localStorage.tcTourCompleted` unset) after the diagram has
@@ -419,6 +707,31 @@ function tradingCrewApp() {
           window.TcTour.maybeAutoStart(window.TcDashboard.getTab, window.TcDashboard.setTab);
         }
       });
+    },
+
+    /* --------------------------------------------- stored prediction */
+    // Loads the DB-stored batch prediction for a ticker (from /predict tiles).
+    async loadStoredPrediction(ticker, runDate) {
+      try {
+        const qs = runDate ? `?run_date=${encodeURIComponent(runDate)}` : "";
+        const r = await fetch(`/api/predict/prediction/${encodeURIComponent(ticker)}${qs}`);
+        if (!r.ok) return null;
+        const d = await r.json();
+        this.storedPredictionTicker = ticker;
+        this.storedPrediction = d.prediction || null;
+        return this.storedPrediction;
+      } catch (_) {
+        /* no stored prediction is fine — the user can run a fresh one */
+        return null;
+      }
+    },
+    // Replay the stored prediction and, when we have a run_id for that
+    // day, that exact workflow — not latest, which can be a newer date.
+    async _hydrateStoredRun(ticker, runDate) {
+      const pred = await this.loadStoredPrediction(ticker, runDate || "");
+      const runId = pred && pred.run_id;
+      if (runId) await this.loadRun(ticker, runId);
+      else await this.loadLatestRun(ticker);
     },
 
     /* ---------------------------------------------------------- options */
@@ -452,19 +765,8 @@ function tradingCrewApp() {
             || (this.llmPresets[0] && this.llmPresets[0].id)
             || "");
 
-        this.embeddingPresets = res.embedding_presets || [];
-        const persistedEmb = (typeof localStorage !== "undefined"
-          ? localStorage.getItem("tc.embedding_preset")
-          : null);
-        const isValidEmb = persistedEmb
-          && this.embeddingPresets.some((p) => p.id === persistedEmb);
-        this.selectedEmbeddingPreset = isValidEmb
-          ? persistedEmb
-          : (res.default_embedding_preset
-            || (this.embeddingPresets[0] && this.embeddingPresets[0].id)
-            || "");
-
         this.tavily = !!res.tavily_configured;
+        this.reactAgents = res.react_agents || [];
 
         this.form.ticker = res.default_ticker || this.form.ticker;
         this.form.trade_date = res.default_trade_date || this.form.trade_date;
@@ -485,7 +787,10 @@ function tradingCrewApp() {
           this.optionsLoaded = true;
         }
 
-        if (this.diagram) this.diagram.setActiveTools(this.form.tools_enabled);
+        if (this.diagram) {
+          this.diagram.setActiveTools(this.form.tools_enabled);
+          this.diagram.setReactAgents(this.reactAgents);
+        }
       } catch (err) {
         console.error("Failed to load /api/options", err);
         this.optionsError = String(err?.message || err);
@@ -498,7 +803,45 @@ function tradingCrewApp() {
     toggle(id) { this.openSections[id] = !this.openSections[id]; },
     openSection(id) {
       this.openSections[id] = true;
-      if (["dialogue", "tools"].includes(id)) this.advancedOpen = true;
+    },
+
+    /* ---------------------------------------------------------- workflow diagram */
+    diagramLayoutId() {
+      if (this.assetClass === "commodity") return "commodity";
+      if (this.form.run_mode === "deterministic") return "stock_deterministic";
+      if (this.form.run_mode === "harness") return "stock_harness";
+      return "stock";
+    },
+    mountWorkflowDiagram() {
+      const el = document.getElementById("workflow-diagram");
+      if (!el) return;
+      const layoutId = this.diagramLayoutId();
+      if (!this.diagram) {
+        this.diagram = new WorkflowDiagram(el, {
+          assetClass: this.assetClass,
+          layoutId,
+        });
+        this.diagram.onSelect((id) => (this.selectedNode = id));
+        this.diagram.onScale((s) => { this.diagramScale = s; });
+      } else {
+        this.diagram.setLayout(layoutId);
+      }
+      this.diagram.setActiveTools(this.form.tools_enabled);
+      this.diagram.setReactAgents(this.reactAgents);
+      this.diagramScale = this.diagram.scale;
+      if (this.selectedNode && !this.diagram.nodesById[this.selectedNode]) {
+        this.selectedNode = null;
+      }
+      if (typeof this.diagram.setGraphMeta === "function") {
+        this.diagram.setGraphMeta({
+          runMode: this.form.run_mode,
+          orchestrator: this.assetClass === "commodity" || this.form.run_mode === "deterministic"
+            ? "crewai"
+            : (this.form.run_mode === "harness" ? "harness" : "langgraph"),
+          qualityReview: this.form.quality_review,
+          compliance: this.form.compliance,
+        });
+      }
     },
 
     /* ---------------------------------------------------------- workflow zoom */
@@ -531,25 +874,24 @@ function tradingCrewApp() {
         }
       } catch (_) { /* private mode etc. */ }
     },
-
-    get activeEmbeddingPreset() {
-      return (this.embeddingPresets || [])
-        .find((p) => p.id === this.selectedEmbeddingPreset) || null;
+    get operatorPicksDialogue() {
+      return this.assetClass === "commodity"
+        || (this.form.run_mode || "autonomous") === "deterministic";
     },
-    get embeddingSummary() {
-      const p = this.activeEmbeddingPreset;
-      if (!p) return "(unset)";
-      return p.resolved_model || p.model || p.label;
+    dialogueMeta() {
+      if (!this.operatorPicksDialogue) {
+        return (this.form.run_mode || "autonomous") === "harness"
+          ? "conductor-driven"
+          : "graph-driven";
+      }
+      return `debate ${this.form.max_debate_rounds} · risk ${this.form.max_risk_rounds}`;
     },
-    onEmbeddingPresetChange() {
-      try {
-        if (typeof localStorage !== "undefined") {
-          localStorage.setItem(
-            "tc.embedding_preset",
-            this.selectedEmbeddingPreset || "",
-          );
-        }
-      } catch (_) { /* private mode etc. */ }
+    _dialogueSnapshot() {
+      if (!this.operatorPicksDialogue) return {};
+      return {
+        debate_rounds: this.form.max_debate_rounds,
+        risk_rounds: this.form.max_risk_rounds,
+      };
     },
     get indicatorKeys() { return Object.keys(this.indicatorLabels || {}); },
     get selectedAnalystCount() {
@@ -572,58 +914,6 @@ function tradingCrewApp() {
     },
     totalAvailableTools() {
       return this.toolOwners.reduce((n, a) => n + (a.tools?.length || 0), 0);
-    },
-
-    /* -------------------------------------- memory-LLM call estimation
-     *
-     * When ``form.memory`` is ON, CrewAI's unified Memory runs an LLM
-     * analysis pass for every save and recall — concretely the four
-     * functions in ``crewai/memory/analyze.py``:
-     *
-     *   • analyze_for_save              (per extracted memory)
-     *   • extract_memories_from_content (per task save)
-     *   • analyze_for_consolidation     (when similar memories exist)
-     *   • analyze_query                 (per search_memory tool call)
-     *
-     * The total scales with task count, which itself depends on the
-     * debate / risk rounds chosen in the sidebar.  We compute the
-     * estimate client-side so the user sees the cost before they
-     * launch a run — and so it stays reactive to slider changes.
-     *
-     * Calibration: this matches the ``62 × MemoryLLM disabled`` count
-     * observed when memory was wired to a fail-fast stub on a default
-     * (debate=2, risk=1) NTNX run.  We treat that as the lower bound
-     * for the "real" LLM case and add headroom for consolidation /
-     * recall fan-out on heavier runs.
-     */
-    estimateMemoryLlmCalls() {
-      const isCommodity = this.assetClass === "commodity";
-      // Analyst grid: 4 merged desks (stock) / 6 (commodity), one task each.
-      const numAnalysts = isCommodity ? 6 : 4;
-      const analystTasks = numAnalysts;
-      // Debate: bull + bear per round.
-      const debateTasks = 2 * (this.form.max_debate_rounds || 1);
-      // Sequential mid stages: research mgr + trader (+ optional QR).
-      const midTasks = 2 + (this.form.quality_review ? 1 : 0);
-      // Risk team: 3 personas per round.
-      const riskTasks = 3 * (this.form.max_risk_rounds || 1);
-      // Final stages: portfolio manager (+ optional compliance).
-      const finalTasks = 1 + (this.form.compliance ? 1 : 0);
-      const numTasks = analystTasks + debateTasks + midTasks + riskTasks + finalTasks;
-
-      // Per-task analyze calls: 1 extract + ~2 save (avg 2 extracted
-      // memories) + occasional consolidation = ~3-4 calls.  Plus a
-      // small per-run recall budget (search_memory tool calls from
-      // analysts).
-      const callsPerTask = 3.5;
-      const recallBudget = 12;
-      const count = Math.round(numTasks * callsPerTask + recallBudget);
-
-      // Wall-clock estimate.  Local LLM caps at ~60 req/min — with 8
-      // parallel save workers + the inner 10-worker pool inside
-      // EncodingFlow we can saturate that, so effective rate ≈ 60/min.
-      const minutes = Math.max(0.1, count / 60);
-      return { count, minutes: minutes.toFixed(1), tasks: numTasks };
     },
 
     /* ---------------------------------------------------------- charts */
@@ -675,25 +965,42 @@ function tradingCrewApp() {
       // double-click.
       if (this.starting) return;
       this.starting = true;
+      this.form.trade_date = this.localCalendarDate();
       const f = this.form;
       const payload = {
         asset_class: this.assetClass,
         ticker: (f.ticker || "").trim().toUpperCase(),
-        debate_rounds: f.max_debate_rounds,
-        risk_rounds: f.max_risk_rounds,
-        memory: f.memory,
+        ...this._dialogueSnapshot(),
+        run_mode: f.run_mode || "autonomous",
         quality_review: f.quality_review,
         compliance: f.compliance,
         critic_enabled: f.critic_enabled,
+        fusion_enabled: f.fusion_enabled,
+        fusion_include_crowd: f.fusion_include_crowd,
         tools_enabled: f.tools_enabled,
         book: this.form.book || "paper",
         llm_preset: this.selectedLlmPreset || "",
-        embedding_preset: this.selectedEmbeddingPreset || "",
+        force_rerun: this.assetClass !== "commodity" && !!this.predForceRerun,
       };
       if (!payload.ticker) {
         this.appendLog("error", "client", "Ticker is required.");
         this.starting = false;
         return;
+      }
+
+      // A run configured in Settings opens the focused per-instrument workbench
+      // (Workflow tab + instrument tabs) so the user watches it stream — the
+      // per-stock page (/run/{ticker}) or per-contract page
+      // (/commodity/run/{contract}) depending on asset class.
+      this.stockActive = true;
+      this.settingsPage = false;
+      if (this.activeTab === "prediction" || this.activeTab === "contracts" || this.sidebarMode === "settings") {
+        this.activeTab = "workflow";
+      }
+      if (!this.focusPage) {
+        this.focusPage = true;
+        const base = this.assetClass === "commodity" ? "/commodity/run/" : "/run/";
+        try { window.history.pushState({ ticker: payload.ticker }, "", base + encodeURIComponent(payload.ticker)); } catch (_) {}
       }
 
       try {
@@ -708,8 +1015,26 @@ function tradingCrewApp() {
           return;
         }
         const body = await res.json();
+        if (body.cached) {
+          this.status = "completed";
+          this.isRunning = false;
+          this.appendLog("info", "client",
+            `Using today's cached prediction for ${payload.ticker}`
+            + (body.run_id ? ` (run_id=${String(body.run_id).slice(0, 16)})` : ""));
+          await this.loadStoredPrediction(payload.ticker, body.run_date || "");
+          if (body.run_id) {
+            await this.loadRun(payload.ticker, body.run_id);
+          }
+          this.loadPredUniverse();
+          this.loadPredHistory();
+          this.loadRecentRuns();
+          return;
+        }
         this.appendLog("info", "client",
-          `Queued ${payload.ticker} (run_id=${body.run_id.slice(0, 16)}) debate=${payload.debate_rounds} risk=${payload.risk_rounds}`);
+          `Queued ${payload.ticker} (run_id=${String(body.run_id || "").slice(0, 16)})`
+          + (payload.run_mode === "harness"
+            ? " harness"
+            : ` debate=${payload.debate_rounds} risk=${payload.risk_rounds}`));
         await this.refreshSessions();
         this.attachToSession(body.run_id);
       } catch (err) {
@@ -725,38 +1050,6 @@ function tradingCrewApp() {
       return (this.sessions || []).filter(
         (s) => s.status === "running" || s.status === "queued"
       ).length;
-    },
-
-    // Kaggle-style column summary over the currently-loaded episode rows:
-    // action / regime distributions + realised-return + conviction stats.
-    // (Outcome-status counts come from the backend and cover ALL rows.)
-    get rlmfEpisodeStats() {
-      const eps = (this.rlmfEpisodeData && this.rlmfEpisodeData.episodes) || [];
-      const s = {
-        count: eps.length,
-        actions: {}, regimes: {},
-        resolved: { n: 0, min: null, max: null, sum: 0 },
-        convictionSum: 0, convictionN: 0,
-      };
-      for (const e of eps) {
-        const a = e.action || "—"; s.actions[a] = (s.actions[a] || 0) + 1;
-        const r = e.regime || "—"; s.regimes[r] = (s.regimes[r] || 0) + 1;
-        if (e.conviction_score != null) { s.convictionSum += Number(e.conviction_score); s.convictionN++; }
-        if (e.realised_return != null) {
-          const v = Number(e.realised_return);
-          s.resolved.n++; s.resolved.sum += v;
-          s.resolved.min = s.resolved.min == null ? v : Math.min(s.resolved.min, v);
-          s.resolved.max = s.resolved.max == null ? v : Math.max(s.resolved.max, v);
-        }
-      }
-      s.convictionAvg = s.convictionN ? s.convictionSum / s.convictionN : null;
-      s.resolved.mean = s.resolved.n ? s.resolved.sum / s.resolved.n : null;
-      return s;
-    },
-
-    // Percent formatter used by the episode summary cards.
-    rlmfPct(v) {
-      return v == null ? "—" : (v * 100).toFixed(1) + "%";
     },
 
     // Reset every per-run render field so switching between sessions
@@ -780,9 +1073,17 @@ function tradingCrewApp() {
       this.episodeMeta = null;
       this.reflectionRecords = null;
       this.decisionPayload = null;
+      this.fusionResult = null;
+      this.reportSignals = null;
+      this.priceSignals = null;
+      this.deskBiasBoard = null;
+      this.evidenceBlackboard = null;
+      this.debateScratchpad = null;
       this.nodeActivities = {};
       this.selectedNode = null;
       this.currentNode = "";
+      this.runStartedAt = null;
+      this.runCompletedAt = null;
     },
 
     // Attach the current tab to ``runId``'s live event stream.  Closes
@@ -810,6 +1111,7 @@ function tradingCrewApp() {
       const s = this.sessions.find((x) => x.run_id === runId);
       this.isRunning = s && (s.status === "queued" || s.status === "running");
       this.status = s ? s.status : "running";
+      this.applyRunClock(s && s.started_at, s && s.completed_at);
 
       // Sync the visible ticker / date / asset-class to the session this
       // tab is now attached to.  Without this a page reload (which resets
@@ -838,16 +1140,80 @@ function tradingCrewApp() {
         catch (err) { this.appendLog("error", "parse", String(err)); }
       });
       ws.addEventListener("close", () => {
-        // The server closes only when the session terminates OR the
-        // browser tore the socket down (refresh / navigation).  In
-        // both cases we release the "running" spinner; on refresh the
-        // next init() call will reattach from localStorage.
+        // Ignore a close for a socket we already replaced (reattach)
+        // or for a kickoff that is still running — keep the header
+        // and Run spinner aligned with /api/sessions.
+        if (this.ws !== ws) return;
+        if (this._sessionIsLive(this.activeRunId)) return;
         this.isRunning = false;
         this.currentNode = "";
       });
       ws.addEventListener("error", () => {
         this.appendLog("error", "ws", `WebSocket error on run ${runId}`);
       });
+    },
+
+    // History session row → focused workbench (/run/{ticker} or
+    // /commodity/run/{c}). Hard-navigate so we never stay on /settings
+    // with a pushed /run URL (settingsPage would hide Workflow).
+    openSession(runId) {
+      if (!runId) return;
+      const s = (this.sessions || []).find((x) => x.run_id === runId);
+      const ticker = ((s && s.ticker) || this.form.ticker || "").trim().toUpperCase();
+      if (!ticker) return;
+      const sessionAsset = String((s && s.cfg && s.cfg.asset_class) || this.assetClass || "stock").toLowerCase();
+      try { localStorage.setItem("tc.activeRunId", runId); } catch (_) {}
+      const base = sessionAsset === "commodity" ? "/commodity/run/" : "/run/";
+      const dest = base + encodeURIComponent(ticker);
+      const here = window.location.pathname || "";
+      if (here === dest && this.focusPage && !this.settingsPage) {
+        this.form.ticker = ticker;
+        this.stockActive = true;
+        this.activeTab = "workflow";
+        this.attachToSession(runId);
+        return;
+      }
+      window.location.assign(dest);
+    },
+
+    deskSessions() {
+      const want = this.assetClass === "commodity" ? "commodity" : "stock";
+      return (this.sessions || []).filter((s) => {
+        const ac = String((s.cfg && s.cfg.asset_class) || "").toLowerCase();
+        return ac === want;
+      });
+    },
+
+    liveDeskSessions() {
+      return this.deskSessions().filter(
+        (s) => s.status === "running" || s.status === "queued",
+      );
+    },
+
+    liveSessionForTicker(ticker) {
+      const t = String(ticker || "").toUpperCase();
+      if (!t) return null;
+      const live = (this.sessions || []).filter((s) => (
+        String(s.ticker || "").toUpperCase() === t
+        && (s.status === "running" || s.status === "queued")
+      ));
+      live.sort((a, b) => String(b.started_at || "").localeCompare(String(a.started_at || "")));
+      return live[0] || null;
+    },
+
+    _sessionIsLive(runId) {
+      if (!runId) return false;
+      const s = (this.sessions || []).find((x) => x.run_id === runId);
+      return !!(s && (s.status === "running" || s.status === "queued"));
+    },
+
+    _hydrateBlockedByLive(ticker) {
+      const t = String(ticker || "").toUpperCase();
+      if (this.activeRunId && this._sessionIsLive(this.activeRunId)) {
+        const s = (this.sessions || []).find((x) => x.run_id === this.activeRunId);
+        if (s && String(s.ticker || "").toUpperCase() === t) return true;
+      }
+      return !!this.liveSessionForTicker(t);
     },
 
     async cancelRun() {
@@ -889,6 +1255,7 @@ function tradingCrewApp() {
         // If the active run finished, drop the sticky "running" state.
         if (this.activeRunId) {
           const s = this.sessions.find((x) => x.run_id === this.activeRunId);
+          if (s) this.applyRunClock(s.started_at, s.completed_at);
           if (s && s.status !== "queued" && s.status !== "running") {
             this.isRunning = false;
             this.status = s.status;
@@ -926,6 +1293,35 @@ function tradingCrewApp() {
     // -------------------------------------------------------------------
     // Session-status helpers used by the sidebar template
     // -------------------------------------------------------------------
+    parseRunTs(value) {
+      if (!value) return null;
+      const t = Date.parse(value);
+      return Number.isFinite(t) ? t : null;
+    },
+    applyRunClock(startedAt, completedAt) {
+      if (startedAt) this.runStartedAt = startedAt;
+      if (completedAt) this.runCompletedAt = completedAt;
+    },
+    formatElapsed(ms) {
+      if (ms == null || ms < 0 || !Number.isFinite(ms)) return "—";
+      const s = Math.max(0, Math.round(ms / 1000));
+      if (s < 60) return `${s}s`;
+      const m = Math.floor(s / 60);
+      const rem = s % 60;
+      if (m < 60) return rem ? `${m}m ${rem}s` : `${m}m`;
+      const h = Math.floor(m / 60);
+      return rem ? `${h}h ${m % 60}m ${rem}s` : `${h}h ${m % 60}m`;
+    },
+    get workflowElapsedLabel() {
+      const t0 = this.parseRunTs(this.runStartedAt);
+      if (t0 == null) return "—";
+      const doneAt = this.parseRunTs(this.runCompletedAt);
+      if (doneAt != null) return this.formatElapsed(doneAt - t0);
+      const live = this.isRunning || this.status === "running" || this.status === "queued";
+      if (!live) return "—";
+      return this.formatElapsed(this.clockNow - t0);
+    },
+
     sessionStatusClass(s) {
       switch ((s || "").toLowerCase()) {
         case "running":   return "bg-blue-500/20 text-blue-200";
@@ -949,7 +1345,35 @@ function tradingCrewApp() {
           }
           if (event.trade_date) this.form.trade_date = String(event.trade_date).slice(0, 10);
           this.appendLog("info", "run",
-            `${event.ticker} · ${event.agent_count} agents · ${event.task_count} tasks`);
+            `${event.ticker} · ${event.agent_count} agents · ${event.task_count} tasks`
+            + (event.orchestrator ? ` · ${event.orchestrator}` : "")
+            + (event.run_mode ? ` · ${event.run_mode}` : "")
+            + (event.playbook_action ? ` · ${event.playbook_action}` : ""));
+          if (event.run_mode) this.form.run_mode = event.run_mode;
+          if (!this.runStartedAt) this.runStartedAt = new Date().toISOString();
+          this.runCompletedAt = null;
+          this.mountWorkflowDiagram();
+          if (this.diagram && typeof this.diagram.setGraphMeta === "function") {
+            this.diagram.setGraphMeta({
+              playbookAction: event.playbook_action,
+              skipReports: event.skip_reports,
+              runMode: event.run_mode,
+              orchestrator: event.orchestrator,
+              qualityReview: event.quality_review,
+              compliance: event.compliance,
+            });
+          }
+          return;
+
+        case "graph_edge":
+          if (this.diagram && typeof this.diagram.activateEdge === "function") {
+            this.diagram.activateEdge(event.src, event.dst, event.kind || "activated");
+          }
+          return;
+
+        case "graph_trace":
+          this.appendLog("info", "graph",
+            `${(event.edges || []).length} live edges`);
           return;
 
         case "node_started":
@@ -1018,11 +1442,16 @@ function tradingCrewApp() {
           this.diagram.setToolState(event.node, event.tool, event.call_id, state, (event.output || "").slice(0, 600));
           this.appendLog(event.error ? "error" : "result", event.tool,
             `[${event.node}] result (${event.elapsed_ms || 0}ms)`);
+          const boardTool = event.tool === "lookup_blackboard"
+            || event.tool === "request_evidence"
+            || event.tool === "read_scratchpad"
+            || event.tool === "write_scratchpad";
           this.pushActivity(event.node, {
             label: event.error ? "tool error" : "tool result",
             color: event.error ? "error" : "result",
-            subtitle: `${event.tool} · ${event.elapsed_ms || 0}ms`,
-            body: (event.output || "").slice(0, 4000),
+            subtitle: `${event.tool} · ${event.elapsed_ms || 0}ms · ${(event.output || "").length} chars`,
+            body: event.output || "",
+            markdown: boardTool && !event.error,
           });
           return;
         }
@@ -1032,8 +1461,70 @@ function tradingCrewApp() {
           this.finalDecision = event.decision?.action || "";
           this.diagram.setDecision(this.finalDecision || "DECISION");
           this.appendLog("final", "decision", this.finalDecision || "(no parsed decision)");
-          // Auto-flip to reports tab
-          this.activeTab = "reports";
+          // Reports are folded into the Workflow tab now — stay put so the
+          // decision + report render in place without a tab jump.
+          if (this.stockActive) this.activeTab = "workflow";
+          return;
+
+        case "report_signals":
+          this.reportSignals = {
+            signals: event.signals || [],
+            net_bias: event.net_bias,
+            net_confidence: event.net_confidence,
+            bias_score: event.bias_score,
+          };
+          this.appendLog("info", "signals",
+            `guidance bias=${event.net_bias ?? "n/a"} score=${event.bias_score ?? "n/a"}`);
+          return;
+
+        case "price_signals":
+          this.priceSignals = {
+            signals: event.signals || [],
+            vol_pct: event.vol_pct,
+            ann_vol: event.ann_vol,
+            atr_pct: event.atr_pct,
+            pos_in_range: event.pos_in_range,
+            drawdown_from_high: event.drawdown_from_high,
+            regime_age_days: event.regime_age_days,
+            hurst: event.hurst,
+            dip_buy: event.dip_buy,
+            size_risk_mult: event.size_risk_mult,
+            size_note: event.size_note,
+          };
+          this.appendLog("info", "signals",
+            `price structure: vol_pct=${event.vol_pct != null ? Number(event.vol_pct).toFixed(2) : "n/a"} ` +
+            `regime_age=${event.regime_age_days != null ? Math.round(event.regime_age_days) + "d" : "n/a"} ` +
+            `dip_buy=${event.dip_buy ? "YES" : "no"} size×${event.size_risk_mult ?? "1"}`);
+          return;
+
+        case "desk_bias_board":
+          this.deskBiasBoard = event.desks || [];
+          this.appendLog("info", "signals",
+            `desk bias board: ${(event.desks || []).map(d => `${d.desk}=${d.bias}`).join(", ")}`);
+          return;
+
+        case "evidence_blackboard":
+          this.evidenceBlackboard = {
+            ticker: event.ticker,
+            markdown: event.markdown || "",
+            desks: event.desks || [],
+            requests: event.requests || [],
+          };
+          if (this.diagram) this.diagram.setState("Shared State", "running");
+          this.appendLog("info", "signals",
+            `evidence blackboard: ${(event.desks || []).length} desks, `
+            + `${(event.markdown || "").length} chars`);
+          return;
+
+        case "debate_scratchpad":
+          this.debateScratchpad = {
+            ticker: event.ticker,
+            markdown: event.markdown || "",
+            entries: event.entries || [],
+          };
+          this.appendLog("info", "signals",
+            `debate scratch pad: ${(event.entries || []).length} entries, `
+            + `${(event.markdown || "").length} chars`);
           return;
 
         case "cascade_status":
@@ -1074,16 +1565,36 @@ function tradingCrewApp() {
           this.appendLog("info", "memory", `episode ${event.episode_id} (${event.regime})`);
           return;
 
+        case "fusion":
+          // Optional in-run signal fusion — surfaced in the Workflow tab
+          // next to the final decision.  Advisory only.
+          this.fusionResult = event.available
+            ? { available: true, sources: event.sources, fused: event.fused }
+            : { available: false, note: event.note, sources: event.sources };
+          if (event.available && event.fused) {
+            this.appendLog("info", "fusion",
+              `fused=${event.fused.side} conf=${(event.fused.confidence * 100).toFixed(0)}%`);
+          }
+          return;
+
         case "run_completed":
           this.status = "completed";
           this.appendLog("info", "run", "completed");
           this.isRunning = false;
           this.currentNode = "";
+          if (!this.runCompletedAt) this.runCompletedAt = new Date().toISOString();
           // Refresh both the on-disk audit list AND the in-memory
           // session sidebar so the completion badge flips right away
           // without waiting for the 3 s poll tick.
           this.loadRecentRuns();
           this.refreshSessions();
+          if (this.assetClass === "stock") {
+            this.loadPredUniverse();
+            this.loadPredHistory();
+            if (this.form.ticker) {
+              this.loadStoredPrediction(this.form.ticker, this.localCalendarDate());
+            }
+          }
           return;
 
         case "session_started":
@@ -1101,28 +1612,17 @@ function tradingCrewApp() {
           this.appendLog("error", "error", event.message);
           this.isRunning = false;
           this.currentNode = "";
+          if (!this.runCompletedAt) this.runCompletedAt = new Date().toISOString();
           this.refreshSessions();
           return;
       }
     },
 
     /* ---------------------------------------------------------- logs/activity */
-    appendLog(kind, tag, message) {
-      const id = ++this._logSeq;
-      const time = new Date().toTimeString().slice(0, 8);
-      const colorMap = {
-        info: "log-tag-info", node: "log-tag-node", tool: "log-tag-tool",
-        result: "log-tag-result", error: "log-tag-error", llm: "log-tag-llm",
-        report: "log-tag-report", final: "log-tag-final", warn: "log-tag-warn",
-      };
-      this.logs.push({ id, time, tag, color: colorMap[kind] || "log-tag-info", message: String(message) });
-      if (this.activeTab !== "logs") this.pendingLogCount++;
-      this.$nextTick(() => {
-        if (!this.autoScroll || this.userScrolledUp) return;
-        const c = document.getElementById("logs-container");
-        if (c) c.scrollTop = c.scrollHeight;
-      });
-    },
+    // The standalone activity log was removed — the diagram edge colours show
+    // live progress and per-agent output is read by clicking a tile.  Kept as
+    // a no-op so the many existing call sites stay valid without edits.
+    appendLog() { /* logs removed */ },
     onLogsScroll() {
       const c = document.getElementById("logs-container");
       if (!c) return;
@@ -1141,11 +1641,13 @@ function tradingCrewApp() {
       if (node.includes("Researcher")) return "researcher";
       if (node.includes("Risk")) return "risk analyst";
       if (node.includes("Analyst")) return "analyst";
-      if (node === "Trader") return "trader";
+      if (node === "Trader" || node === "Senior Futures Trader") return "trader";
       if (node === "Portfolio Manager") return "portfolio manager";
-      if (node === "Research Manager") return "research manager";
+      if (node === "Research Manager" || node === "Futures Research Manager") return "research manager";
       if (node === "Quality Reviewer") return "quality reviewer";
       if (node === "Compliance Officer") return "compliance officer";
+      if (node === "Playbook Router") return "router";
+      if (node === "Shared State") return "shared state";
       return "node";
     },
     entryBadgeClass(entry) {
@@ -1176,6 +1678,7 @@ function tradingCrewApp() {
         "Market Analyst": "analyst",
         "News Analyst": "analyst",
         "Fundamentals Analyst": "analyst",
+        "Reports Analyst": "analyst",
         "Macro Analyst": "analyst",
         "Bullish Researcher": "bull",
         "Bearish Researcher": "bear",
@@ -1260,7 +1763,66 @@ function tradingCrewApp() {
       const cleaned = this.cleanModelOutput(raw);
       if (!window.marked) return `<pre>${this.escape(cleaned)}</pre>`;
       try { window.marked.setOptions({ breaks: true, gfm: true }); } catch (_) {}
-      return window.marked.parse(cleaned);
+      return this.enhanceHtml(window.marked.parse(cleaned));
+    },
+    // Format a PLAIN-TEXT model field (rationale, bullets, sources) into safe
+    // HTML: escape, turn bare URLs into shortened coloured links, and badge the
+    // inline `[source: …]` provenance tags so they read distinctly from the
+    // reasoning prose.
+    formatText(raw) {
+      if (raw == null || raw === "") return "";
+      const cleaned = this.cleanModelOutput(String(raw));
+      const urlRe = /(https?:\/\/[^\s<>()\[\]]+)/g;
+      let out = "", last = 0, m;
+      while ((m = urlRe.exec(cleaned)) !== null) {
+        out += this.escape(cleaned.slice(last, m.index));
+        out += this._anchor(m[1]);
+        last = m.index + m[1].length;
+      }
+      out += this.escape(cleaned.slice(last));
+      out = this._badgeSourceTags(out);
+      return out.replace(/\n/g, "<br>");
+    },
+    // Post-process rendered markdown: normalise every anchor to a shortened,
+    // coloured, new-tab link and badge any `[source: …]` tags marked.js left
+    // as text.  Shared by renderMarkdown so tile reports match the decision card.
+    enhanceHtml(html) {
+      html = html.replace(/<a\b[^>]*?href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi, (_m, href, inner) => {
+        const plain = inner.replace(/<[^>]+>/g, "").trim();
+        const label = (plain === href || /^https?:\/\/\S+$/.test(plain)) ? this.shortenUrl(href) : plain;
+        return this._anchor(href, label);
+      });
+      return this._badgeSourceTags(html);
+    },
+    _anchor(href, label) {
+      const text = this.escape(label != null ? label : this.shortenUrl(href));
+      const h = this.escapeAttr(href);
+      return `<a href="${h}" target="_blank" rel="noopener" class="src-link" title="${h}">${text}</a>`;
+    },
+    _badgeSourceTags(html) {
+      // Wrap "[source: …]" (may already contain an <a> from linkifying) in a
+      // muted badge.  Negative-lookahead on "]" keeps the match on one tag.
+      return html.replace(/\[source:((?:(?!\]).)*)\]/gi, (m) => `<span class="src-tag">${m}</span>`);
+    },
+    // Compact display label for a link — host (minus www) + a "pdf" hint, so a
+    // 120-char BSE filing URL reads as "bseindia.com · pdf ↗" while the full URL
+    // stays in href + title.  (A local, dependency-free "shortener" — no external
+    // service, no API key, fully reversible on hover/click.)
+    shortenUrl(url) {
+      try {
+        const u = new URL(url);
+        const host = u.hostname.replace(/^www\./, "");
+        const isPdf = /\.pdf(?:$|[?#])/i.test(u.pathname + u.search);
+        return host + (isPdf ? " · pdf" : "") + " ↗";
+      } catch (_) { return url; }
+    },
+    // Source-list entry → display label (shorten if it leads with a URL).
+    sourceLabel(s) {
+      const first = (s || "").split(" ")[0];
+      return /^https?:\/\//.test(first) ? this.shortenUrl(first) : s;
+    },
+    escapeAttr(s) {
+      return (s || "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
     },
     cleanModelOutput(s) {
       if (!s) return "";
@@ -1290,6 +1852,373 @@ function tradingCrewApp() {
         console.error("loadMemoryRetrieval failed", err);
         this.retrievedEpisodes = [];
         this.memoryMeta = null;
+      }
+    },
+
+    async loadStrategyBoard() {
+      try {
+        const book = this.assetClass === "commodity" ? "commodity" : "equity";
+        const res = await fetch(`/api/strategy?book=${book}`).then(r => r.json());
+        this.strategyBoard = res;
+        this.strategyDraft = res.strategy_edit
+          ? JSON.parse(JSON.stringify(res.strategy_edit))
+          : null;
+        const prompts = res.prompts || [];
+        if (prompts.length && !prompts.some(p => p.key === this.promptKey)) {
+          this.promptKey = prompts[0].key;
+        }
+        this.syncPromptDraft();
+        const catalog = (res.knob_catalog || []).filter(k => k.enabled);
+        if (catalog.length && !catalog.some(k => k.id === this.experimentKnob)) {
+          this.experimentKnob = catalog[0].id;
+        }
+        this.strategyError = "";
+        this.promptError = "";
+        this.hermesError = "";
+      } catch (err) {
+        console.error("loadStrategyBoard failed", err);
+        this.strategyBoard = null;
+        this.strategyDraft = null;
+      }
+    },
+
+    syncPromptDraft() {
+      const row = (this.strategyBoard?.prompts || []).find(p => p.key === this.promptKey);
+      this.promptDraft = {
+        goal: row?.goal || "",
+        backstory: row?.backstory || "",
+      };
+    },
+
+    _hermesBook() {
+      return this.assetClass === "commodity" ? "commodity" : "equity";
+    },
+
+    _settingsUrl() {
+      return this._hermesBook() === "commodity" ? "/settings?book=commodity" : "/settings";
+    },
+
+    _dashboardUrl() {
+      return this.assetClass === "commodity" ? "/commodity" : "/stocks";
+    },
+
+    _apiDetail(body) {
+      if (!body) return "";
+      if (typeof body.detail === "string") return body.detail;
+      if (body.detail != null) return JSON.stringify(body.detail);
+      return "";
+    },
+
+    async setAssetClass(next) {
+      if (this.assetClass === next) return;
+      this.assetClass = next;
+      await this.loadOptions();
+      this._initBulkCfg();
+      if (this.settingsPage) {
+        try { window.history.pushState({}, "", this._settingsUrl()); } catch (_) {}
+        await this.loadSettingsPage();
+      } else {
+        this._hydrateBulkFromServer();
+      }
+    },
+
+    openSettingsPage() {
+      this.sidebarMode = "settings";
+      if (this.settingsPage) return;
+      this.settingsPage = true;
+      this.focusPage = false;
+      try { window.history.pushState({}, "", this._settingsUrl()); } catch (_) {}
+      this.loadSettingsPage();
+    },
+
+    leaveSettingsPage() {
+      window.location.assign(this._dashboardUrl());
+    },
+
+    goToHomepage() {
+      window.location.assign("/");
+    },
+
+    commodityDeskRuns() {
+      const allowed = new Set(
+        (this.tickers || []).map((t) => String(t.symbol || "").toUpperCase()).filter(Boolean),
+      );
+      return (this.recentRuns || []).filter((r) => allowed.has(String(r.ticker || "").toUpperCase()));
+    },
+
+    _applyBulkToForm(c) {
+      if (!c || typeof c !== "object") return;
+      if ("debate_rounds" in c) this.form.max_debate_rounds = c.debate_rounds;
+      if ("risk_rounds" in c) this.form.max_risk_rounds = c.risk_rounds;
+      if ("run_mode" in c) this.form.run_mode = c.run_mode;
+      if ("quality_review" in c) this.form.quality_review = c.quality_review;
+      if ("compliance" in c) this.form.compliance = c.compliance;
+      if ("critic_enabled" in c) this.form.critic_enabled = c.critic_enabled;
+      if ("fusion_enabled" in c) this.form.fusion_enabled = c.fusion_enabled;
+      if ("fusion_include_crowd" in c) this.form.fusion_include_crowd = c.fusion_include_crowd;
+      if ("tools_enabled" in c) this.form.tools_enabled = c.tools_enabled;
+      if ("book" in c) this.form.book = c.book;
+      if ("llm_preset" in c && c.llm_preset) this.selectedLlmPreset = c.llm_preset;
+    },
+
+    _applySettingsPayload(body) {
+      this.strategyDraft = body.strategy ? JSON.parse(JSON.stringify(body.strategy)) : null;
+      this.settingsPromptBlock = body.prompt_block || "";
+      this.settingsSource = body.strategy_source || "";
+      this.settingsLivePath = body.live_path || "";
+      this.settingsPackagedPath = body.packaged_path || "";
+      this.strategyBoard = {
+        ...(this.strategyBoard || {}),
+        prompts: body.prompts || [],
+        prompt_block: body.prompt_block,
+        strategy_source: body.strategy_source,
+        knob_catalog: body.knob_catalog || [],
+      };
+      if ((body.prompts || []).length && !body.prompts.some(p => p.key === this.promptKey)) {
+        this.promptKey = body.prompts[0].key;
+      }
+      this.syncPromptDraft();
+      if (body.bulk && typeof body.bulk === "object") {
+        this.bulkCfg = body.bulk;
+        this.bulkCfgSaved = true;
+        this._applyBulkToForm(body.bulk);
+        try { localStorage.setItem(this._bulkCfgStorageKey(), JSON.stringify(body.bulk)); } catch (_) {}
+      }
+    },
+
+    async loadSettingsPage() {
+      this.settingsError = "";
+      try {
+        const res = await fetch(`/api/settings?book=${this._hermesBook()}`);
+        const body = await res.json();
+        if (!res.ok) throw new Error(this._apiDetail(body) || res.statusText);
+        this._applySettingsPayload(body);
+      } catch (err) {
+        this.settingsError = String(err.message || err);
+        this.strategyDraft = null;
+      }
+    },
+
+    async _hydrateBulkFromServer() {
+      try {
+        const res = await fetch(`/api/settings?book=${this._hermesBook()}`);
+        const body = await res.json();
+        if (!res.ok) return;
+        if (body.bulk && typeof body.bulk === "object") {
+          this.bulkCfg = body.bulk;
+          this.bulkCfgSaved = true;
+          this._applyBulkToForm(body.bulk);
+          try { localStorage.setItem(this._bulkCfgStorageKey(), JSON.stringify(body.bulk)); } catch (_) {}
+        }
+      } catch (_) { /* keep local snapshot */ }
+    },
+
+    async saveAllSettings() {
+      if (!this.strategyDraft) return;
+      this.settingsSaving = true;
+      this.settingsError = "";
+      try {
+        const payload = {
+          strategy: this.strategyDraft,
+          bulk: this._bulkCfgFromForm(),
+        };
+        if ((this.promptDraft.goal || "").trim() && (this.promptDraft.backstory || "").trim()) {
+          payload.prompts = [{
+            key: this.promptKey,
+            goal: this.promptDraft.goal,
+            backstory: this.promptDraft.backstory,
+          }];
+        }
+        const res = await fetch(`/api/settings?book=${this._hermesBook()}`, {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const body = await res.json();
+        if (!res.ok) throw new Error(this._apiDetail(body) || res.statusText);
+        this._applySettingsPayload(body);
+        this.bulkCfg = body.bulk || payload.bulk;
+        this.bulkCfgSaved = true;
+        try { localStorage.setItem(this._bulkCfgStorageKey(), JSON.stringify(this.bulkCfg)); } catch (_) {}
+      } catch (err) {
+        this.settingsError = String(err.message || err);
+      } finally {
+        this.settingsSaving = false;
+      }
+    },
+
+    async revertStrategyFromSettings() {
+      if (!window.confirm("Revert to the packaged desk_strategy.yaml? Live edits will be deleted.")) return;
+      this.settingsSaving = true;
+      this.settingsError = "";
+      try {
+        const res = await fetch(`/api/settings?book=${this._hermesBook()}`, {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ revert_strategy: true }),
+        });
+        const body = await res.json();
+        if (!res.ok) throw new Error(this._apiDetail(body) || res.statusText);
+        this._applySettingsPayload(body);
+      } catch (err) {
+        this.settingsError = String(err.message || err);
+      } finally {
+        this.settingsSaving = false;
+      }
+    },
+
+    async unsetPromptFromSettings() {
+      this.settingsSaving = true;
+      this.settingsError = "";
+      try {
+        const res = await fetch(`/api/settings?book=${this._hermesBook()}`, {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ unset_prompts: [this.promptKey] }),
+        });
+        const body = await res.json();
+        if (!res.ok) throw new Error(this._apiDetail(body) || res.statusText);
+        this._applySettingsPayload(body);
+      } catch (err) {
+        this.settingsError = String(err.message || err);
+      } finally {
+        this.settingsSaving = false;
+      }
+    },
+
+    async saveStrategyDraft() {
+      if (!this.strategyDraft) return;
+      this.strategySaving = true;
+      this.strategyError = "";
+      try {
+        const res = await fetch(`/api/strategy?book=${this._hermesBook()}`, {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(this.strategyDraft),
+        });
+        const body = await res.json();
+        if (!res.ok) throw new Error(body.detail || res.statusText);
+        this.strategyBoard = body;
+        this.strategyDraft = body.strategy_edit
+          ? JSON.parse(JSON.stringify(body.strategy_edit))
+          : this.strategyDraft;
+      } catch (err) {
+        this.strategyError = String(err.message || err);
+      } finally {
+        this.strategySaving = false;
+      }
+    },
+
+    async revertStrategyDraft() {
+      if (!window.confirm("Revert to the packaged desk_strategy.yaml? Live edits will be deleted.")) return;
+      this.strategySaving = true;
+      this.strategyError = "";
+      try {
+        const res = await fetch(`/api/strategy/revert?book=${this._hermesBook()}`, { method: "POST" });
+        const body = await res.json();
+        if (!res.ok) throw new Error(body.detail || res.statusText);
+        this.strategyBoard = body;
+        this.strategyDraft = body.strategy_edit
+          ? JSON.parse(JSON.stringify(body.strategy_edit))
+          : null;
+      } catch (err) {
+        this.strategyError = String(err.message || err);
+      } finally {
+        this.strategySaving = false;
+      }
+    },
+
+    async savePromptDraft() {
+      this.promptSaving = true;
+      this.promptError = "";
+      try {
+        const res = await fetch(`/api/strategy/prompts?book=${this._hermesBook()}`, {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            key: this.promptKey,
+            goal: this.promptDraft.goal,
+            backstory: this.promptDraft.backstory,
+          }),
+        });
+        const body = await res.json();
+        if (!res.ok) throw new Error(body.detail || res.statusText);
+        await this.loadStrategyBoard();
+      } catch (err) {
+        this.promptError = String(err.message || err);
+      } finally {
+        this.promptSaving = false;
+      }
+    },
+
+    async revertPromptDraft() {
+      this.promptSaving = true;
+      this.promptError = "";
+      try {
+        const res = await fetch(
+          `/api/strategy/prompts/${encodeURIComponent(this.promptKey)}?book=${this._hermesBook()}`,
+          { method: "DELETE" },
+        );
+        const body = await res.json();
+        if (!res.ok) throw new Error(body.detail || res.statusText);
+        await this.loadStrategyBoard();
+      } catch (err) {
+        this.promptError = String(err.message || err);
+      } finally {
+        this.promptSaving = false;
+      }
+    },
+
+    async hermesExperiment(action) {
+      this.hermesBusy = true;
+      this.hermesError = "";
+      try {
+        const payload = { action };
+        if (action === "open") payload.knob = this.experimentKnob;
+        const res = await fetch(`/api/strategy/experiment?book=${this._hermesBook()}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const body = await res.json();
+        if (!res.ok) throw new Error(body.detail || res.statusText);
+        this.strategyBoard = body;
+        if (body.strategy_edit) {
+          this.strategyDraft = JSON.parse(JSON.stringify(body.strategy_edit));
+        }
+      } catch (err) {
+        this.hermesError = String(err.message || err);
+      } finally {
+        this.hermesBusy = false;
+      }
+    },
+
+    addStrategyRule(section) {
+      if (!this.strategyDraft?.rules?.[section]) return;
+      this.strategyDraft.rules[section].push("");
+    },
+
+    removeStrategyRule(section, idx) {
+      if (!this.strategyDraft?.rules?.[section]) return;
+      this.strategyDraft.rules[section].splice(idx, 1);
+    },
+
+    /* ------------------------------------------- L2: conviction calibration */
+    async loadCalibration() {
+      try {
+        const q = new URLSearchParams({
+          basis: this.calibrationBasis || "return",
+          cohort: this.calibrationCohort || "current",
+        });
+        if (this.calibrationTickerOnly) {
+          const ticker = (this.form.ticker || "").trim().toUpperCase();
+          if (ticker) q.set("ticker", ticker);
+        }
+        const res = await fetch(`/api/calibration?${q}`).then(r => r.json());
+        this.calibration = res;
+      } catch (err) {
+        console.error("loadCalibration failed", err);
+        this.calibration = null;
       }
     },
 
@@ -1331,26 +2260,14 @@ function tradingCrewApp() {
         // Refresh retrieval so newly-resolved episodes immediately appear
         // in the top-k list with their fresh reflections.
         await this.loadMemoryRetrieval();
+        // Resolving is exactly what feeds calibration, so refresh it too.
+        await this.loadCalibration();
+        await this.loadStrategyBoard();
       } catch (err) {
         console.error("resolveOutcomes failed", err);
         this.resolveResult = { error: String(err), count: 0, by_status: {}, records: [] };
       } finally {
         this.resolveLoading = false;
-      }
-    },
-
-    /* ---------------------------------------------------------- M7 portfolio */
-    async loadPortfolio() {
-      try {
-        const q = new URLSearchParams({
-          method: this.allocatorMethod || "HRP",
-          book: this.form.book || "paper",
-        });
-        const res = await fetch(`/api/portfolio?${q}`).then(r => r.json());
-        this.portfolio = res;
-      } catch (err) {
-        console.error("loadPortfolio failed", err);
-        this.portfolio = null;
       }
     },
 
@@ -1393,13 +2310,34 @@ function tradingCrewApp() {
         this.clearingRecentRuns = false;
       }
     },
+    // Repaint the Workflow diagram + reports from the most recent stored
+    // run for ``ticker`` (used when a prediction tile is opened for a
+    // name that isn't currently live-streaming).  Silently no-ops when
+    // the ticker has no persisted run yet, leaving a clean empty diagram.
+    async loadLatestRun(ticker) {
+      try {
+        if (this._hydrateBlockedByLive(ticker)) return;
+        const res = await fetch(`/api/runs/${encodeURIComponent(ticker)}/latest`);
+        if (!res.ok) return;
+        const record = await res.json();
+        if (!record || record.error || !record.run_id) return;
+        // Ignore if the user has since switched to a different name.
+        if (this.form.ticker && this.form.ticker.toUpperCase() !== ticker.toUpperCase()) return;
+        if (this._hydrateBlockedByLive(ticker)) return;
+        await this.loadRun(ticker, record.run_id);
+      } catch (_) {
+        /* no stored run is fine */
+      }
+    },
     async loadRun(ticker, runId) {
       try {
+        if (this._hydrateBlockedByLive(ticker)) return;
         const res = await fetch(`/api/runs/${encodeURIComponent(ticker)}/${encodeURIComponent(runId)}`).then(r => r.json());
         if (res.error) {
           console.warn("loadRun error:", res.error);
           return;
         }
+        if (this._hydrateBlockedByLive(ticker)) return;
         this.loadedRunId = runId;
         // Lock the header + Charts (and every other ticker-scoped tab:
         // Memory, Backtest, Portfolio, Futures) to the run being viewed.
@@ -1424,7 +2362,19 @@ function tradingCrewApp() {
         this.reflectionRecords = res.reflection_records || null;
         this.decisionPayload = res.final_decision || null;
         this.finalDecision = res.final_decision?.action || "";
-        // Repaint the per-agent reports (Workflow tab + Reports tab).
+        this.fusionResult = null;
+        this.reportSignals = res.report_signals || null;
+        this.priceSignals = res.price_signals || null;
+        this.deskBiasBoard = res.desk_bias_board || null;
+        this.evidenceBlackboard = res.evidence_blackboard || null;
+        this.debateScratchpad = res.debate_scratchpad || null;
+        // Reflect the persisted terminal status so the header/badges match
+        // reality post-completion (not the default "running").
+        this.status = res.status || "completed";
+        this.isRunning = false;
+        this.currentNode = "";
+        this.applyRunClock(res.started_at, res.completed_at);
+        // Repaint the per-agent reports (rendered inside the Workflow tab).
         this.reports = { ...(res.reports || {}) };
         // ``reports_by_round`` is the new per-round source of truth for
         // the Reports tab.  Old run records pre-date the field, so fall
@@ -1441,13 +2391,48 @@ function tradingCrewApp() {
             ])
           );
         }
-        // Rehydrate the degraded-roles set so the Reports tab badges
-        // and the diagram colouring match the persisted state of the
-        // run (the saved record carries one entry per analyst whose
-        // final answer was substituted with the OSS-LLM placeholder).
+        // Rebuild the per-node activity map from the persisted per-round
+        // reports so clicking an agent tile shows THAT agent's output after
+        // completion — the same tile-specific view the live run shows (tool
+        // calls / intermediate steps aren't persisted, so post-run the tile
+        // shows the agent's final report(s), which is the output users want).
+        const rebuilt = {};
+        for (const [role, rounds] of Object.entries(this.reportsByRound)) {
+          rebuilt[role] = (rounds || []).map((r, i) => {
+            const rl = (r.total_rounds > 1) ? ` · round ${r.round}/${r.total_rounds}` : "";
+            const chars = (r.output || "").length;
+            return {
+              key: `${role}-report-${i}`,
+              label: r.degraded ? `report (degraded)${rl}` : `report${rl}`,
+              color: r.degraded ? "warn" : "llm",
+              subtitle: chars ? `${chars} chars` : (r.has_body ? "loading…" : "0 chars"),
+              body: r.output || "",
+              has_body: !!r.has_body,
+              markdown: true,
+            };
+          });
+        }
+        this.nodeActivities = rebuilt;
+        this.selectedNode = null;
+        // Rehydrate the degraded-roles set so the badges and the diagram
+        // colouring match the persisted state of the run (the saved record
+        // carries one entry per analyst whose final answer was substituted
+        // with the OSS-LLM placeholder).
         this.degradedRoles = Object.fromEntries(
           (res.degraded_roles || []).map((role) => [role, true])
         );
+        if (res.config?.run_mode) this.form.run_mode = res.config.run_mode;
+        this.mountWorkflowDiagram();
+        if (this.diagram && typeof this.diagram.setGraphMeta === "function") {
+          this.diagram.setGraphMeta({
+            playbookAction: res.config?.playbook_action,
+            skipReports: res.config?.skip_reports,
+            runMode: res.config?.run_mode,
+            orchestrator: res.config?.orchestrator,
+            qualityReview: res.config?.quality_review,
+            compliance: res.config?.compliance,
+          });
+        }
         if (this.diagram && res.expected_role_order) {
           res.expected_role_order.forEach(role => {
             try {
@@ -1468,6 +2453,74 @@ function tradingCrewApp() {
         }
       } catch (err) {
         console.error("loadRun failed", err);
+      }
+    },
+    _roleNeedsHydrate(role) {
+      const rounds = (this.reportsByRound || {})[role] || [];
+      return rounds.some((r) => r && r.has_body && !r.output);
+    },
+    _applyRoleReports(role, rounds) {
+      if (!role || !Array.isArray(rounds) || !rounds.length) return;
+      this.reportsByRound = { ...this.reportsByRound, [role]: rounds };
+      const last = rounds[rounds.length - 1] || {};
+      this.reports = { ...this.reports, [role]: last.output || "" };
+      this.nodeActivities = {
+        ...this.nodeActivities,
+        [role]: rounds.map((r, i) => {
+          const rl = (r.total_rounds > 1) ? ` · round ${r.round}/${r.total_rounds}` : "";
+          return {
+            key: `${role}-report-${i}`,
+            label: r.degraded ? `report (degraded)${rl}` : `report${rl}`,
+            color: r.degraded ? "warn" : "llm",
+            subtitle: `${(r.output || "").length} chars`,
+            body: r.output || "",
+            markdown: true,
+          };
+        }),
+      };
+    },
+    async hydrateRoleReports(role) {
+      const ticker = this.form.ticker;
+      const runId = this.loadedRunId;
+      if (!ticker || !runId || !role || role === "decision") return;
+      if (!this._roleNeedsHydrate(role)) return;
+      this._hydratingRoles = this._hydratingRoles || {};
+      if (this._hydratingRoles[role]) return;
+      this._hydratingRoles[role] = true;
+      try {
+        const url = `/api/runs/${encodeURIComponent(ticker)}/${encodeURIComponent(runId)}/reports?role=${encodeURIComponent(role)}`;
+        const res = await fetch(url);
+        if (!res.ok) return;
+        const data = await res.json();
+        const rounds = (data.reports_by_round && data.reports_by_round[role]) || [];
+        this._applyRoleReports(role, rounds);
+      } catch (err) {
+        console.error("hydrateRoleReports failed", err);
+      } finally {
+        delete this._hydratingRoles[role];
+      }
+    },
+    async hydrateAllReports() {
+      const ticker = this.form.ticker;
+      const runId = this.loadedRunId;
+      if (!ticker || !runId) return;
+      const needed = Object.keys(this.reportsByRound || {}).filter((role) => this._roleNeedsHydrate(role));
+      if (!needed.length) return;
+      this._hydratingRoles = this._hydratingRoles || {};
+      if (this._hydratingRoles["*"]) return;
+      this._hydratingRoles["*"] = true;
+      try {
+        const url = `/api/runs/${encodeURIComponent(ticker)}/${encodeURIComponent(runId)}/reports`;
+        const res = await fetch(url);
+        if (!res.ok) return;
+        const data = await res.json();
+        for (const [role, rounds] of Object.entries(data.reports_by_round || {})) {
+          this._applyRoleReports(role, rounds || []);
+        }
+      } catch (err) {
+        console.error("hydrateAllReports failed", err);
+      } finally {
+        delete this._hydratingRoles["*"];
       }
     },
 
@@ -1670,13 +2723,23 @@ function tradingCrewApp() {
           sweep_drawdown_kill: String(this.gridSweepDrawdownKill),
           sweep_cost_model: String(this.gridSweepCostModel),
           validation: this.backtestValidation || "walk_forward",
+          cpcv_groups: String(this.cpcvGroups || 6),
+          cpcv_k: String(this.cpcvK || 2),
+          optimizer: this.backtestOptimizer || "grid",
+          swarm_size: String(this.swarmSize || 12),
+          swarm_iterations: String(this.swarmIterations || 8),
+          swarm_seed: String(this.swarmSeed || 0),
+          consensus: String(this.gridConsensus),
+          consensus_top_k: String(this.consensusTopK || 5),
           train_size: String(this.backtestConfig.train_size),
           embargo_size: String(this.backtestConfig.embargo_size),
           test_size: String(this.backtestConfig.test_size),
           lookback_years: String(this.backtestLookbackYears || 5),
+          apply: String(this.applyTune),
         });
         const res = await fetch(`/api/grid_search?${q}`, { method: "POST" }).then(r => r.json());
         this.gridSearchResult = res;
+        this.$nextTick(() => this.renderSwarmHistoryChart());
       } catch (err) {
         console.error("runGridSearch failed", err);
         this.gridSearchResult = { error: String(err) };
@@ -1815,6 +2878,678 @@ function tradingCrewApp() {
       }, 2000);
     },
 
+    /* ------------------------- Forward collection (scale) job controls */
+    async initScale() {
+      await this.refreshScaleStatus();
+      this._startScalePolling();
+    },
+    async refreshScaleStatus() {
+      try {
+        const prevActive = this.scaleActive;
+        this.scaleStatus = await fetch("/api/scale/status").then(r => r.json());
+        // Default the universe select to a shipped one if unset.
+        if (!this.scaleForm.universe && this.scaleStatus?.universes?.length) {
+          this.scaleForm.universe = this.scaleStatus.universes[0].name;
+        }
+        // While a batch runs, keep the Prediction tiles' status fresh so they
+        // flip to green as decisions land; refresh once more when it finishes.
+        if (!this.predHistDate && (this.scaleActive || prevActive)) {
+          this.loadPredUniverse();
+          if (prevActive && !this.scaleActive) this.loadPredHistory();
+        }
+        // Refresh the per-backend search counters for this batch's session.
+        this.loadSearchStats(this.scaleStatus?.job_id);
+      } catch (err) {
+        console.error("refreshScaleStatus failed", err);
+      }
+    },
+    // Fetch per-backend web-search counters for a session (batch job_id or a
+    // run_id).  Group-by-session view so backend health is visible in the UI
+    // without grepping logs.
+    async loadSearchStats(traceId) {
+      if (!traceId) { this.searchStats = null; return; }
+      try {
+        const r = await fetch(`/api/search_stats/${encodeURIComponent(traceId)}`);
+        if (!r.ok) return;
+        this.searchStats = await r.json();
+      } catch (err) {
+        console.error("loadSearchStats failed", err);
+      }
+    },
+    get searchBackendRows() {
+      // Nest engine breakdown rows (e.g. "searxng/bing") under their parent
+      // backend ("searxng") so the panel *expands* SearXNG into its engines.
+      const b = (this.searchStats && this.searchStats.backends) || {};
+      let all = Object.entries(b).map(([name, v]) => ({ name, ...v }));
+      // Circular-ring mode records each engine as its own canonical top-level
+      // node ("searxng:bing"). The legacy fan-out breakdown ("searxng/bing"
+      // under a "searxng" parent) is then a redundant duplicate, so drop the
+      // slash rows AND the empty "searxng" parent whenever ring nodes exist.
+      if (all.some((e) => e.name.startsWith("searxng:"))) {
+        all = all.filter((e) => !e.name.includes("/") && e.name !== "searxng");
+      }
+      const tops = all.filter((e) => !e.name.includes("/"))
+                      .sort((a, c) => (c.total || 0) - (a.total || 0));
+      const subs = {};
+      all.filter((e) => e.name.includes("/")).forEach((e) => {
+        const parent = e.name.split("/")[0];
+        (subs[parent] = subs[parent] || []).push({
+          ...e, label: e.name.split("/").slice(1).join("/"), isSub: true,
+        });
+      });
+      Object.values(subs).forEach((l) => l.sort((a, c) => (c.total || 0) - (a.total || 0)));
+      const out = [];
+      const seen = new Set();
+      tops.forEach((t) => {
+        out.push({ ...t, label: t.name, isSub: false });
+        seen.add(t.name);
+        (subs[t.name] || []).forEach((s) => out.push(s));
+      });
+      // Orphan breakdowns whose parent never logged a top-level row.
+      Object.keys(subs).forEach((p) => {
+        if (seen.has(p)) return;
+        out.push({ name: p, label: p, isSub: false, success: 0, empty: 0, throttled: 0, error: 0, total: 0 });
+        subs[p].forEach((s) => out.push(s));
+      });
+      return out;
+    },
+
+    /* ==================================================================== */
+    /* Prediction tab: universe grid, batch controls, search-add, history   */
+    /* ==================================================================== */
+    async loadPredUniverse() {
+      try {
+        // While a batch is active, its predictions persist under the batch's
+        // own `day` (scaleStatus.day), which may differ from "today" if the
+        // batch straddles midnight.  Query that day so the completed count
+        // tracks the current run instead of today's (possibly empty) row.
+        const day = this.scaleActive ? (this.scaleStatus && this.scaleStatus.day) : "";
+        const qs = day ? `?run_date=${encodeURIComponent(day)}` : "";
+        const r = await fetch(`/api/predict/universe${qs}`);
+        if (!r.ok) return;
+        const d = await r.json();
+        this.predUniverse = { markets: { IN: [], US: [], ...(d.markets || {}) } };
+        this.predProgress = d.progress || { total: 0, done: 0, failed: 0 };
+        this.predRunDate = d.run_date || "";
+      } catch (err) {
+        console.error("loadPredUniverse failed", err);
+      }
+    },
+    predToggle(id) { this.predExpanded[id] = !this.predExpanded[id]; },
+    get predMarkets() { return this.predMarket === "all" ? ["IN", "US"] : [this.predMarket]; },
+    get predProgressPct() {
+      const t = this.predProgress.total || 0;
+      return t ? Math.round((100 * (this.predProgress.done || 0)) / t) : 0;
+    },
+    // Tickers currently mid-run in the active batch → their live session run_id.
+    // Sourced from the orchestrator's authoritative active_runs map.
+    get predInflight() {
+      return (this.scaleStatus && this.scaleStatus.active_runs) || {};
+    },
+    // Resolve a ticker to its live batch session run_id (if any).
+    predRunIdFor(ticker) {
+      const m = (this.scaleStatus && this.scaleStatus.active_runs) || {};
+      return m[ticker] || m[(ticker || "").toUpperCase()] || null;
+    },
+    predTileClass(co) {
+      if (co.status === "done") return "tile-done";       // green — completed
+      if (this.predInflight[co.ticker]) return "tile-running"; // orange — ongoing
+      return "";                                            // none — not run
+    },
+    /* ---------- Virtual portfolio ---------- */
+    // ₹10L book for the prediction-run date currently on /stocks/history/{date}.
+    async loadPortfolio() {
+      this.portfolioLoading = true;
+      this.portfolioError = "";
+      try {
+        if (!this.predHistoryDays.length) await this.loadPredHistory();
+        const days = this.predHistoryDays;
+        this.portfolioDate = this.predHistDate || this.portfolioDate
+          || (days[0] && days[0].run_date) || "";
+        if (!this.portfolioDate) { this.portfolio = null; return; }
+        const q = new URLSearchParams({ market: this.portfolioMarket || "all" });
+        const r = await fetch(`/api/portfolio/virtual/${encodeURIComponent(this.portfolioDate)}?${q}`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        this.portfolio = await r.json();
+      } catch (err) {
+        this.portfolioError = "Failed to load portfolio: " + (err.message || err);
+        this.portfolio = null;
+      } finally {
+        this.portfolioLoading = false;
+      }
+    },
+    // Top-right run-date dropdown → sync the left History pane + reload.
+    onPortfolioDateChange() {
+      if (!this.portfolioDate) return;
+      this.activeTab = "portfolio";
+      this.enterRunReview(this.portfolioDate);
+    },
+    // SQL-viewer style: click a header to sort; click again to flip direction.
+    sortPortfolio(key) {
+      const s = this.portfolioSort;
+      if (s.key === key) {
+        s.dir = s.dir === "asc" ? "desc" : "asc";
+      } else {
+        s.key = key;
+        // Text columns default A→Z; numeric columns default high→low.
+        s.dir = (key === "name" || key === "ticker" || key === "action") ? "asc" : "desc";
+      }
+    },
+    sortedHoldings() {
+      if (!this.portfolio || !this.portfolio.holdings) return [];
+      const { key, dir } = this.portfolioSort;
+      const mul = dir === "asc" ? 1 : -1;
+      return [...this.portfolio.holdings].sort((a, b) => {
+        const av = a[key], bv = b[key];
+        if (typeof av === "string" || typeof bv === "string") {
+          return mul * String(av ?? "").localeCompare(String(bv ?? ""));
+        }
+        return mul * ((av ?? 0) - (bv ?? 0));
+      });
+    },
+    sortIndicator(key) {
+      if (this.portfolioSort.key !== key) return "";
+      return this.portfolioSort.dir === "asc" ? " ▲" : " ▼";
+    },
+    // Compact Indian-format currency (₹, lakh/crore aware for big totals).
+    fmtINR(v, decimals = 0) {
+      if (v == null || isNaN(v)) return "—";
+      return "₹" + Number(v).toLocaleString("en-IN", {
+        minimumFractionDigits: decimals, maximumFractionDigits: decimals,
+      });
+    },
+    pctClass(p) {
+      if (p == null) return "text-slate-400";
+      return p > 0 ? "text-emerald-300" : (p < 0 ? "text-red-300" : "text-slate-400");
+    },
+    fmtPct(p) {
+      if (p == null || isNaN(p)) return "—";
+      return (p * 100 >= 0 ? "+" : "") + (p * 100).toFixed(2) + "%";
+    },
+
+    predActionClass(a) {
+      const x = (a || "").toUpperCase();
+      if (x === "STRONG_BUY") return "bg-emerald-500/40 text-emerald-100 ring-1 ring-emerald-400/50";
+      if (x === "BUY") return "bg-emerald-500/20 text-emerald-300";
+      if (x === "SELL") return "bg-red-500/20 text-red-300";
+      if (x === "STRONG_SELL") return "bg-red-500/40 text-red-100 ring-1 ring-red-400/50";
+      if (x === "HOLD") return "bg-slate-500/20 text-slate-300";
+      return "bg-blue-500/20 text-blue-300";
+    },
+    // Canonical (underscore) form so filter comparison is legacy-tolerant
+    // (OVERWEIGHT/UNDERWEIGHT/NEUTRAL -> BUY/SELL/HOLD).
+    _canonAction(a) {
+      let s = String(a == null ? "" : a).toUpperCase();
+      if (s.includes(".")) s = s.split(".").pop();
+      const legacy = { OVERWEIGHT: "BUY", UNDERWEIGHT: "SELL", NEUTRAL: "HOLD" };
+      return legacy[s] || s;
+    },
+    // Total predictions on the day (drives the "All" filter tile count).
+    predActionTotal() {
+      return Object.values(this.predHist.action_counts || {}).reduce((a, b) => a + (b || 0), 0);
+    },
+    // Toggle the action-distribution filter. Passing null (the "All" tile) or
+    // re-clicking the active tile clears it.
+    setPredActionFilter(act) {
+      this.predActionFilter = act && this.predActionFilter !== act ? act : null;
+    },
+    // Sectors for the history grid with the action filter applied: keep only
+    // matching companies and drop sectors that end up empty.
+    predSectorsFiltered() {
+      const sectors = this.predHist.sectors || [];
+      if (!this.predActionFilter) return sectors;
+      const want = this._canonAction(this.predActionFilter);
+      return sectors
+        .map((s) => ({ ...s, companies: (s.companies || []).filter((co) => this._canonAction(co.action) === want) }))
+        .filter((s) => s.companies.length);
+    },
+    predRunNames() {
+      const rows = [];
+      for (const s of this.predSectorsFiltered()) {
+        for (const co of s.companies || []) {
+          rows.push({ ...co, sector: s.sector, market: s.market });
+        }
+      }
+      return rows.sort((a, b) => {
+        const aa = this._canonAction(a.action);
+        const ba = this._canonAction(b.action);
+        return aa.localeCompare(ba) || String(a.ticker || "").localeCompare(String(b.ticker || ""));
+      });
+    },
+    // Group the loaded contract catalog (this.tickers, from /api/options?
+    // asset_class=commodity) by category for the commodity Contracts grid —
+    // the futures analog of the stock Prediction universe.
+    contractGroups() {
+      const order = ["energy", "metals", "grains", "softs", "livestock", "financials", "other"];
+      const groups = {};
+      (this.tickers || []).forEach((t) => {
+        const cat = t.category || "other";
+        (groups[cat] = groups[cat] || []).push({ symbol: t.symbol, name: t.name || t.symbol });
+      });
+      return Object.keys(groups)
+        .sort((a, b) => {
+          const ia = order.indexOf(a), ib = order.indexOf(b);
+          return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib) || a.localeCompare(b);
+        })
+        .map((k) => ({ category: k, items: groups[k] }));
+    },
+    openTile(ticker, runId) {
+      this.form.ticker = ticker;
+      this.stockActive = true;
+      this.activeTab = "workflow";
+      this.storedPredictionTicker = ticker;
+      // Navigate into the focused per-instrument page (drops the left pane +
+      // global tabs).  The URL is pushed at the tail of this method.
+      this.focusPage = true;
+      const isCommodity = this.assetClass === "commodity";
+      const date = isCommodity ? "" : (this.predHistDate || "");
+      // Commodity has no batch forward-collection, so there is never a live
+      // batch session to attach to — predRunIdFor is stock-only.
+      const live = this.liveSessionForTicker(ticker);
+      const liveId = isCommodity ? null : ((live && live.run_id) || this.predRunIdFor(ticker));
+      if (liveId && !date) {
+        // Live batch run for this name → attach to its session so the
+        // Workflow diagram streams node-by-node (same path as a manual run).
+        this.attachToSession(liveId);
+        this.loadStoredPrediction(ticker, "");
+      } else {
+        // Not currently running.  Detach from any live session we were
+        // streaming so its events stop repainting THIS instrument's diagram,
+        // wipe the previous view, then repaint the selected name's stored
+        // run (that day's run_id when reviewing a prediction run).
+        if (this.ws) { try { this.ws.close(); } catch (_) {} this.ws = null; }
+        this.activeRunId = null;
+        this.isRunning = false;
+        this.resetRunState();
+        if (!isCommodity) {
+          if (runId) {
+            this.loadStoredPrediction(ticker, date);
+            this.loadRun(ticker, runId);
+          } else {
+            this._hydrateStoredRun(ticker, date);
+          }
+        } else {
+          this.loadLatestRun(ticker);
+        }
+        if (typeof this.loadChart === "function") this.loadChart();
+      }
+      const base = isCommodity ? "/commodity/run/" : "/run/";
+      const q = date ? ("?date=" + encodeURIComponent(date)) : "";
+      try { window.history.pushState({}, "", base + encodeURIComponent(ticker) + q); } catch (_) {}
+    },
+    backToUniverse() {
+      this.stockActive = false;
+      this.activeTab = "prediction";
+      try { window.history.pushState({}, "", "/stocks"); } catch (_) {}
+    },
+    // Back on the focused workbench.  A dated /run/{ticker}?date= return
+    // lands on that prediction run (Names); otherwise /stocks or /commodity.
+    backToHome() {
+      this.focusPage = false;
+      this.stockActive = false;
+      if (this.assetClass === "commodity") {
+        this.activeTab = "contracts";
+        try { window.history.pushState({}, "", "/commodity"); } catch (_) {}
+        return;
+      }
+      if (this.predHistDate) {
+        this.enterRunReview(this.predHistDate);
+        return;
+      }
+      this.activeTab = "prediction";
+      try { window.history.pushState({}, "", "/stocks"); } catch (_) {}
+      if (!this.predHistoryDays.length) this.loadPredHistory();
+      const uni = this.predUniverse && this.predUniverse.markets;
+      if (!uni || (!(uni.IN || []).length && !(uni.US || []).length)) {
+        this.loadPredUniverse();
+        this.predEnrichLoop();
+      }
+    },
+
+    /* ----- background metadata enrichment (names + hover links) ----- */
+    async predEnrichLoop() {
+      if (this._predEnrichRunning) return;
+      this._predEnrichRunning = true;
+      try {
+        for (let i = 0; i < 25; i++) {
+          const r = await fetch("/api/predict/enrich?limit=20", { method: "POST" });
+          if (!r.ok) break;
+          const d = await r.json();
+          if (d.enriched > 0) await this.loadPredUniverse();
+          if (!d.remaining) break;
+        }
+      } catch (_) { /* best-effort */ } finally {
+        this._predEnrichRunning = false;
+      }
+    },
+
+    /* ----- search / add / remove ----- */
+    async predDoSearch() {
+      const q = (this.predSearch.q || "").trim();
+      if (q.length < 2) { this.predSearch.results = []; return; }
+      this.predSearch.loading = true;
+      try {
+        const url = `/api/predict/search?q=${encodeURIComponent(q)}&market=${this.predSearch.market}`;
+        const d = await fetch(url).then((r) => r.json());
+        this.predSearch.results = d.results || [];
+        this.predSearch.open = true;
+      } catch (err) {
+        this.predError = "Search failed: " + (err.message || err);
+      } finally {
+        this.predSearch.loading = false;
+      }
+    },
+    async predAddCompany(r) {
+      this.predSearch.adding = r.symbol;
+      try {
+        const resp = await fetch("/api/predict/company", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ticker: r.symbol, name: r.name, market: r.market }),
+        });
+        if (!resp.ok) { const e = await resp.json().catch(() => ({})); throw new Error(e.detail || resp.status); }
+        this.predSearch.q = ""; this.predSearch.results = []; this.predSearch.open = false;
+        await this.loadPredUniverse();
+      } catch (err) {
+        this.predError = "Could not add " + r.symbol + ": " + (err.message || err);
+      } finally {
+        this.predSearch.adding = "";
+      }
+    },
+    async predRemove(co) {
+      if (!window.confirm(`Remove ${co.name} (${co.ticker}) from the universe?`)) return;
+      try {
+        const r = await fetch("/api/predict/company/" + encodeURIComponent(co.ticker), { method: "DELETE" });
+        if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.detail || r.status); }
+        await this.loadPredUniverse();
+      } catch (err) {
+        this.predError = "Could not remove " + co.ticker + ": " + (err.message || err);
+      }
+    },
+
+    /* ----- bulk/scale config snapshot (reuse Settings, save before run) ----- */
+    _bulkCfgFromForm() {
+      // Mirrors the interactive Run Analysis payload (minus ticker / date).
+      // Autonomous stock omits debate/risk — graph + Hermes own those loops.
+      const f = this.form;
+      return {
+        ...this._dialogueSnapshot(),
+        run_mode: f.run_mode || "autonomous",
+        quality_review: f.quality_review,
+        compliance: f.compliance,
+        critic_enabled: f.critic_enabled,
+        fusion_enabled: f.fusion_enabled,
+        fusion_include_crowd: f.fusion_include_crowd,
+        tools_enabled: f.tools_enabled || {},
+        book: f.book || "paper",
+        llm_preset: this.selectedLlmPreset || "",
+      };
+    },
+    _bulkCfgStorageKey() {
+      return "tc.bulk_cfg." + (this.assetClass || "stock");
+    },
+    _initScaleWorkers() {
+      // Keep the forward-collection worker count stable across server restarts
+      // so a fresh run doesn't silently fall back to the hardcoded default and
+      // overwhelm the local LLM server (e.g. previously 2 workers -> restart ->
+      // back to 5/6).  Restored into both the Prediction-tile batch (predWorkers)
+      // and the scale/bulk form (scaleForm.workers).
+      const clamp = (n) => Math.max(1, Math.min(24, parseInt(n, 10) || -1));
+      try {
+        const pw = localStorage.getItem("tc.predWorkers");
+        if (pw !== null) {
+          const n = clamp(pw);
+          if (n >= 1) this.predWorkers = n;
+        }
+        const sw = localStorage.getItem("tc.scaleWorkers");
+        if (sw !== null) {
+          const n = clamp(sw);
+          if (n >= 1) this.scaleForm.workers = n;
+        }
+      } catch (_) { /* private mode etc. */ }
+    },
+    _persistScaleWorkers() {
+      try {
+        localStorage.setItem("tc.predWorkers", String(this.predWorkers));
+        localStorage.setItem("tc.scaleWorkers", String(this.scaleForm.workers));
+      } catch (_) { /* private mode etc. */ }
+    },
+    _initBulkCfg() {
+      let saved = null;
+      try {
+        saved = JSON.parse(localStorage.getItem(this._bulkCfgStorageKey()));
+      } catch (_) { /* private mode / corrupt JSON */ }
+      if (saved && typeof saved === "object" && Object.keys(saved).length) {
+        // Backfill keys added to the snapshot after this save (notably
+        // tools_enabled) so an old snapshot can't silently run the batch
+        // with default tools / missing settings.
+        const fromForm = this._bulkCfgFromForm();
+        let changed = false;
+        for (const k of Object.keys(fromForm)) {
+          if (!(k in saved)) { saved[k] = fromForm[k]; changed = true; }
+        }
+        // A legacy snapshot with an EMPTY tools_enabled object is
+        // indistinguishable from "all defaults" on the crew side; the form
+        // always carries every agent key, so rewrite it from the form.
+        if (!saved.tools_enabled || !Object.keys(saved.tools_enabled).length) {
+          saved.tools_enabled = fromForm.tools_enabled;
+          changed = true;
+        }
+        if (changed) {
+          try { localStorage.setItem(this._bulkCfgStorageKey(), JSON.stringify(saved)); } catch (_) {}
+        }
+        this.bulkCfg = saved;
+        this.bulkCfgSaved = true;
+      } else {
+        // No saved snapshot yet — default to the current Settings so bulk
+        // mirrors Run Analysis out of the box.
+        this.bulkCfg = this._bulkCfgFromForm();
+        this.bulkCfgSaved = false;
+      }
+    },
+    _batchRunCfg() {
+      // Single and bulk use the same Settings form (hydrated from
+      // GET /api/settings). No second snapshot.
+      return this._bulkCfgFromForm();
+    },
+    async saveBulkCfg() {
+      // Pin the CURRENT Settings as the snapshot used by the next bulk run.
+      this.bulkCfgError = "";
+      this.bulkCfg = this._bulkCfgFromForm();
+      try {
+        const res = await fetch(`/api/settings?book=${this._hermesBook()}`, {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ bulk: this.bulkCfg }),
+        });
+        const body = await res.json();
+        if (!res.ok) throw new Error(this._apiDetail(body) || res.statusText);
+        this.bulkCfg = body.bulk || this.bulkCfg;
+        this.bulkCfgSaved = true;
+        try { localStorage.setItem(this._bulkCfgStorageKey(), JSON.stringify(this.bulkCfg)); } catch (_) {}
+      } catch (err) {
+        this.bulkCfgSaved = false;
+        this.bulkCfgError = String(err.message || err);
+      }
+    },
+    bulkCfgSummary() {
+      const c = this._bulkCfgFromForm();
+      const toolsCount = Object.values(c.tools_enabled || {})
+        .reduce((n, a) => n + (a?.length || 0), 0);
+      let model = c.llm_preset || "default";
+      const preset = (this.llmPresets || []).find((p) => p.id === c.llm_preset);
+      if (preset) model = preset.resolved_model || preset.model || preset.label;
+      const mode = c.run_mode === "deterministic"
+        ? "deterministic"
+        : (c.run_mode === "harness" ? "harness" : "autonomous");
+      if (mode === "autonomous" && this.assetClass === "stock") {
+        return `${mode} · graph-driven debate · ${toolsCount} tools · ${model}`;
+      }
+      if (mode === "harness" && this.assetClass === "stock") {
+        return `${mode} · conductor loop · ${toolsCount} tools · ${model}`;
+      }
+      return `${mode} · ${c.debate_rounds} debate · ${c.risk_rounds} risk · ${toolsCount} tools · ${model}`;
+    },
+    bulkCfgToolRows() {
+      const tools = this.form.tools_enabled || {};
+      return (this.toolOwners || []).map((a) => ({
+        role: a.role,
+        key: a.key,
+        tools: tools[a.key] || [],
+        inSnapshot: a.key in tools,
+      }));
+    },
+
+    /* ----- batch controls (reuse /api/scale/*) ----- */
+    _predBatchTickers() {
+      const out = [];
+      this.predMarkets.forEach((mk) => {
+        (this.predUniverse.markets[mk] || []).forEach((cat) => {
+          (cat.companies || []).forEach((co) => out.push(co.ticker));
+        });
+      });
+      return out;
+    },
+    async predStartBatch() {
+      const tickers = this._predBatchTickers();
+      if (!tickers.length) { this.predError = "No companies to run."; return; }
+      this.scaleLoading = true; this.predError = "";
+      this._persistScaleWorkers();
+      // Poll immediately so the UI goes live even while the start POST is
+      // still in flight (the server may briefly gate on the LLM endpoint
+      // being ready — the status endpoint reflects that via llm_wait).
+      this._startScalePolling();
+      try {
+        const res = await fetch("/api/scale/start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            tickers,
+            workers: this.predWorkers,
+            // Use the saved bulk-config snapshot (full Settings form) so the
+            // batch honors the configured dialogue rounds + tool selection.
+            run_cfg: this._batchRunCfg(),
+            force_rerun: !!this.predForceRerun,
+          }),
+        });
+        if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || res.status); }
+        this.scaleStatus = await res.json();
+        this._startScalePolling();
+      } catch (err) {
+        this.predError = "Could not start batch: " + (err.message || err);
+      } finally {
+        this.scaleLoading = false;
+      }
+    },
+
+    /* ----- history (left sidebar dates -> that day's snapshot) ----- */
+    async loadPredHistory() {
+      try {
+        const d = await fetch("/api/predict/history").then((r) => r.json());
+        this.predHistoryDays = d.days || [];
+      } catch (_) { /* non-fatal */ }
+    },
+    async loadPredHistDay() {
+      if (!this.predHistDate) return;
+      try {
+        const r = await fetch("/api/predict/history/" + encodeURIComponent(this.predHistDate));
+        if (r.ok) {
+          this.predHist = await r.json();
+          this.predActionFilter = null;   // reset filter for the freshly loaded day
+        }
+      } catch (err) {
+        this.predError = "Failed to load " + this.predHistDate + ": " + (err.message || err);
+      }
+    },
+    openHistDate(date) {
+      this.enterRunReview(date);
+    },
+    enterRunReview(date, { push = true } = {}) {
+      if (!date) return;
+      this.predHistDate = date;
+      this.portfolioDate = date;
+      this.stockActive = false;
+      this.focusPage = false;
+      if (this.activeTab !== "portfolio" && this.activeTab !== "run-names") {
+        this.activeTab = this.reviewReturnTab || "run-names";
+      }
+      if (!this.predHistoryDays.length) this.loadPredHistory();
+      this.loadPredHistDay();
+      if (this.activeTab === "portfolio") this.loadPortfolio();
+      if (push) {
+        try { window.history.pushState({}, "", "/stocks/history/" + encodeURIComponent(date)); } catch (_) {}
+      }
+    },
+    backToLive({ push = true } = {}) {
+      this.predHistDate = "";
+      this.stockActive = false;
+      this.focusPage = false;
+      this.activeTab = "prediction";
+      this.loadPredUniverse();
+      this.predEnrichLoop();
+      if (push) {
+        try { window.history.pushState({}, "", "/stocks"); } catch (_) {}
+      }
+    },
+    _startScalePolling() {
+      if (this.scalePollTimer) clearInterval(this.scalePollTimer);
+      this.scalePollTimer = setInterval(() => this.refreshScaleStatus(), 3000);
+    },
+    async startScale() {
+      this.scaleLoading = true;
+      this.scaleError = "";
+      this._persistScaleWorkers();
+      // Poll immediately so the LLM-readiness wait (llm_wait) is visible even
+      // while the start POST is still in flight.
+      this._startScalePolling();
+      try {
+        const body = {
+          workers: this.scaleForm.workers,
+          // Use the saved bulk-config snapshot (full Settings form).
+          run_cfg: this._batchRunCfg(),
+          force_rerun: !!this.predForceRerun,
+        };
+        if (this.scaleForm.useCustom) {
+          body.tickers = this.scaleForm.tickers;
+        } else {
+          body.universe = this.scaleForm.universe;
+        }
+        const res = await fetch("/api/scale/start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.detail || `HTTP ${res.status}`);
+        }
+        this.scaleStatus = await res.json();
+        this._startScalePolling();
+      } catch (err) {
+        console.error("startScale failed", err);
+        this.scaleError = String(err.message || err);
+      } finally {
+        this.scaleLoading = false;
+      }
+    },
+    async _scaleAction(path) {
+      this.scaleError = "";
+      try {
+        const res = await fetch(path, { method: "POST" }).then(r => r.json());
+        if (res && res.ok === false) this.scaleError = res.reason || "action failed";
+        await this.refreshScaleStatus();
+      } catch (err) {
+        console.error(`${path} failed`, err);
+        this.scaleError = String(err.message || err);
+      }
+    },
+    pauseScale() { return this._scaleAction("/api/scale/pause"); },
+    resumeScale() { return this._scaleAction("/api/scale/resume"); },
+    killScale() {
+      if (!window.confirm("Kill the forward-collection run? In-flight names finish first; progress is kept and can be re-started later.")) return;
+      return this._scaleAction("/api/scale/stop");
+    },
+
     async pollRlStatus() {
       const ticker = (this.form.ticker || "").trim().toUpperCase();
       if (!ticker) return;
@@ -1894,236 +3629,6 @@ function tradingCrewApp() {
       } finally {
         this.rlLoading.recommend = false;
       }
-    },
-
-    // ==================================================================
-    // RLMF — LLM fine-tune from market feedback (dataset / LoRA / serving)
-    // ==================================================================
-    async initRlmf() {
-      await Promise.all([
-        this.loadRlmfDataset(),
-        this.loadRlmfEpisodes(),
-        this.pollRlmfLora(),
-        this.refreshRlmfServe(),
-        this.loadRlmfAdapters(),
-      ]);
-    },
-
-    async loadRlmfDataset() {
-      this.rlmfLoading.dataset = true;
-      try {
-        const q = this.rlmfLora.symbol ? `?symbol=${encodeURIComponent(this.rlmfLora.symbol.trim().toUpperCase())}` : "";
-        const res = await fetch(`/api/training/rlmf/dataset${q}`).then(r => r.json());
-        this.rlmfSummary = res.summary || null;
-      } catch (err) {
-        console.warn("loadRlmfDataset failed", err);
-      } finally {
-        this.rlmfLoading.dataset = false;
-      }
-    },
-
-    async loadRlmfEpisodes() {
-      this.rlmfLoading.episodes = true;
-      try {
-        const params = new URLSearchParams();
-        if (this.rlmfEpisodeFilter.symbol) params.set("symbol", this.rlmfEpisodeFilter.symbol.trim().toUpperCase());
-        if (this.rlmfEpisodeFilter.status) params.set("status", this.rlmfEpisodeFilter.status);
-        const qs = params.toString();
-        this.rlmfEpisodeData = await fetch(`/api/training/rlmf/episodes${qs ? "?" + qs : ""}`).then(r => r.json());
-      } catch (err) {
-        console.error("loadRlmfEpisodes failed", err);
-      } finally {
-        this.rlmfLoading.episodes = false;
-      }
-    },
-
-    async loadRlmfAdapters() {
-      try {
-        this.rlmfAdapters = await fetch("/api/training/rlmf/adapters").then(r => r.json());
-      } catch (err) {
-        console.warn("loadRlmfAdapters failed", err);
-      }
-    },
-
-    async seedRlmfSample() {
-      this.rlmfLoading.sample = true;
-      this.rlmfError = "";
-      try {
-        const res = await fetch("/api/training/rlmf/sample/seed", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ count: 12 }),
-        }).then(r => r.json());
-        this.appendLog("info", "rlmf", `Seeded ${res.seeded} sample episodes (${res.symbol})`);
-        await Promise.all([this.loadRlmfEpisodes(), this.loadRlmfDataset()]);
-      } catch (err) {
-        this.rlmfError = String(err.message || err);
-      } finally {
-        this.rlmfLoading.sample = false;
-      }
-    },
-
-    async clearRlmfSample() {
-      this.rlmfLoading.sample = true;
-      this.rlmfError = "";
-      try {
-        const res = await fetch("/api/training/rlmf/sample/clear", { method: "POST" }).then(r => r.json());
-        this.appendLog("info", "rlmf", `Removed ${res.removed} sample episodes`);
-        await Promise.all([this.loadRlmfEpisodes(), this.loadRlmfDataset()]);
-      } catch (err) {
-        this.rlmfError = String(err.message || err);
-      } finally {
-        this.rlmfLoading.sample = false;
-      }
-    },
-
-    async exportRlmfDataset() {
-      this.rlmfLoading.export = true;
-      this.rlmfError = "";
-      try {
-        const symbol = this.rlmfLora.symbol ? this.rlmfLora.symbol.trim().toUpperCase() : null;
-        const res = await fetch("/api/training/rlmf/export", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ symbol }),
-        }).then(r => r.json());
-        this.appendLog("info", "rlmf", `Exported ${res.rows} rows to ${res.path}`);
-        await this.loadRlmfDataset();
-      } catch (err) {
-        this.rlmfError = String(err.message || err);
-      } finally {
-        this.rlmfLoading.export = false;
-      }
-    },
-
-    async startRlmfLora() {
-      this.rlmfLoading.loraStart = true;
-      this.rlmfError = "";
-      try {
-        const payload = {
-          base_model: (this.rlmfLora.base_model || "").trim(),
-          symbol: this.rlmfLora.symbol ? this.rlmfLora.symbol.trim().toUpperCase() : null,
-          epochs: this.rlmfLora.epochs,
-          learning_rate: this.rlmfLora.learning_rate,
-          lora_r: this.rlmfLora.lora_r,
-          lora_alpha: this.rlmfLora.lora_alpha,
-          max_seq_len: this.rlmfLora.max_seq_len,
-        };
-        const res = await fetch("/api/training/rlmf/lora/start", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-        if (!res.ok) {
-          const detail = await res.json().catch(() => ({ detail: res.statusText }));
-          throw new Error(detail.detail || res.statusText);
-        }
-        this.rlmfLoraStatus = await res.json();
-        this._startRlmfLoraPolling();
-      } catch (err) {
-        this.rlmfError = String(err.message || err);
-      } finally {
-        this.rlmfLoading.loraStart = false;
-      }
-    },
-
-    async stopRlmfLora() {
-      try {
-        await fetch("/api/training/rlmf/lora/stop", { method: "POST" });
-        await this.pollRlmfLora();
-      } catch (err) {
-        this.rlmfError = String(err.message || err);
-      }
-    },
-
-    async pollRlmfLora() {
-      try {
-        this.rlmfLoraStatus = await fetch("/api/training/rlmf/lora/status").then(r => r.json());
-      } catch (err) {
-        console.warn("pollRlmfLora failed", err);
-      }
-    },
-
-    _startRlmfLoraPolling() {
-      if (this.rlmfPollTimer) clearInterval(this.rlmfPollTimer);
-      this.rlmfPollTimer = setInterval(async () => {
-        await this.pollRlmfLora();
-        if (!(this.rlmfLoraStatus && this.rlmfLoraStatus.active)) {
-          clearInterval(this.rlmfPollTimer);
-          this.rlmfPollTimer = null;
-          await Promise.all([this.loadRlmfAdapters(), this.loadRlmfDataset()]);
-        }
-      }, 2500);
-    },
-
-    // ---- serving (inference with/without LoRA) ------------------------
-    async startRlmfServe() {
-      this.rlmfLoading.serveStart = true;
-      this.rlmfError = "";
-      try {
-        const payload = {
-          mode: this.rlmfServe.mode,
-          base_model: (this.rlmfServe.base_model || "").trim(),
-          adapter_dir: (this.rlmfServe.adapter_dir || "").trim() || null,
-          port: this.rlmfServe.port,
-          max_model_len: this.rlmfServe.max_model_len || null,
-          gpu_mem_util: this.rlmfServe.gpu_mem_util || null,
-          max_num_seqs: this.rlmfServe.max_num_seqs || null,
-        };
-        const res = await fetch("/api/training/rlmf/serve/start", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-        if (!res.ok) {
-          const detail = await res.json().catch(() => ({ detail: res.statusText }));
-          throw new Error(detail.detail || res.statusText);
-        }
-        this.rlmfServeStatus = await res.json();
-        this._startRlmfServePolling();
-        // Refresh the LLM preset dropdown so the served model is selectable…
-        await this.loadOptions?.();
-        // …and auto-select it, so "load from the left pane" is one click:
-        // the LoRA endpoint when serving with the adapter, else the base.
-        const wantId = this.rlmfServe.mode === "with_lora" ? "served-lora" : "served-base";
-        if ((this.llmPresets || []).some((p) => p.id === wantId)) {
-          this.selectedLlmPreset = wantId;
-          this.onLlmPresetChange();
-        }
-      } catch (err) {
-        this.rlmfError = String(err.message || err);
-      } finally {
-        this.rlmfLoading.serveStart = false;
-      }
-    },
-
-    async stopRlmfServe() {
-      try {
-        await fetch("/api/training/rlmf/serve/stop", { method: "POST" });
-        await this.refreshRlmfServe();
-        await this.loadOptions?.();
-      } catch (err) {
-        this.rlmfError = String(err.message || err);
-      }
-    },
-
-    async refreshRlmfServe() {
-      try {
-        this.rlmfServeStatus = await fetch("/api/training/rlmf/serve/status").then(r => r.json());
-      } catch (err) {
-        console.warn("refreshRlmfServe failed", err);
-      }
-    },
-
-    _startRlmfServePolling() {
-      const timer = setInterval(async () => {
-        await this.refreshRlmfServe();
-        // Stop polling once the server is confirmed ready or has exited.
-        if (!this.rlmfServeStatus || !this.rlmfServeStatus.running || this.rlmfServeStatus.ready) {
-          clearInterval(timer);
-          if (this.rlmfServeStatus && this.rlmfServeStatus.ready) await this.loadOptions?.();
-        }
-      }, 4000);
     },
 
     renderRlChart() {
@@ -2219,6 +3724,9 @@ function tradingCrewApp() {
           train_size: String(this.backtestConfig.train_size),
           embargo_size: String(this.backtestConfig.embargo_size),
           test_size: String(this.backtestConfig.test_size),
+          validation: this.backtestValidation || "walk_forward",
+          cpcv_groups: String(this.cpcvGroups || 6),
+          cpcv_k: String(this.cpcvK || 2),
           lookback_years: String(this.backtestLookbackYears || 5),
         });
         const res = await fetch(`/api/backtest?${q}`).then(r => r.json());
@@ -2245,16 +3753,55 @@ function tradingCrewApp() {
       }
       const equity = this.backtestResult.combined_equity;
       const labels = this.backtestResult.combined_timestamps || equity.map((_, i) => `t${i}`);
+      const datasets = [{
+        label: "Strategy",
+        data: equity,
+        borderColor: "#22d3ee",
+        backgroundColor: "rgba(34, 211, 238, 0.1)",
+        fill: true, tension: 0.1, pointRadius: 0,
+      }];
+      // Overlay the buy-and-hold benchmark so alpha is visible, not just stated.
+      const bench = this.backtestResult.combined_benchmark;
+      if (bench && bench.length === equity.length) {
+        datasets.push({
+          label: "Buy & hold",
+          data: bench,
+          borderColor: "#a78bfa",
+          borderDash: [5, 4],
+          backgroundColor: "transparent",
+          fill: false, tension: 0.1, pointRadius: 0,
+        });
+      }
       this.backtestChart = new window.Chart(ctx, {
         type: "line",
+        data: { labels, datasets },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          scales: {
+            x: { ticks: { color: "#64748b", maxTicksLimit: 8 }, grid: { color: "#1e293b" } },
+            y: { ticks: { color: "#94a3b8" }, grid: { color: "#1e293b" } },
+          },
+          plugins: { legend: { display: bench && bench.length === equity.length, labels: { color: "#94a3b8" } } },
+        },
+      });
+    },
+
+    /* ----------------------- Swarm PSO convergence sparkline */
+    renderSwarmHistoryChart() {
+      const ctx = document.getElementById("swarm-history-chart");
+      const hist = this.gridSearchResult?.history;
+      if (!ctx || !hist || !hist.length || !window.Chart) return;
+      if (this._swarmChart) { try { this._swarmChart.destroy(); } catch (_) {} this._swarmChart = null; }
+      this._swarmChart = new window.Chart(ctx, {
+        type: "line",
         data: {
-          labels,
+          labels: hist.map((_, i) => `it${i}`),
           datasets: [{
-            label: "Equity",
-            data: equity,
-            borderColor: "#22d3ee",
-            backgroundColor: "rgba(34, 211, 238, 0.1)",
-            fill: true, tension: 0.1, pointRadius: 0,
+            label: "Global best score",
+            data: hist,
+            borderColor: "#f59e0b",
+            backgroundColor: "rgba(245, 158, 11, 0.12)",
+            fill: true, tension: 0.2, pointRadius: 2,
           }],
         },
         options: {
@@ -2266,6 +3813,96 @@ function tradingCrewApp() {
           plugins: { legend: { display: false } },
         },
       });
+    },
+
+    /* ----------------------- Multi-asset portfolio backtest (M7) */
+    async runPortfolioBacktest() {
+      const tickers = (this.portfolioTickers || "").trim();
+      if (!tickers) return;
+      this.portfolioLoading = true;
+      this.portfolioResult = null;
+      try {
+        const q = new URLSearchParams({
+          tickers,
+          cost_model: this.backtestCostModel || "standard",
+          allocation_method: this.portfolioAllocMethod || "HRP",
+          gross_budget: String(this.portfolioGrossBudget || 0.8),
+          lookback_years: String(this.backtestLookbackYears || 5),
+        });
+        const res = await fetch(`/api/portfolio_backtest?${q}`).then(r => r.json());
+        this.portfolioResult = res;
+        this.$nextTick(() => this.renderPortfolioChart());
+      } catch (err) {
+        console.error("runPortfolioBacktest failed", err);
+        this.portfolioResult = { error: String(err) };
+      } finally {
+        this.portfolioLoading = false;
+      }
+    },
+    renderPortfolioChart() {
+      const ctx = document.getElementById("portfolio-equity-chart");
+      const eq = this.portfolioResult?.equity_curve;
+      if (!ctx || !eq || !eq.length || !window.Chart) return;
+      if (this.portfolioChart) { try { this.portfolioChart.destroy(); } catch (_) {} this.portfolioChart = null; }
+      const labels = this.portfolioResult.timestamps || eq.map((_, i) => `t${i}`);
+      const datasets = [{
+        label: "Portfolio",
+        data: eq,
+        borderColor: "#34d399",
+        backgroundColor: "rgba(52, 211, 153, 0.1)",
+        fill: true, tension: 0.1, pointRadius: 0,
+      }];
+      const bench = this.portfolioResult.benchmark_curve;
+      if (bench && bench.length === eq.length) {
+        datasets.push({
+          label: "Equal-weight B&H",
+          data: bench,
+          borderColor: "#a78bfa",
+          borderDash: [5, 4],
+          backgroundColor: "transparent",
+          fill: false, tension: 0.1, pointRadius: 0,
+        });
+      }
+      this.portfolioChart = new window.Chart(ctx, {
+        type: "line",
+        data: { labels, datasets },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          scales: {
+            x: { ticks: { color: "#64748b", maxTicksLimit: 8 }, grid: { color: "#1e293b" } },
+            y: { ticks: { color: "#94a3b8" }, grid: { color: "#1e293b" } },
+          },
+          plugins: { legend: { display: true, labels: { color: "#94a3b8" } } },
+        },
+      });
+    },
+
+    /* ----------------------- Crowd-positioning chip */
+    async loadCrowdSignal() {
+      const ticker = (this.form.ticker || "").trim().toUpperCase();
+      if (!ticker) return;
+      this.crowdLoading = true;
+      this.crowdSignal = null;
+      try {
+        const res = await fetch(`/api/crowd_positioning?ticker=${encodeURIComponent(ticker)}`).then(r => r.json());
+        this.crowdSignal = res;
+      } catch (err) {
+        console.error("loadCrowdSignal failed", err);
+        this.crowdSignal = { error: String(err) };
+      } finally {
+        this.crowdLoading = false;
+      }
+    },
+
+    /* ----------------------- Formatting helpers for the new metric cards */
+    fmtPct(v, dp = 2) {
+      if (v === null || v === undefined || Number.isNaN(v)) return "—";
+      return (v * 100).toFixed(dp) + "%";
+    },
+    fmtNum(v, dp = 2) {
+      if (v === null || v === undefined || Number.isNaN(v)) return "—";
+      if (v === Infinity || v === -Infinity) return v > 0 ? "∞" : "-∞";
+      return Number(v).toFixed(dp);
     },
   };
 }

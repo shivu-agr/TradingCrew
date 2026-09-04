@@ -75,6 +75,127 @@ def normalise_action(value: str) -> str:
     return LEGACY_ACTION_MAPPING.get(key, key)
 
 
+HorizonStance = Literal["bullish", "bearish", "mixed", "neutral"]
+
+
+class HorizonForecast(BaseModel):
+    """One SHORT / MEDIUM / LONG view. Harness runs must emit all three."""
+
+    stance: HorizonStance
+    horizon_days: int
+    expected_return_pct: float
+    confidence: float = Field(..., ge=0.0, le=1.0)
+    drivers: List[str] = Field(default_factory=list)
+    risks: List[str] = Field(default_factory=list)
+    falsifiers: List[str] = Field(default_factory=list)
+    sources: List[str] = Field(default_factory=list)
+
+    @field_validator("stance", mode="before")
+    @classmethod
+    def _coerce_stance(cls, v: object) -> object:
+        if not isinstance(v, str):
+            return v
+        key = v.strip().lower().replace("_", " ")
+        mapping = {
+            "hold": "neutral",
+            "sit-out": "neutral",
+            "sit out": "neutral",
+            "buy": "bullish",
+            "strong buy": "bullish",
+            "overweight": "bullish",
+            "sell": "bearish",
+            "strong sell": "bearish",
+            "underweight": "bearish",
+            "bull": "bullish",
+            "bear": "bearish",
+        }
+        return mapping.get(key, key)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _coerce_confidence(cls, v: object) -> object:
+        if isinstance(v, (int, float)):
+            return v
+        if not isinstance(v, str):
+            return v
+        s = v.strip().lower().replace("‑", "-").replace("—", "-")
+        s = s.replace(" ", "").replace("_", "")
+        labels = {
+            "low": 0.3,
+            "low-medium": 0.4,
+            "lowmedium": 0.4,
+            "low-moderate": 0.4,
+            "lowmoderate": 0.4,
+            "medium": 0.5,
+            "med": 0.5,
+            "moderate": 0.5,
+            "medium-high": 0.65,
+            "mediumhigh": 0.65,
+            "moderate-high": 0.65,
+            "moderatehigh": 0.65,
+            "high": 0.8,
+            "veryhigh": 0.9,
+        }
+        if s in labels:
+            return labels[s]
+        try:
+            return float(s)
+        except ValueError:
+            return v
+
+    @field_validator("horizon_days", mode="before")
+    @classmethod
+    def _coerce_days(cls, v: object) -> object:
+        if isinstance(v, str):
+            digits = "".join(ch for ch in v if ch.isdigit())
+            return int(digits) if digits else v
+        return v
+
+    @field_validator("expected_return_pct", mode="before")
+    @classmethod
+    def _coerce_ret(cls, v: object) -> object:
+        if isinstance(v, str):
+            s = v.strip().replace("%", "")
+            try:
+                n = float(s)
+            except ValueError:
+                return v
+            return n / 100.0 if abs(n) > 1 else n
+        if isinstance(v, (int, float)) and abs(float(v)) > 1:
+            return float(v) / 100.0
+        return v
+
+    @field_validator("drivers", "risks", "falsifiers", "sources", mode="before")
+    @classmethod
+    def _coerce_list(cls, v: object) -> object:
+        if v is None:
+            return []
+        if isinstance(v, str):
+            return [v]
+        return v
+
+
+class HorizonForecasts(BaseModel):
+    SHORT: HorizonForecast
+    MEDIUM: HorizonForecast
+    LONG: HorizonForecast
+
+
+class StagedTarget(BaseModel):
+    """One scale-out profit tier of a trade plan.
+
+    Populated deterministically by the risk layer (``stops.compute_staged_targets``)
+    after the final target is validated — NOT emitted by the LLM.  ``weight`` is
+    the fraction of the position to exit at this tier (tiers sum to ~1.0).
+    """
+
+    tier: int
+    price: float
+    pct: float  # signed decimal move to this tier (profit-direction positive)
+    reward_risk: Optional[float] = None
+    weight: float
+
+
 class PortfolioDecision(BaseModel):
     """Structured final decision emitted by the Portfolio Manager."""
 
@@ -84,6 +205,11 @@ class PortfolioDecision(BaseModel):
     entry_price: float
     stop_loss: float
     target_price: float
+    # Scale-out profit tiers (T1/T2/T3) derived from the validated final
+    # target by the deterministic risk layer.  Empty for HOLD / when
+    # volatility can't be measured.  Additive + optional so older RunRecord
+    # JSONs load unchanged and the LLM never has to emit it.
+    staged_targets: List[StagedTarget] = Field(default_factory=list)
     horizon_days: int
     horizon: Horizon = Field(
         default=Horizon.MEDIUM,
@@ -97,13 +223,27 @@ class PortfolioDecision(BaseModel):
             "backwards compatibility."
         ),
     )
-    expected_return_pct: float
+    expected_return_pct: float = Field(
+        description=(
+            "Expected return over horizon_days as a DECIMAL FRACTION "
+            "(0.05 = +5%), NOT percent points. Signed by the expected move "
+            "of the underlying: positive for a long thesis, negative for a "
+            "short. Consistent with (target_price - entry_price)/entry_price."
+        ),
+    )
     rationale: str
     key_drivers: List[str]
     key_risks: List[str]
     falsifiers: List[str]
     geopolitical_flags: List[str]
     compliance_status: Literal["CLEAR", "FLAGGED", "BLOCKED"]
+
+    # HOLD sit-out may still carry ATR watch levels. These are advisory
+    # (not a live order). ``size_pct_of_book`` stays 0; the Kelly/vol
+    # size that *would* have been used if the watch side were entered
+    # lives on ``recommended_size_pct``.
+    watch_side: Optional[Literal["long", "short"]] = None
+    recommended_size_pct: float = Field(default=0.0, ge=0.0, le=100.0)
 
     # Long-term view — required on EVERY decision.
     #
@@ -153,6 +293,10 @@ class PortfolioDecision(BaseModel):
             "the analyst reports' provenance lines."
         ),
     )
+
+    # Harness workflow only. Autonomous / deterministic JSON stays valid
+    # without this field. When present, all three tiers must be filled.
+    horizon_forecasts: Optional[HorizonForecasts] = None
 
     # ------------------------------------------------------------------
     # Validators

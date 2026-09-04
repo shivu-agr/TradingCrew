@@ -52,7 +52,7 @@ from trading_crew.agentic.risk import (
     run_risk_gates,
     VarConfig,
 )
-from trading_crew.agentic.risk.sizing import debate_to_risk_mult
+from trading_crew.agentic.risk.sizing import debate_to_risk_mult, vol_state_to_risk_mult
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +235,7 @@ def run_pipeline(
     # Compute realised vol + 1-day historical VaR/CVaR from the same OHLCV.
     realised_vol_annual = 0.0
     cvar_one_day = 0.0
+    vol_pct: Optional[float] = None
     try:
         import math
         closes = ohlcv["Close"].astype(float).tolist()
@@ -250,6 +251,18 @@ def run_pipeline(
             mean = sum(log_returns[-var_cfg.window:]) / var_cfg.window
             var_term = sum((r - mean) ** 2 for r in log_returns[-var_cfg.window:]) / max(1, var_cfg.window - 1)
             realised_vol_annual = math.sqrt(var_term) * math.sqrt(252)
+        # Cheap realised-vol percentile (current 20d vol vs its trailing year)
+        # for the vol-state size penalty.  BOCPD regime age is deliberately
+        # NOT recomputed here (it's a ~1s pass and the PM prompt already
+        # carries it) so we keep this execution/backtest path fast.
+        if len(log_returns) >= 60:
+            import statistics
+            roll = [statistics.pstdev(log_returns[i - 20:i]) * math.sqrt(252)
+                    for i in range(20, len(log_returns) + 1)]
+            if roll:
+                cur = roll[-1]
+                hist = roll[-252:] if len(roll) >= 252 else roll
+                vol_pct = sum(1 for v in hist if v <= cur) / len(hist)
     except Exception:
         logger.exception("M5: failed to compute realised vol / VaR")
 
@@ -263,6 +276,16 @@ def run_pipeline(
         )
         if rm < risk_mult:
             risk_mult = rm  # debate can only reduce size, never increase
+
+    # Fold in the probe-validated vol-state size penalty (only reduces).
+    if vol_pct is not None:
+        vs_mult, _ = vol_state_to_risk_mult(
+            vol_percentile=vol_pct,
+            floor=sizing_config.risk_mult_floor,
+            ceiling=sizing_config.risk_mult_ceiling,
+        )
+        if vs_mult < risk_mult:
+            risk_mult = vs_mult
 
     sizing = compute_size(
         proposal,

@@ -44,11 +44,15 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from .backtest import (
     BacktestMetrics,
     BacktestResult,
+    CPCVConfig,
     Fold,
     WalkForwardConfig,
     compute_metrics,
     deflated_sharpe,
+    generate_cpcv_folds,
     generate_folds,
+    probability_of_backtest_overfitting,
+    run_cpcv,
     run_walk_forward,
 )
 from .execution.contracts import ActionProposal
@@ -101,6 +105,13 @@ class GridPoint:
                 "max_drawdown": self.metrics.max_drawdown,
                 "deflated_sharpe": self.metrics.deflated_sharpe,
                 "n_periods": self.metrics.n_periods,
+                "win_rate": self.metrics.win_rate,
+                "expectancy": self.metrics.expectancy,
+                "payoff_ratio": self.metrics.payoff_ratio,
+                "profit_factor": self.metrics.profit_factor,
+                "alpha": self.metrics.alpha,
+                "beta": self.metrics.beta,
+                "benchmark_return_pct": self.metrics.benchmark_return_pct,
             } if self.metrics is not None else {},
             "rank_metric": self.rank_metric,
             "error": self.error,
@@ -116,6 +127,8 @@ class GridSearchResult:
     n_points: int
     points: List[GridPoint] = field(default_factory=list)
     best_index: Optional[int] = None
+    validation: str = "walk_forward"
+    pbo: Optional[float] = None
 
     def best(self) -> Optional[GridPoint]:
         if self.best_index is None:
@@ -128,6 +141,8 @@ class GridSearchResult:
             "n_proposals": self.n_proposals,
             "n_points": self.n_points,
             "best_index": self.best_index,
+            "validation": self.validation,
+            "pbo": self.pbo,
             "best": self.best().to_dict() if self.best() is not None else None,
             "points": [p.to_dict() for p in self.points],
         }
@@ -190,8 +205,10 @@ def run_grid_search(
     grid: Optional[Sequence[GridAxis]] = None,
     cost_model_name: str = "standard",
     rank_by: str = "deflated_sharpe",
+    validation: str = "walk_forward",
+    cpcv_config: Optional[CPCVConfig] = None,
 ) -> GridSearchResult:
-    """Sweep ``grid`` against ``proposals`` via walk-forward backtest.
+    """Sweep ``grid`` against ``proposals`` via walk-forward (or CPCV) backtest.
 
     Parameters
     ----------
@@ -203,17 +220,26 @@ def run_grid_search(
     grid : list of ``GridAxis``; defaults to ``default_grid()``.
     rank_by : "deflated_sharpe" (default — handles overfit) | "sharpe"
               (raw) | "sortino" | "calmar" | "total_return_pct".
+    validation : "walk_forward" (default) | "cpcv".  Under CPCV every
+              config is scored on the concatenation of its combinatorial
+              out-of-sample paths, and the whole sweep additionally
+              reports a **Probability of Backtest Overfitting** (PBO)
+              over the config-vs-time return matrix.
+    cpcv_config : CPCV geometry (only used when ``validation="cpcv"``);
+              defaults to 6 groups / k=2.
     """
     if not proposals:
         return GridSearchResult(
             ticker=(next(iter(ohlcv_by_symbol)) if ohlcv_by_symbol else "?"),
-            n_proposals=0, n_points=0,
+            n_proposals=0, n_points=0, validation=validation,
         )
 
     grid = list(grid or default_grid())
     walk_forward_config = walk_forward_config or WalkForwardConfig(
         train_size=3, embargo_size=1, test_size=1,
     )
+    use_cpcv = validation == "cpcv"
+    cpcv_config = cpcv_config or CPCVConfig(n_groups=6, k_test=2, embargo_size=1)
 
     # Build the full cartesian product up front so we know ``n_trials`` and
     # can pass it to ``compute_metrics`` for Deflated Sharpe deflation.
@@ -222,44 +248,69 @@ def run_grid_search(
     grid_points_raw = [dict(zip(axis_names, combo)) for combo in product(*axis_values)]
     n_trials = max(1, len(grid_points_raw))
 
-    folds: List[Fold] = generate_folds(n_obs=len(proposals), config=walk_forward_config)
-    if not folds:
-        result = GridSearchResult(
-            ticker=next(iter(ohlcv_by_symbol)) if ohlcv_by_symbol else "?",
-            n_proposals=len(proposals), n_points=0,
-        )
-        return result
+    if use_cpcv:
+        cpcv_folds = generate_cpcv_folds(n_obs=len(proposals), config=cpcv_config)
+        if not cpcv_folds:
+            return GridSearchResult(
+                ticker=next(iter(ohlcv_by_symbol)) if ohlcv_by_symbol else "?",
+                n_proposals=len(proposals), n_points=0, validation=validation,
+            )
+        folds = []
+    else:
+        folds = generate_folds(n_obs=len(proposals), config=walk_forward_config)
+        if not folds:
+            return GridSearchResult(
+                ticker=next(iter(ohlcv_by_symbol)) if ohlcv_by_symbol else "?",
+                n_proposals=len(proposals), n_points=0, validation=validation,
+            )
 
     points: List[GridPoint] = []
+    # Per-config out-of-sample return series, aligned in time, for PBO.
+    equity_series: List[Optional[List[float]]] = []
     for raw in grid_points_raw:
         sizing_cfg, gate_cfg = _build_configs(raw)
         try:
-            bt: BacktestResult = run_walk_forward(
-                proposals=proposals,
-                ohlcv_by_symbol=ohlcv_by_symbol,
-                folds=folds,
-                cost_model_name=cost_model_name,
-                sizing_config=sizing_cfg,
-                gate_config=gate_cfg,
-            )
+            if use_cpcv:
+                cp = run_cpcv(
+                    proposals=proposals,
+                    ohlcv_by_symbol=ohlcv_by_symbol,
+                    cpcv_folds=cpcv_folds,
+                    cost_model_name=cost_model_name,
+                    sizing_config=sizing_cfg,
+                    gate_config=gate_cfg,
+                )
+                equity = cp.combined_equity
+                n_folds = len(cp.paths)
+            else:
+                bt: BacktestResult = run_walk_forward(
+                    proposals=proposals,
+                    ohlcv_by_symbol=ohlcv_by_symbol,
+                    folds=folds,
+                    cost_model_name=cost_model_name,
+                    sizing_config=sizing_cfg,
+                    gate_config=gate_cfg,
+                )
+                equity = bt.combined_equity
+                n_folds = len(bt.folds)
             # Recompute metrics with the correct ``n_trials`` so the
             # Deflated Sharpe is comparable across the grid.
-            equity = bt.combined_equity
             corrected = compute_metrics(
                 equity, n_trials=n_trials, periods_per_year=252,
             )
             rank_value = _extract_rank(corrected, rank_by)
+            equity_series.append(list(equity))
             points.append(
                 GridPoint(
                     sizing_config=_dict_of(sizing_cfg),
                     gate_config=_dict_of(gate_cfg),
-                    n_folds=len(bt.folds),
+                    n_folds=n_folds,
                     metrics=corrected,
                     rank_metric=rank_value,
                 )
             )
         except Exception as exc:
             logger.exception("Grid point failed: %s", raw)
+            equity_series.append(None)
             points.append(
                 GridPoint(
                     sizing_config=_dict_of(sizing_cfg),
@@ -272,13 +323,51 @@ def run_grid_search(
             )
 
     best_idx = _argmax(points)
+    pbo = _compute_pbo(equity_series)
     return GridSearchResult(
         ticker=next(iter(ohlcv_by_symbol)) if ohlcv_by_symbol else "?",
         n_proposals=len(proposals),
         n_points=len(points),
         points=points,
         best_index=best_idx,
+        validation=validation,
+        pbo=pbo,
     )
+
+
+def _compute_pbo(equity_series: Sequence[Optional[Sequence[float]]]) -> Optional[float]:
+    """Build the config-vs-time return matrix and compute PBO (CSCV).
+
+    Each config contributes one periodic-return series (from its combined
+    equity curve).  We align every series to the shortest common length
+    so the matrix is rectangular, then hand it to
+    :func:`probability_of_backtest_overfitting`.  Returns ``None`` when
+    there are fewer than two valid configs or the series are too short.
+    """
+    valid = [s for s in equity_series if s is not None and len(s) >= 2]
+    if len(valid) < 2:
+        return None
+    min_len = min(len(s) for s in valid)
+    if min_len < 2:
+        return None
+    # Periodic returns per config, truncated to the common horizon.
+    returns_cols: List[List[float]] = []
+    for s in valid:
+        tail = s[-min_len:]
+        rets = [
+            (tail[i] / tail[i - 1]) - 1.0 if tail[i - 1] > 0 else 0.0
+            for i in range(1, len(tail))
+        ]
+        returns_cols.append(rets)
+    T = len(returns_cols[0])
+    N = len(returns_cols)
+    if T < 4:
+        return None
+    matrix = [[returns_cols[n][t] for n in range(N)] for t in range(T)]
+    n_splits = min(16, T if T % 2 == 0 else T - 1)
+    if n_splits < 2:
+        return None
+    return probability_of_backtest_overfitting(matrix, n_splits=n_splits)
 
 
 # ---------------------------------------------------------------------------

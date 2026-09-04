@@ -34,12 +34,14 @@ import logging
 import math
 import os
 import re
+import sqlite3
+import threading
 from collections import Counter
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +98,7 @@ class OutcomeStatus(str, Enum):
 # format never needs an offline rewrite.  Mirrors ``PortfolioState.SCHEMA_VERSION``
 # (paper §M7) so all on-disk schemas have a uniform "what version is
 # this" identifier.
-EPISODE_SCHEMA_VERSION = 1
+EPISODE_SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -148,10 +150,59 @@ class Episode:
     alpha_return: Optional[float] = None
     max_drawdown: Optional[float] = None
     reflection: Optional[str] = None
+    # Structured L2 reflection: ``{desks: [...], error_class: str,
+    # recommended_change: str, tag: str, confidence: float}``.  Drives
+    # accurate cross-desk feedback routing (see ``agent_feedback``) and the
+    # calibration analytics.  Optional + additive so older episodes (free-text
+    # reflection only) still load with None.
+    reflection_meta: Optional[Dict[str, Any]] = None
     embargo_days: int = 0
     created_ts: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     schema_version: int = EPISODE_SCHEMA_VERSION
     retrieval_count: int = 0
+    # Swarm-intelligence crowd-positioning score at decision time, in
+    # [-1, +1] (+ crowd long / - crowd short).  Optional + additive so
+    # older episodes (written before the swarm layer) still load with None
+    # and the backtest can segment performance by crowd regime.
+    crowd_score: Optional[float] = None
+    # Per-component crowd contributions at decision time (each in [-1, +1],
+    # keyed by "put_call" / "iv_skew" / "insider" / "analyst" /
+    # "institutional" / "cot").  Logged so the crowd-weight learner can fit
+    # data-driven fusion weights from realised alpha.  Optional + additive.
+    crowd_components: Optional[Dict[str, float]] = None
+    # --- Trust / provenance (Phase 0) ------------------------------------
+    # Which workflow version produced this decision.  Optional + additive
+    # so pre-Phase-0 episodes load with None; the backtest / grid-search /
+    # RLMF paths can filter to a single trustworthy cohort instead of
+    # blindly replaying proposals from a drifting workflow.
+    workflow_version: Optional[str] = None
+    prompts_hash: Optional[str] = None
+    code_git_sha: Optional[str] = None
+    source: str = "live"  # "live" | "backfill"
+    # Per-desk directional lean at decision time, keyed by crew agent_key
+    # (``market_analyst`` → ``bullish``/``bearish``/``neutral``).  Optional so
+    # older episodes still load.  Used after resolve to attribute a WIN/LOSS
+    # to the steps that actually predicted the wrong way.
+    desk_leans: Optional[Dict[str, str]] = None
+    # Unsigned close-to-close market return over the holding window (not
+    # side-signed).  Set on resolve so HOLD opportunity-cost and desk-vs-tape
+    # alignment do not depend on the position PnL.
+    market_return: Optional[float] = None
+    # Canonical prediction-vs-outcome label (WIN/LOSS/FLAT/HOLD_*), set on
+    # resolve.  See ``trading_crew.agentic.outcome``.
+    outcome_label: Optional[str] = None
+    # Resolve-day web briefing of *why* the tape moved.  Training-only
+    # (Mass 1PO negatives).  Never written into a live or PIT decision.
+    market_reason: Optional[str] = None
+    # 30-day learning clock (desk_strategy.yaml).  Independent of
+    # ``outcome_ts`` so a MEDIUM/LONG thesis can stay pending while the
+    # short review teaches the desks.
+    review_ts: Optional[str] = None
+    review_status: Optional[str] = None  # PENDING / RESOLVED
+    review_embargo_days: int = 0
+    review: Optional[Dict[str, Any]] = None
+    # Per-tier priced scores once each clock elapses: {short|medium|long: {...}}.
+    horizon_scores: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -178,22 +229,59 @@ class Episode:
             alpha_return=data.get("alpha_return"),
             max_drawdown=data.get("max_drawdown"),
             reflection=data.get("reflection"),
+            reflection_meta=data.get("reflection_meta"),
             embargo_days=int(data.get("embargo_days", 0)),
             created_ts=data.get("created_ts", datetime.now(timezone.utc).isoformat()),
             schema_version=int(data.get("schema_version", 0)),
             retrieval_count=int(data.get("retrieval_count", 0)),
+            crowd_score=data.get("crowd_score"),
+            crowd_components=data.get("crowd_components"),
+            workflow_version=data.get("workflow_version"),
+            prompts_hash=data.get("prompts_hash"),
+            code_git_sha=data.get("code_git_sha"),
+            source=data.get("source", "live"),
+            desk_leans=data.get("desk_leans"),
+            market_return=data.get("market_return"),
+            outcome_label=data.get("outcome_label"),
+            market_reason=data.get("market_reason"),
+            review_ts=data.get("review_ts"),
+            review_status=data.get("review_status"),
+            review_embargo_days=int(data.get("review_embargo_days", 0) or 0),
+            review=data.get("review"),
+            horizon_scores=data.get("horizon_scores"),
         )
 
     def effective_unembargoed_ts(self) -> datetime:
         """Earliest timestamp at which this episode becomes retrievable.
 
         Equal to ``outcome_ts + embargo_days``.  PENDING episodes are
-        always embargoed (they have no realised outcome yet).
+        always embargoed (they have no realised outcome yet) unless a
+        30-day review has resolved — see ``effective_review_unembargoed_ts``.
         """
         base = datetime.fromisoformat(self.outcome_ts.replace("Z", "+00:00"))
         if base.tzinfo is None:
             base = base.replace(tzinfo=timezone.utc)
         return base + _days(self.embargo_days)
+
+    def effective_review_unembargoed_ts(self) -> Optional[datetime]:
+        """When the 30-day learning review may be retrieved.
+
+        ``None`` until ``review_ts`` is set.  Thesis numbers stay hidden
+        until ``effective_unembargoed_ts`` — this clock only unlocks the
+        short-review lesson.
+        """
+        if not self.review_ts:
+            return None
+        base = datetime.fromisoformat(self.review_ts.replace("Z", "+00:00"))
+        if base.tzinfo is None:
+            base = base.replace(tzinfo=timezone.utc)
+        return base + _days(int(self.review_embargo_days or 0))
+
+    def review_retrievable(self, as_of: datetime) -> bool:
+        if (self.review_status or "").upper() != "RESOLVED":
+            return False
+        open_at = self.effective_review_unembargoed_ts()
+        return open_at is not None and open_at <= as_of
 
 
 def _days(n: int):
@@ -268,14 +356,46 @@ def _cosine(a: Dict[str, float], b: Dict[str, float]) -> float:
 # ---------------------------------------------------------------------------
 
 
-class EpisodicMemory:
-    """Append-only episodic store with outcome-embargo retrieval.
+def _ep_create(conn: sqlite3.Connection) -> None:
+    """Create the ``episodes`` table + indexes on ``conn`` (idempotent)."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS episodes (
+               episode_id      TEXT PRIMARY KEY,
+               symbol          TEXT,
+               decision_ts     TEXT,
+               outcome_ts      TEXT,
+               outcome_status  TEXT,
+               source          TEXT,
+               retrieval_count INTEGER NOT NULL DEFAULT 0,
+               created_ts      TEXT,
+               data_json       TEXT NOT NULL
+           )"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ep_status ON episodes(outcome_status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ep_symbol ON episodes(symbol)")
 
-    Storage layout (JSONL, one ``Episode`` per line) is chosen because:
-    - It's append-friendly (no rewrite penalty per add).
-    - It's grep/diff-able (debugging an audit trail is line-oriented).
-    - It avoids a database dependency.
+
+class EpisodicMemory:
+    """Episodic store with outcome-embargo retrieval, backed by SQLite.
+
+    Storage is an ``episodes`` table inside the single application database
+    (``prediction.db``) — not a separate file, and not the former append-only
+    JSONL — because:
+    - Upsert-by-id is O(1); the JSONL ``add`` did a full read-modify-write of
+      the entire file per append (O(n²) over a 200-name batch).
+    - Concurrent collector workers can write safely (WAL + busy-timeout).
+    - It keeps *all* app state in one DB with multiple tables.
+
+    The ``path`` argument still names the store.  The canonical production
+    store (``<cache>/memory/episodes.*`` sitting next to ``prediction.db``)
+    is transparently routed into ``prediction.db``'s ``episodes`` table,
+    sharing that DB's single serialized connection.  Any other path (tests)
+    opens its own isolated SQLite file, so per-test stores never collide.
+    Legacy ``episodes.jsonl`` / standalone ``episodes.db`` data is imported
+    once on first open.
     """
+
+    _MIGRATED_DBS: set = set()  # store keys whose legacy data was already imported
 
     def __init__(
         self,
@@ -289,7 +409,9 @@ class EpisodicMemory:
         """
         Parameters
         ----------
-        path : path to the JSONL store. Created with parents on first write.
+        path : store location.  The canonical ``<cache>/memory/episodes.*``
+               store is routed into the shared ``prediction.db``; any other
+               ``.jsonl``/``.db`` path opens its own isolated SQLite file.
         decay_per_day : exponential decay rate per day (default 0.005 ≈ half-life ~140 days).
         decay_weight : λ in ``score = similarity + λ·exp(−decay·Δdays)``.
                        The decay factor itself is the *boost* for newer
@@ -303,30 +425,169 @@ class EpisodicMemory:
                    embedding without touching the retrieval logic.
         """
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        resolved = self.path if self.path.suffix == ".db" else self.path.with_suffix(".db")
+
+        # Route the canonical production store into the single app DB so all
+        # state lives in one file (multiple tables), sharing its connection.
+        self._shared = False
+        self._pdb = None
+        try:
+            from web.backend import prediction_db as _pdb
+
+            pred = _pdb.db_path()
+            if (
+                resolved.name == "episodes.db"
+                and resolved.parent.name == "memory"
+                and resolved.parent.parent == pred.parent
+            ):
+                self._shared = True
+                self._pdb = _pdb
+                resolved = pred
+        except Exception:  # noqa: BLE001 — prediction_db unavailable ⇒ standalone
+            pass
+
+        self._db_path = resolved
         self.decay_per_day = decay_per_day
         self.decay_weight = decay_weight
         self.regime_match_bonus = regime_match_bonus
         self._embed = embed_fn or self._default_embed
 
+        self._own_lock = threading.Lock()
+        self._own_conn: Optional[sqlite3.Connection] = None
+        if self._shared:
+            conn, lock = self._acquire()
+            with lock:
+                _ep_create(conn)
+                conn.commit()
+            self._migrate_shared()
+        else:
+            self._db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._own_conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+            self._own_conn.row_factory = sqlite3.Row
+            self._own_conn.execute("PRAGMA journal_mode=WAL")
+            self._own_conn.execute("PRAGMA busy_timeout=10000")
+            _ep_create(self._own_conn)
+            self._own_conn.commit()
+            self._migrate_legacy_jsonl()
+
     @staticmethod
     def _default_embed(text: str) -> Dict[str, float]:
         return _tf_vector(_tokenise(text))
 
+    # ------------------------------------------------------------- internals
+
+    def _acquire(self):
+        """Return the active ``(connection, lock)`` pair.
+
+        Shared mode fetches ``prediction.db``'s connection fresh each call so
+        it stays valid even if that singleton reopens (e.g. cache-dir change).
+        """
+        if self._shared:
+            return self._pdb.shared_connection()
+        return self._own_conn, self._own_lock
+
+    def _bulk_insert(self, episodes: Sequence[Episode]) -> None:
+        """INSERT OR IGNORE a batch (never clobbers a newer existing row)."""
+        conn, lock = self._acquire()
+        with lock:
+            for ep in episodes:
+                conn.execute(
+                    "INSERT OR IGNORE INTO episodes "
+                    "(episode_id, symbol, decision_ts, outcome_ts, outcome_status, "
+                    " source, retrieval_count, created_ts, data_json) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    self._episode_row(ep),
+                )
+            conn.commit()
+
+    def _import_jsonl(self, jsonl: Path) -> None:
+        try:
+            episodes: List[Episode] = []
+            with jsonl.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        episodes.append(Episode.from_dict(json.loads(line)))
+            self._bulk_insert(episodes)
+            jsonl.rename(jsonl.with_suffix(".jsonl.migrated"))
+            logger.info("imported %d legacy episodes from %s into %s",
+                        len(episodes), jsonl, self._db_path)
+        except Exception as exc:  # noqa: BLE001 — migration is best-effort
+            logger.warning("legacy episode JSONL import failed for %s: %s", jsonl, exc)
+
+    def _import_sqlite(self, src_path: Path) -> None:
+        try:
+            src = sqlite3.connect(str(src_path))
+            src.row_factory = sqlite3.Row
+            rows = src.execute("SELECT data_json FROM episodes").fetchall()
+            src.close()
+            episodes = [Episode.from_dict(json.loads(r["data_json"])) for r in rows]
+            self._bulk_insert(episodes)
+            src_path.rename(src_path.with_suffix(".db.migrated"))
+            logger.info("imported %d episodes from standalone %s into %s",
+                        len(episodes), src_path, self._db_path)
+        except Exception as exc:  # noqa: BLE001 — migration is best-effort
+            logger.warning("standalone episode DB import failed for %s: %s", src_path, exc)
+
+    def _migrate_shared(self) -> None:
+        """Import legacy episode stores from ``<cache>/memory/`` into the shared DB once."""
+        key = "shared:" + str(self._db_path)
+        if key in EpisodicMemory._MIGRATED_DBS:
+            return
+        EpisodicMemory._MIGRATED_DBS.add(key)
+        memdir = self._db_path.parent / "memory"
+        jsonl = memdir / "episodes.jsonl"
+        if jsonl.is_file():
+            self._import_jsonl(jsonl)
+        standalone = memdir / "episodes.db"
+        if standalone.is_file() and standalone != self._db_path:
+            self._import_sqlite(standalone)
+
+    def _migrate_legacy_jsonl(self) -> None:
+        """Standalone mode: import a legacy JSONL at ``self.path`` once."""
+        key = str(self._db_path)
+        if key in EpisodicMemory._MIGRATED_DBS:
+            return
+        EpisodicMemory._MIGRATED_DBS.add(key)
+        legacy = self.path
+        if legacy.suffix == ".jsonl" and legacy.is_file():
+            self._import_jsonl(legacy)
+
+    @staticmethod
+    def _episode_row(ep: Episode) -> tuple:
+        return (
+            ep.episode_id, ep.symbol, ep.decision_ts, ep.outcome_ts,
+            ep.outcome_status.value, ep.source,
+            int(getattr(ep, "retrieval_count", 0) or 0), ep.created_ts,
+            json.dumps(ep.to_dict(), sort_keys=True),
+        )
+
+    @staticmethod
+    def _row_to_episode(row: sqlite3.Row) -> Episode:
+        return Episode.from_dict(json.loads(row["data_json"]))
+
+    def _upsert(self, ep: Episode) -> None:
+        conn, lock = self._acquire()
+        with lock:
+            conn.execute(
+                """INSERT INTO episodes
+                     (episode_id, symbol, decision_ts, outcome_ts, outcome_status,
+                      source, retrieval_count, created_ts, data_json)
+                   VALUES(?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(episode_id) DO UPDATE SET
+                     symbol=excluded.symbol, decision_ts=excluded.decision_ts,
+                     outcome_ts=excluded.outcome_ts, outcome_status=excluded.outcome_status,
+                     source=excluded.source, retrieval_count=excluded.retrieval_count,
+                     created_ts=excluded.created_ts, data_json=excluded.data_json""",
+                self._episode_row(ep),
+            )
+            conn.commit()
+
     # ------------------------------------------------------------- writes
 
     def add(self, episode: Episode) -> None:
-        """Append a new episode (or replace one with the same ``episode_id``)."""
-        existing = list(self.iter_all())
-        replaced = False
-        for i, ep in enumerate(existing):
-            if ep.episode_id == episode.episode_id:
-                existing[i] = episode
-                replaced = True
-                break
-        if not replaced:
-            existing.append(episode)
-        self._rewrite(existing)
+        """Insert a new episode (or replace one with the same ``episode_id``)."""
+        self._upsert(episode)
 
     def update_outcome(
         self,
@@ -336,7 +597,11 @@ class EpisodicMemory:
         alpha_return: float,
         max_drawdown: float,
         reflection: Optional[str] = None,
+        reflection_meta: Optional[Dict[str, Any]] = None,
         outcome_ts: Optional[str] = None,
+        market_return: Optional[float] = None,
+        outcome_label: Optional[str] = None,
+        market_reason: Optional[str] = None,
     ) -> bool:
         """Transition an episode from PENDING to RESOLVED.
 
@@ -344,59 +609,115 @@ class EpisodicMemory:
         Idempotent: re-resolving an already-RESOLVED episode updates its
         outcome but keeps the original ``created_ts``.
         """
-        existing = list(self.iter_all())
-        found = False
-        for ep in existing:
-            if ep.episode_id == episode_id:
-                ep.realised_return = realised_return
-                ep.alpha_return = alpha_return
-                ep.max_drawdown = max_drawdown
-                ep.outcome_status = OutcomeStatus.RESOLVED
-                if reflection is not None:
-                    ep.reflection = reflection
-                if outcome_ts is not None:
-                    ep.outcome_ts = outcome_ts
-                found = True
-                break
-        if found:
-            self._rewrite(existing)
-        return found
+        ep = self.get(episode_id)
+        if ep is None:
+            return False
+        ep.realised_return = realised_return
+        ep.alpha_return = alpha_return
+        ep.max_drawdown = max_drawdown
+        ep.outcome_status = OutcomeStatus.RESOLVED
+        if reflection is not None:
+            ep.reflection = reflection
+        if reflection_meta is not None:
+            ep.reflection_meta = reflection_meta
+        if outcome_ts is not None:
+            ep.outcome_ts = outcome_ts
+        if market_return is not None:
+            ep.market_return = market_return
+        if outcome_label is not None:
+            ep.outcome_label = outcome_label
+        if market_reason is not None:
+            ep.market_reason = market_reason
+        self._upsert(ep)
+        return True
+
+    def update_review(
+        self,
+        episode_id: str,
+        *,
+        review_ts: str,
+        realised_return: float,
+        alpha_return: float,
+        max_drawdown: float,
+        market_return: Optional[float],
+        outcome_label: str,
+        reflection: Optional[str] = None,
+        reflection_meta: Optional[Dict[str, Any]] = None,
+        embargo_days: int = 0,
+    ) -> bool:
+        """Write the 30-day learning review without flipping thesis status."""
+        ep = self.get(episode_id)
+        if ep is None:
+            return False
+        payload: Dict[str, Any] = {
+            "realised_return": realised_return,
+            "alpha_return": alpha_return,
+            "max_drawdown": max_drawdown,
+            "market_return": market_return,
+            "outcome_label": outcome_label,
+            "reflection": reflection,
+            "reflection_meta": reflection_meta,
+        }
+        ep.review_ts = review_ts
+        ep.review_status = "RESOLVED"
+        ep.review_embargo_days = int(embargo_days)
+        ep.review = payload
+        scores = dict(ep.horizon_scores or {})
+        scores["short"] = {
+            "realised_return": realised_return,
+            "alpha_return": alpha_return,
+            "max_drawdown": max_drawdown,
+            "outcome_label": outcome_label,
+        }
+        ep.horizon_scores = scores
+        self._upsert(ep)
+        return True
 
     def abandon(self, episode_id: str, reason: str = "") -> bool:
         """Mark an episode ``ABANDONED`` — excluded from retrieval but retained for replay."""
-        existing = list(self.iter_all())
-        found = False
-        for ep in existing:
-            if ep.episode_id == episode_id:
-                ep.outcome_status = OutcomeStatus.ABANDONED
-                if reason:
-                    ep.reflection = f"ABANDONED: {reason}"
-                found = True
-                break
-        if found:
-            self._rewrite(existing)
-        return found
+        ep = self.get(episode_id)
+        if ep is None:
+            return False
+        ep.outcome_status = OutcomeStatus.ABANDONED
+        if reason:
+            ep.reflection = f"ABANDONED: {reason}"
+        self._upsert(ep)
+        return True
 
     # -------------------------------------------------------------- reads
 
     def iter_all(self) -> Iterable[Episode]:
-        if not self.path.is_file():
-            return
-        with self.path.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                yield Episode.from_dict(json.loads(line))
+        conn, lock = self._acquire()
+        with lock:
+            rows = conn.execute(
+                "SELECT data_json FROM episodes ORDER BY rowid"
+            ).fetchall()
+        for row in rows:
+            yield self._row_to_episode(row)
 
     def all_episodes(self) -> List[Episode]:
         return list(self.iter_all())
 
     def get(self, episode_id: str) -> Optional[Episode]:
-        for ep in self.iter_all():
-            if ep.episode_id == episode_id:
-                return ep
-        return None
+        conn, lock = self._acquire()
+        with lock:
+            row = conn.execute(
+                "SELECT data_json FROM episodes WHERE episode_id=?", (episode_id,)
+            ).fetchone()
+        return self._row_to_episode(row) if row else None
+
+    @property
+    def db_path(self) -> Path:
+        """The SQLite file backing this store (the shared prediction.db in production)."""
+        return self._db_path
+
+    def remove(self, episode_id: str) -> bool:
+        """Delete one episode by id.  Returns True if a row was removed."""
+        conn, lock = self._acquire()
+        with lock:
+            cur = conn.execute("DELETE FROM episodes WHERE episode_id=?", (episode_id,))
+            conn.commit()
+        return cur.rowcount > 0
 
     # -------------------------------------------------------------- retrieval
 
@@ -413,14 +734,17 @@ class EpisodicMemory:
 
         Filtering rules:
 
-        1. Only ``RESOLVED`` episodes are eligible (PENDING leaks future
-           info; ABANDONED is signal-noise).
-        2. ``effective_unembargoed_ts`` must be ≤ ``as_of``.  This is the
-           outcome-embargo step (paper §13.1.2).
-        3. If ``symbol`` is given, prefer same-symbol episodes (we don't
+        1. ``RESOLVED`` episodes whose ``effective_unembargoed_ts`` ≤
+           ``as_of`` are eligible (the thesis-horizon embargo).
+        2. ``PENDING`` episodes whose 30-day ``review`` has resolved and
+           whose ``effective_review_unembargoed_ts`` ≤ ``as_of`` are also
+           eligible — only the short-review lesson is visible, not the
+           unfinished thesis outcome.
+        3. ``ABANDONED`` is excluded.
+        4. If ``symbol`` is given, prefer same-symbol episodes (we don't
            hard-filter — cross-ticker lessons are valuable per the paper —
            but we boost same-symbol by 10% in the score).
-        4. If ``regime`` is given, same-regime episodes get a small boost.
+        5. If ``regime`` is given, same-regime episodes get a small boost.
 
         Score: ``cosine(query, episode) − decay_weight · exp(−decay·Δdays) · (Δdays - 0)`` — wait,
         we use ``cosine + decay_weight · exp(−decay·Δdays)`` where the
@@ -434,10 +758,15 @@ class EpisodicMemory:
 
         candidates: List[RetrievedEpisode] = []
         for ep in self.iter_all():
-            if ep.outcome_status != OutcomeStatus.RESOLVED:
+            if ep.outcome_status == OutcomeStatus.ABANDONED:
                 continue
-            if ep.effective_unembargoed_ts() > as_of_dt:
-                continue  # OUTCOME EMBARGO — never include future-known outcomes
+            thesis_open = (
+                ep.outcome_status == OutcomeStatus.RESOLVED
+                and ep.effective_unembargoed_ts() <= as_of_dt
+            )
+            review_open = (not thesis_open) and ep.review_retrievable(as_of_dt)
+            if not thesis_open and not review_open:
+                continue  # OUTCOME / REVIEW EMBARGO — never include future-known tape
 
             ep_vec = self._embed(ep.state_summary)
             sim = _cosine(query_vec, ep_vec)
@@ -470,24 +799,23 @@ class EpisodicMemory:
         top = candidates[:k]
 
         # Retrieval-counter bookkeeping — increments on every successful
-        # retrieve() call so evict() can preserve frequently-cited
-        # lessons.  We persist via a single _rewrite() at the end (no
-        # per-episode incremental write) to keep retrieval cheap.
+        # retrieve() call so evict() can preserve frequently-cited lessons.
+        # A targeted UPDATE per touched id (keeps ``data_json`` in sync too).
         if top:
-            touched = {r.episode.episode_id for r in top}
-            episodes = list(self.iter_all())
-            changed = False
-            for ep in episodes:
-                if ep.episode_id in touched:
-                    ep.retrieval_count = int(getattr(ep, "retrieval_count", 0) or 0) + 1
-                    changed = True
-            if changed:
-                try:
-                    self._rewrite(episodes)
-                except OSError:
-                    # Persistence is best-effort — retrieval still
-                    # succeeds even if disk is read-only.
-                    pass
+            try:
+                conn, lock = self._acquire()
+                with lock:
+                    for r in top:
+                        ep = r.episode
+                        ep.retrieval_count = int(getattr(ep, "retrieval_count", 0) or 0) + 1
+                        conn.execute(
+                            "UPDATE episodes SET retrieval_count=?, data_json=? WHERE episode_id=?",
+                            (ep.retrieval_count, json.dumps(ep.to_dict(), sort_keys=True), ep.episode_id),
+                        )
+                    conn.commit()
+            except sqlite3.Error:
+                # Persistence is best-effort — retrieval still succeeds.
+                pass
 
         return top
 
@@ -539,29 +867,16 @@ class EpisodicMemory:
             survivors.sort(key=lambda ep: ep.decision_ts, reverse=True)
             survivors = survivors[:max_records]
 
-        removed = len(episodes) - len(survivors)
-        if removed:
-            self._rewrite(survivors)
-        return removed
-
-    # -------------------------------------------------------------- internals
-
-    def _rewrite(self, episodes: Sequence[Episode]) -> None:
-        """Atomic JSONL rewrite — same crash-safe pattern as state.py."""
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        try:
-            with tmp.open("w", encoding="utf-8") as fh:
-                for ep in episodes:
-                    fh.write(json.dumps(ep.to_dict(), sort_keys=True) + "\n")
-            os.replace(tmp, self.path)
-        except OSError as exc:
-            logger.warning("could not persist episodic memory to %s: %s", self.path, exc)
-            try:
-                if tmp.exists():
-                    tmp.unlink()
-            except OSError:
-                pass
-            raise
+        survivor_ids = {ep.episode_id for ep in survivors}
+        removed_ids = [ep.episode_id for ep in episodes if ep.episode_id not in survivor_ids]
+        if removed_ids:
+            conn, lock = self._acquire()
+            with lock:
+                conn.executemany(
+                    "DELETE FROM episodes WHERE episode_id=?", [(i,) for i in removed_ids]
+                )
+                conn.commit()
+        return len(removed_ids)
 
 
 def _parse_ts(ts: str) -> datetime:

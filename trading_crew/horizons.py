@@ -6,7 +6,7 @@ holding the trade*.  Historically the codebase used ``horizon_days``
 alone, defaulted to 90–120, and any horizon > ~252d fell off the
 prompt's cognitive map.  This module gives us a compact three-tier
 alphabet that survives across the schema, the backtest, the prompts,
-the UI, and the RLMF training loop.
+the UI, and the prediction-harness training loop.
 
 Rationale for three tiers (not more, not fewer)
 -----------------------------------------------
@@ -14,7 +14,9 @@ Rationale for three tiers (not more, not fewer)
   earnings plays, near-term catalyst bets.  This is what the trader's
   short panel already covered; we keep it because a few strategies
   (binary FDA event, earnings surprise, buyback close) genuinely need
-  a sub-quarter window.
+  a sub-quarter window.  Independently, the self-learn loop always
+  prices a ~21 trading-day / 30 calendar-day *review* (see
+  ``desk_strategy.yaml``) so MEDIUM/LONG theses still teach at 30 days.
 * **MEDIUM (61–252 trading days, ~3–12 calendar months)** — the "few
   months" bucket in the user's spec.  This is where most retail
   buy-and-hold-for-a-quarter positions live, and where a Ind-AS
@@ -48,7 +50,7 @@ class Horizon(str, Enum):
 
     Kept as a ``str`` Enum so Pydantic can serialise/deserialise it
     transparently and downstream consumers (JSON logs, the UI, the
-    RLMF dataset) see a plain string.
+    episode store) see a plain string.
     """
 
     SHORT = "SHORT"
@@ -80,7 +82,8 @@ class Horizon(str, Enum):
     The backtest panel covers 2y / 5y windows to bound the risk of
     the thesis.  Because outcome-resolution can't wait 10 years,
     the outcome_ts is clamped to *5 years* (1260 trading days) and
-    the RLMF loop uses the 2y realised return as the reward proxy.
+    the 30-day harness review still scores the short path while this
+    thesis stays pending.
     """
 
 

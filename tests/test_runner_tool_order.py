@@ -217,3 +217,187 @@ def test_orphan_finished_emits_after_timeout():
         assert events[0]["call_id"] is None
     finally:
         loop.close()
+
+
+def test_pm_regime_injection_prepends_once_and_skips_unknown():
+    """The deterministic regime is handed straight to the PM prompt: prepended
+    exactly once, never for UNKNOWN, and never when there's no PM handle."""
+    runner, loop = _fresh_runner()
+    try:
+        base = "You are the Portfolio Manager. Make the final call."
+        runner._pm_task = SimpleNamespace(description=base)
+        runner._pm_regime_injected = False
+
+        runner._inject_pm_regime("TREND")
+        assert runner._pm_regime_injected is True
+        assert "MARKET REGIME" in runner._pm_task.description
+        assert "TREND" in runner._pm_task.description
+        assert runner._pm_task.description.endswith(base)
+
+        # Idempotent — a second call must not stack a second block.
+        runner._inject_pm_regime("RANGE")
+        assert runner._pm_task.description.count("MARKET REGIME") == 1
+
+        # UNKNOWN / missing regime is not injected (no signal → no noise).
+        runner2, loop2 = _fresh_runner()
+        try:
+            runner2._pm_task = SimpleNamespace(description=base)
+            runner2._pm_regime_injected = False
+            runner2._inject_pm_regime("UNKNOWN")
+            runner2._inject_pm_regime(None)
+            assert "MARKET REGIME" not in runner2._pm_task.description
+            assert runner2._pm_regime_injected is False
+        finally:
+            loop2.close()
+
+        # No PM handle → no-op (deep-link / attach-only sessions).
+        runner3, loop3 = _fresh_runner()
+        try:
+            runner3._pm_task = None
+            runner3._pm_regime_injected = False
+            runner3._inject_pm_regime("TREND")  # must not raise
+            assert runner3._pm_regime_injected is False
+        finally:
+            loop3.close()
+    finally:
+        loop.close()
+
+
+def test_parse_desk_bias_classifies_tldr():
+    from web.backend.runner import _parse_desk_bias
+
+    assert _parse_desk_bias("TLDR:\n- up [source: x]\n- Bias: bullish\nbody") == "bullish"
+    assert _parse_desk_bias("- Bias: bearish / cautious") == "bearish"
+    assert _parse_desk_bias("Bias: neutral") == "neutral"
+    assert _parse_desk_bias("- Bias: mixed") == "neutral"
+    assert _parse_desk_bias("- Bias: positive, long thesis") == "bullish"
+    # Markdown-bold leaders the models actually emit (regression: these silently
+    # failed to parse at first, rendering an empty board on live runs).
+    assert _parse_desk_bias("- **Bias:** Slightly bearish.") == "bearish"
+    assert _parse_desk_bias("- **Bias:** Bullish on the chart, options mixed") == "bullish"
+    assert _parse_desk_bias("  - **Bias**: mixed signals") == "neutral"
+    assert _parse_desk_bias("* Bias - neutral") == "neutral"
+    assert _parse_desk_bias("- **Bias:** slight negative due to insider sales.") == "bearish"
+    # One safe qualifier word before "bias" is tolerated (Fundamentals writes
+    # "Long-term bias:", others "Overall/Net bias:").
+    assert _parse_desk_bias("- **Long-term bias:** stable cash-flow, debt reduction") == "neutral"
+    assert _parse_desk_bias("- Overall bias: bearish") == "bearish"
+    # Must NOT latch onto the reports desk's NET_GUIDANCE_BIAS: line or prose.
+    assert _parse_desk_bias("NET_GUIDANCE_BIAS: NEUTRAL (confidence 0.55)") is None
+    assert _parse_desk_bias("net positive bias.") is None
+    assert _parse_desk_bias("reflecting a market-wide bias toward downside moves") is None
+    # Canonical machine tag (the reliable primary source) is honoured and wins
+    # over the fuzzy prose line when both are present.
+    assert _parse_desk_bias("body...\nDESK_BIAS: BULLISH") == "bullish"
+    assert _parse_desk_bias("- DESK_BIAS: NEUTRAL") == "neutral"
+    assert _parse_desk_bias("**DESK_BIAS:** BEARISH") == "bearish"
+    assert _parse_desk_bias("- **Bias:** bearish on chart\n\nDESK_BIAS: BULLISH") == "bullish"
+    # No Bias line → nothing to surface (better than a fabricated lean).
+    assert _parse_desk_bias("just some prose, no verdict") is None
+    assert _parse_desk_bias("") is None
+
+
+def test_pm_bias_board_built_from_captured_desks(monkeypatch):
+    """Board renders one row per captured desk in canonical lens order, carries
+    the verdicts, and is explicitly non-directive."""
+    monkeypatch.setenv("TRADINGCREW_PM_DESK_BIAS_BOARD", "1")
+    runner, loop = _fresh_runner()
+    try:
+        runner._desk_biases = {
+            "Reports Analyst": "bullish",
+            "Market Analyst": "bearish",
+            "Macro Analyst": "neutral",
+        }
+        board = runner._build_bias_board()
+        # Canonical order: Market before Reports before Macro.
+        assert board.index("Market") < board.index("Reports/Guidance") < board.index("Macro")
+        assert "bullish" in board and "bearish" in board and "neutral" in board
+        # Non-directive on side, but disagreement is binding (HOLD on split).
+        assert "does not prescribe" in board.lower()
+        assert "HOLD" in board
+        assert "Neutrals do not create a split" in board
+    finally:
+        loop.close()
+
+
+def test_pm_bias_board_injects_once_via_pm_announce(monkeypatch):
+    """The board is handed to the PM exactly when its node is announced, once,
+    and only when the env flag is on."""
+    monkeypatch.setenv("TRADINGCREW_PM_DESK_BIAS_BOARD", "1")
+    runner, loop = _fresh_runner()
+    try:
+        base = "You are the Portfolio Manager. Decide."
+        runner._pm_task = SimpleNamespace(description=base)
+        runner._desk_biases = {"Market Analyst": "bullish", "News Analyst": "neutral"}
+
+        # A non-PM announce must NOT inject.
+        runner._announce("Bullish Researcher")
+        assert "DESK BIAS BOARD" not in runner._pm_task.description
+
+        # Announcing the PM injects the board, once, ending with the base.
+        runner._announce("Portfolio Manager")
+        assert runner._pm_bias_board_injected is True
+        assert runner._pm_task.description.count("DESK BIAS BOARD") == 1
+        assert runner._pm_task.description.endswith(base)
+
+        # …and it surfaces a desk_bias_board event for the dashboard.
+        events = _drain(runner)
+        board_evs = [e for e in events if e.get("type") == "desk_bias_board"]
+        assert len(board_evs) == 1
+        desks = {d["desk"]: d["bias"] for d in board_evs[0]["desks"]}
+        assert desks == {"Market": "bullish", "News": "neutral"}
+    finally:
+        loop.close()
+
+
+def test_pm_bias_board_disabled_by_env(monkeypatch):
+    monkeypatch.setenv("TRADINGCREW_PM_DESK_BIAS_BOARD", "0")
+    runner, loop = _fresh_runner()
+    try:
+        runner._pm_task = SimpleNamespace(description="base")
+        runner._desk_biases = {"Market Analyst": "bullish"}
+        runner._inject_pm_bias_board()
+        assert runner._pm_bias_board_injected is False
+        assert "DESK BIAS BOARD" not in runner._pm_task.description
+    finally:
+        loop.close()
+
+
+def test_pm_bias_board_empty_and_no_pm_are_noops(monkeypatch):
+    monkeypatch.setenv("TRADINGCREW_PM_DESK_BIAS_BOARD", "1")
+    runner, loop = _fresh_runner()
+    try:
+        # No desks captured → empty board, no injection.
+        runner._pm_task = SimpleNamespace(description="base")
+        runner._desk_biases = {}
+        runner._inject_pm_bias_board()
+        assert runner._pm_bias_board_injected is False
+        assert runner._build_bias_board() == ""
+
+        # No PM handle → silent no-op.
+        runner._pm_task = None
+        runner._desk_biases = {"Market Analyst": "bullish"}
+        runner._inject_pm_bias_board()  # must not raise
+        assert runner._pm_bias_board_injected is False
+    finally:
+        loop.close()
+
+
+def test_pm_bias_board_build_is_cheap():
+    """No I/O — building the board 5k times must be well under a second, so the
+    feature adds no meaningful wall-clock to a run."""
+    import time as _time
+
+    runner, loop = _fresh_runner()
+    try:
+        runner._desk_biases = {
+            "Market Analyst": "bullish", "News Analyst": "neutral",
+            "Fundamentals Analyst": "bullish", "Reports Analyst": "bearish",
+            "Macro Analyst": "neutral",
+        }
+        t0 = _time.perf_counter()
+        for _ in range(5000):
+            runner._build_bias_board()
+        assert _time.perf_counter() - t0 < 1.0
+    finally:
+        loop.close()

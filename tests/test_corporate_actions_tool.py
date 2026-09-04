@@ -35,6 +35,26 @@ from unittest.mock import patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _stub_firecrawl(monkeypatch):
+    """Firecrawl is a third (post-Phase-1) news provider; stub it to empty so
+    these tests exercise only the Tavily/SerpAPI paths they set up, without
+    making a live Firecrawl call when a key is present in the env.
+
+    Also stub the FREE custom-crawl tier (search_links) empty: corporate
+    actions is now custom-first (``TRADINGCREW_PREFER_CUSTOM_CRAWL`` default
+    on), so without this the free tier would satisfy every theme from the live
+    network and the paid-API rows these tests set up would never be reached."""
+    from trading_crew import tools
+    from trading_crew.data_sources import web_research
+
+    monkeypatch.setattr(tools, "_firecrawl_news", lambda q, max_results=8: [], raising=False)
+    monkeypatch.setattr(
+        web_research, "search_links",
+        lambda *a, **k: [], raising=False,
+    )
+
+
 def _fake_results(theme_to_results: Dict[str, List[Dict[str, str]]]):
     """Build a Tavily.search side_effect that returns canned hits per theme."""
     from trading_crew import tools as tools_mod

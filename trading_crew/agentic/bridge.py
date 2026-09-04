@@ -39,6 +39,7 @@ defensively (belt-and-braces).
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -92,11 +93,124 @@ def _action_side_from_decision(action: str, size_pct: float) -> ActionSide:
 
 
 def _conviction_tier_from_score(conv: float) -> ConvictionTier:
-    if conv >= 0.65:
-        return ConvictionTier.HIGH
-    if conv >= 0.35:
-        return ConvictionTier.MEDIUM
-    return ConvictionTier.LOW
+    """Delegate to the contract's canonical bucketing so the bridge and the
+    ``ActionProposal`` validator can never disagree on the thresholds."""
+    return ConvictionTier.from_score(conv)
+
+
+# --- Evidence-based conviction (M1) ---------------------------------------
+#
+# The Portfolio Manager's raw ``confidence`` is a single self-reported number
+# that empirically collapses into a narrow, overconfident band (~0.60-0.80):
+# on 824 production episodes 99% of scores fell in [0.60, 0.80] and only 0.5%
+# were ever LOW.  A compressed conviction defeats its whole purpose — M5 sizing
+# scales risk by it, so nearly every position gets the same size, and two runs
+# of the same name on the same day can flip BUY<->SELL at *identical*
+# conviction (pure noise, not a change of confidence).
+#
+# So instead of trusting one number, we fuse the *evidence the PM already
+# emitted alongside it* into a conviction that actually spans [0, 1]:
+#
+#   * action strength   — STRONG_BUY/STRONG_SELL is an explicit high-conviction
+#                         call the 4-value ActionSide throws away; we recover it.
+#   * evidence balance  — key_drivers vs (key_risks + falsifiers): a thesis with
+#                         many supports and few falsifiers is higher conviction
+#                         than a finely-balanced one.
+#   * capital committed — size_pct_of_book: how much book the PM is willing to
+#                         put behind the call (well-defined 0-100, unlike the
+#                         expected_return_pct whose units are still being fixed).
+#   * raw confidence    — kept, but de-weighted and floor-stretched so the
+#                         overconfident band no longer dominates.
+#
+# This is a deterministic, self-contained recalibration (no LLM, no resolved
+# outcomes needed).  Once enough outcomes resolve, the RLMF/calibration layer
+# can learn a data-driven correction on top; until then this restores a
+# meaningful spread from information already on the decision.
+def _conviction_mode() -> str:
+    """``evidence`` (default) or ``raw`` — read live so it can be toggled at
+    runtime (and monkeypatched in tests) without re-importing."""
+    return (os.getenv("TRADINGCREW_CONVICTION_MODE", "evidence") or "evidence").strip().lower()
+
+
+_CONV_W_ACTION = 0.45
+_CONV_W_EVIDENCE = 0.25
+_CONV_W_SIZE = 0.15
+_CONV_W_CONF = 0.15
+# size_pct_of_book (a 0-100 percentage) that counts as "full commitment".
+_CONV_SIZE_FULL_PCT = 5.0
+# Raw confidence below this floor contributes nothing; above it is stretched to
+# [0, 1] so the observed 0.60-0.80 band spreads instead of acting as a constant
+# offset.
+_CONV_CONF_FLOOR = 0.50
+
+_ACTION_STRENGTH = {
+    "STRONG_BUY": 1.0,
+    "STRONG_SELL": 1.0,
+    "BUY": 0.5,
+    "SELL": 0.5,
+    "OVERWEIGHT": 0.5,
+    "UNDERWEIGHT": 0.5,
+    "HOLD": 0.25,
+    "NEUTRAL": 0.25,
+}
+
+
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, x))
+
+
+def _evidence_conviction(decision: PortfolioDecision, side: ActionSide) -> float:
+    """Fuse the PM's own evidence into a conviction score in [0, 1].
+
+    See the module note above for the rationale.  The result is deterministic
+    and depends only on fields already present on ``decision``.
+    """
+    action = (decision.action or "HOLD").upper()
+    s_action = _ACTION_STRENGTH.get(action, 0.0)
+
+    n_drivers = len(decision.key_drivers or [])
+    n_against = len(decision.key_risks or []) + len(decision.falsifiers or [])
+    denom = n_drivers + n_against
+    # No evidence either way -> neutral 0.5 (not a failure fallback; it is the
+    # correct prior when the PM listed neither supports nor falsifiers).
+    s_evidence = (n_drivers / denom) if denom else 0.5
+
+    size_pct = max(0.0, float(decision.size_pct_of_book or 0.0))
+    s_size = _clamp01(size_pct / _CONV_SIZE_FULL_PCT)
+
+    raw_conf = _clamp01(float(decision.confidence or 0.0))
+    s_conf = _clamp01((raw_conf - _CONV_CONF_FLOOR) / (1.0 - _CONV_CONF_FLOOR))
+
+    conv = (
+        _CONV_W_ACTION * s_action
+        + _CONV_W_EVIDENCE * s_evidence
+        + _CONV_W_SIZE * s_size
+        + _CONV_W_CONF * s_conf
+    )
+    # A degenerate directional call rolled back to ABSTAIN carries no real
+    # conviction; cap it low so downstream sizing can't act on it.
+    if side == ActionSide.ABSTAIN:
+        conv = min(conv, 0.15)
+    return _clamp01(conv)
+
+
+def _signed_expected_return(er: float, side: ActionSide) -> float:
+    """Force ``expected_return_pct`` (a canonical DECIMAL fraction) to agree
+    in sign with the trade side.
+
+    Convention: ``expected_return_pct`` is the expected move of the
+    *underlying* — positive for a long thesis, negative for a short.  The PM
+    occasionally emits a contradictory sign (e.g. a positive number on a
+    SELL); we resolve it deterministically from the side magnitude rather
+    than trusting the stray sign, so M5 Kelly sizing and the M7 allocator see
+    a coherent edge.  HOLD / ABSTAIN carry no directional edge.
+    """
+    mag = abs(er)
+    if side == ActionSide.BUY:
+        return mag
+    if side == ActionSide.SELL:
+        return -mag
+    return 0.0
 
 
 def _target_weight_from_decision(side: ActionSide, size_pct: float) -> float:
@@ -172,7 +286,16 @@ def portfolio_decision_to_action_proposal(
     try:
         side = _action_side_from_decision(decision.action, decision.size_pct_of_book)
         target_weight = _target_weight_from_decision(side, decision.size_pct_of_book)
-        tier = _conviction_tier_from_score(decision.confidence)
+        # Derive the conviction score, then bucket the tier from the *same*
+        # value so the two can never disagree.  ``evidence`` (default) fuses the
+        # PM's own drivers/risks/action-strength/size into a score that actually
+        # spans [0, 1]; ``raw`` preserves the legacy "conviction == confidence"
+        # behaviour for A/B comparison and easy rollback.
+        if _conviction_mode() == "raw":
+            conviction = _clamp01(float(decision.confidence or 0.0))
+        else:
+            conviction = _evidence_conviction(decision, side)
+        tier = _conviction_tier_from_score(conviction)
         validity = _validity_check_from_decision(decision, side, decision.size_pct_of_book)
 
         rationale = (decision.rationale or "").strip()
@@ -213,10 +336,12 @@ def portfolio_decision_to_action_proposal(
             horizon_days=accounting_horizon,
             limit_price=decision.entry_price if decision.entry_price > 0 else None,
             tif=OrderTimeInForce.DAY,
-            conviction_score=max(0.0, min(1.0, float(decision.confidence or 0.0))),
+            conviction_score=conviction,
             conviction_tier=tier,
             sizing_basis=SizingBasis.TARGET_WEIGHT,
-            expected_return_pct=float(decision.expected_return_pct or 0.0),
+            expected_return_pct=_signed_expected_return(
+                float(decision.expected_return_pct or 0.0), side
+            ),
             rationale=rationale,
             validity_check=validity,
             tags=tags,

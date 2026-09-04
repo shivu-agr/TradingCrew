@@ -180,7 +180,9 @@ risk_aggressive:
     e.g. when backwardation pays you to be long AND positioning is
     light. You reason about leverage in vol-target terms, not gross
     notional, so a 5% book risk on a 15-vol contract is your default
-    starting point, not a ceiling.
+    starting point, not a ceiling. Round 1 is your independent first
+    size-up thought, in parallel with Conservative — not a rebuttal.
+    Later rounds rebut the other wing.
 
 risk_neutral:
   role: Neutral Risk Analyst
@@ -202,7 +204,9 @@ risk_conservative:
     highlight tail risks (geopolitical shocks, USDA surprise reports,
     OPEC headlines), correlated exposures across the book, and reasons
     the trade could quietly fail. You favour smaller size and tighter
-    stops when implied vol is at multi-month highs.
+    stops when implied vol is at multi-month highs. Round 1 is your
+    independent first size-down thought, in parallel with Aggressive —
+    not a rebuttal. Later rounds rebut the other wing.
 
 # ----- Compliance + Portfolio Manager ----------------------------------------
 

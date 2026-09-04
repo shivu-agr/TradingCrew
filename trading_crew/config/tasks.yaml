@@ -4,7 +4,7 @@
 # Task graph (sequential, with async_execution wired in code for the analyst
 # fan-out and context= chains wired in code from the @task decorators):
 #
-#   4 analysts (parallel via async_execution=True)
+#   5 analysts (parallel via async_execution=True)
 #     -> DEBATE_ROUNDS x (Bull -> Bear)
 #       -> Research Manager synthesis
 #           -> Trader plan
@@ -57,11 +57,13 @@
 
 # ----- Analyst phase (all 4 run with async_execution=True in code) ----------
 #
-# The four desks below were consolidated from an earlier eight-analyst
-# layout.  Each one now covers a wider remit under a batched tool budget:
+# The five desks below: four were consolidated from an earlier eight-analyst
+# layout, and a fifth (Reports / Guidance) was added back to read the
+# company's own filings.  Each covers a wider remit under a batched tool budget:
 #   * market_analyst        = price/technicals + options/positioning (was market + quant)
 #   * news_analyst          = catalysts + corporate actions + sentiment + insider (was news + social)
 #   * fundamentals_analyst  = financials + long-term thesis + sector/peers (was fundamentals + sector)
+#   * reports_analyst       = primary filings / management guidance / target-vs-actual
 #   * macro_analyst         = macro regime + geopolitical + supply-chain (was macro + geopolitical)
 
 market_task:
@@ -71,6 +73,11 @@ market_task:
     Tool budget: call each tool AT MOST ONCE, then write the report.
     Do NOT loop for more calls — emitting another tool call instead of
     a final report counts as task failure.
+
+    When the tools have returned, WRITE THE REPORT immediately.  Do NOT
+    narrate your tool usage ("Let me get…", "Now let me…", "I'll fetch…")
+    — the report is the ONLY output, and a narration of tool calls
+    instead of a report is a task failure.
 
     Mandatory order:
       1. get_stock_data — 5-year OHLCV (5y overview + monthly
@@ -104,6 +111,10 @@ market_task:
     implied move + put/call read, sell-side consensus, and a 1-line
     bias (bullish / bearish / neutral).  Keep under ~2000 chars.  Every
     number must carry an inline ``[source: <identifier>]`` tag.
+    The VERY LAST line of the report MUST be the canonical machine tag
+    ``DESK_BIAS: BULLISH`` (or ``BEARISH`` / ``NEUTRAL``) — exactly one
+    uppercase word, alone on its line — so the desk's directional lean is
+    read deterministically downstream.  This is REQUIRED, not optional.
 
 news_task:
   description: >
@@ -115,14 +126,19 @@ news_task:
     report.  Emitting more tool calls instead of a final report
     counts as task failure.
 
+    When the tools have returned, WRITE THE REPORT immediately.  Do NOT
+    narrate your tool usage ("Let me get…", "Now let me…", "I'll fetch…")
+    — the report is the ONLY output, and a narration of tool calls
+    instead of a report is a task failure.
+
     Mandatory order:
-      1. Call get_market_context({ticker}) ONCE so you know the company's
-         country, industry, and the country-/industry-specific news themes
-         to query.  Do NOT default to US-centric themes (Fed, treasury,
-         DXY) unless the brief tells you the company is US-listed.
-      2. Call get_news({ticker}) for company-specific catalysts and the
-         overall sentiment / tone (the tool searches by the long name
-         from the brief).
+      1. Call get_market_context({ticker}) ONCE. The brief is FACTS
+         (country, industry, name) — not a canned theme list. Do NOT
+         default to US-centric headlines unless the brief says the
+         company is US-listed.
+      2. From the brief + your catalyst remit + any gap you still have,
+         write a 6-12 word query and call get_news({ticker},
+         query="<your query>").
       3. Call get_corporate_actions({ticker}) — this is the **specific**
          hook for buybacks, dividends, splits, M&A, guidance updates,
          and board / management changes that the generic
@@ -131,9 +147,9 @@ news_task:
          leadership change during the analysis window it will surface
          here.  Treat any hits as first-class catalysts in the report,
          even if get_news did not surface them.
-      4. Call get_global_news({ticker}) so the macro headlines surfaced
-         are for the company's home country (RBI / Union Budget /
-         INR for an Indian name, Fed / CPI / DXY for a US name, …).
+      4. Write a home-country macro query from the brief (central bank,
+         FX, inflation for THAT country) and call
+         get_global_news({ticker}, query="<your query>").
       5. Call get_insider_transactions for executive activity.
 
     Tie each headline to a likely impact (positive / negative / neutral),
@@ -161,13 +177,17 @@ news_task:
     dividend / split / M&A / guidance / board — each hit cited with
     its ``[source: <url>]`` URL, or one line "none in window" if
     get_corporate_actions found nothing), 3-5 company catalysts (drawn
-    from the news THEMES in the market context — e.g. defence
-    procurement, shipping insurance, OPEC quota — not generic US macro
-    lines), an overall sentiment / dominant-narrative read, 2-3 macro
+    from queries YOU wrote off the brief's country + industry — not
+    generic US macro lines), an overall sentiment / dominant-narrative
+    read, 2-3 macro
     items from the company's HOME-COUNTRY basket, insider activity
     summary, and 1-line bias.  Keep under ~2800 chars total.  Every
     numeric claim and every headline carries an inline
     ``[source: <url-or-identifier>]`` tag.
+    The VERY LAST line of the report MUST be the canonical machine tag
+    ``DESK_BIAS: BULLISH`` (or ``BEARISH`` / ``NEUTRAL``) — exactly one
+    uppercase word, alone on its line — so the desk's directional lean is
+    read deterministically downstream.  This is REQUIRED, not optional.
 
 fundamentals_task:
   description: >
@@ -176,6 +196,14 @@ fundamentals_task:
     name against its sector peers.
 
     Tool budget: call each tool AT MOST ONCE, then write the report.
+    Exception: get_sector_peers may be called a second time only to
+    pass peers= after you reject a live set as the wrong industry
+    or country.
+
+    When the tools have returned, WRITE THE REPORT immediately.  Do NOT
+    narrate your tool usage ("Let me get…", "Now let me…", "I'll fetch…")
+    — the report is the ONLY output, and a narration of tool calls
+    instead of a report is a task failure.
 
     Mandatory tool sequence:
       1. get_fundamentals — snapshot ratios (P/E, EPS, margins).
@@ -199,9 +227,14 @@ fundamentals_task:
          the call weighs where the business is HEADING, not only where it
          has been.  If coverage is sparse the tool says so — do not invent
          estimates.
-      6. get_sector_peers — YTD return / market-cap / P/E across the
-         country-appropriate peer basket, so you can state the alpha
-         vs the median peer.
+      6. get_sector_peers({ticker}) — live Yahoo industry + country
+         screen (not a ticker dictionary). Always pass ticker={ticker};
+         an empty argument object is a failed call. Quote the tool's
+         "Focus alpha vs median" line; do not recompute it. If a row
+         is INDUSTRY_MISMATCH or the set is the wrong country, you may
+         call get_sector_peers({ticker}, peers="<space-separated
+         yfinance tickers you already saw in a filing or tool output>")
+         a second time. Do not invent tickers.
 
     Assess growth, profitability, balance-sheet strength, free-cash-flow
     quality, the multi-year compounding quality, AND relative strength
@@ -259,6 +292,91 @@ fundamentals_task:
     never attach a ``get_long_term_thesis`` source tag to a number that
     is not in its output.  Keep under ~3800 chars.  Every figure cited
     carries an inline ``[source: <identifier>]`` tag.
+    The VERY LAST line of the report MUST be the canonical machine tag
+    ``DESK_BIAS: BULLISH`` (or ``BEARISH`` / ``NEUTRAL``) — exactly one
+    uppercase word, alone on its line — reflecting your net near-term +
+    long-term lean, so it is read deterministically downstream.  REQUIRED.
+
+reports_task:
+  description: >
+    Read {ticker}'s OWN primary filings and extract the MANAGEMENT
+    GUIDANCE / TARGETS, the TARGET-vs-ACTUAL delivery record, and the
+    forward outlook — the signal the restated ratio tables never show.
+
+    Tool budget: AT MOST 3 tool calls in this fixed order.  After the
+    third tool returns you MUST stop calling tools and write the report.
+
+    When the tools have returned, WRITE THE REPORT immediately.  Do NOT
+    narrate your tool usage ("Let me get…", "Now let me…", "I'll fetch…")
+    — the report is the ONLY output, and a narration of tool calls
+    instead of a report is a task failure.
+
+    Mandatory order:
+      1. get_market_context({ticker}) — learn the country + industry so
+         you frame guidance in context (and know whether primary filings
+         are even available for this name).
+      2. **get_report_insights({ticker})** — the core tool.  It pulls
+         {ticker}'s primary filings — for INDIAN names the concall /
+         earnings-call transcripts, investor presentations, annual-report
+         MD&A and credit-rating rationales from screener.in; for US names
+         the SEC EDGAR 10-K / 10-Q reports (MD&A / outlook) and earnings
+         8-Ks (results + guidance) — crawls the (large) documents and
+         returns an LLM-summarised digest.  The digest LEADS with a
+         **REPORT TREND SIGNALS card**: directional, confidence-scored
+         signals (OUTLOOK_TONE, REVENUE_GUIDANCE raised/maintained/cut,
+         MARGIN_GUIDANCE, DELIVERY_TRACK_RECORD beat/in-line/miss,
+         DEMAND_MOMENTUM, CREDIT_TRAJECTORY, and a synthesised
+         NET_GUIDANCE_BIAS), then the supporting evidence (explicit
+         guidance/targets with periods, target-vs-actual, forward outlook
+         + tone, credit action).  If the name is in NEITHER feed (e.g. a
+         London/HK listing) it returns a clear "not available" note — in
+         that case DO NOT invent guidance.
+      3. get_forward_estimates({ticker}) — the forward-CONSENSUS
+         counterweight (analyst targets, forward-vs-trailing EPS, revision
+         momentum).  This works everywhere, so it is your primary source
+         when step 2 reported "not available".
+
+    Your report is SPECIFICALLY about {ticker}'s OWN primary filings —
+    NEVER a generic market summary, and NEVER a reply to a generic
+    "summarize the market" prompt.  Write the report from the data the
+    tools actually returned in context (get_report_insights /
+    get_forward_estimates).  If a tool returned "not available", say so
+    plainly — do NOT substitute general-knowledge or unrelated market
+    commentary for the missing {ticker} data.
+
+    Write what management COMMITTED to vs what they DELIVERED, and whether
+    the delivery record earns their current outlook credibility.  Carry the
+    REPORT TREND SIGNALS card THROUGH to your report verbatim (it is the
+    desk's headline read) — do NOT drop or re-score it.  If no explicit
+    guidance/target exists in the filings, say so — never manufacture a
+    target or a signal direction the filings don't support.
+
+    PROVENANCE: cite every guidance figure / delivery datapoint with the
+    inline ``[source: <url>]`` tag carried by get_report_insights (each
+    filing's URL) or the get_forward_estimates source line.  A qualitative
+    read with no citable figure must be labelled ``[analyst judgement]`` —
+    never invent a URL or a placeholder link (``example.com``) to satisfy this rule.
+  expected_output: >
+    A REPORTS & GUIDANCE briefing that opens with a ``TLDR:`` 3-4 line
+    block LEADING with the NET_GUIDANCE_BIAS (POSITIVE / NEUTRAL / NEGATIVE
+    + confidence) and the 2-3 strongest trend signals (e.g. "revenue
+    guidance RAISED, delivery BEAT 3/4, tone BULLISH"), then the latest
+    explicit guidance/target and the most recent target-vs-actual verdict.
+    Immediately after the TLDR, reproduce the **REPORT TREND SIGNALS**
+    card verbatim from get_report_insights.  Then: (1) Management guidance
+    / targets, (2) Target vs actual delivery (beat / miss / in-line), (3)
+    Forward outlook & tone + named risks, (4) Credit / balance-sheet
+    actions if any.  If get_report_insights reported no primary filings
+    (name in neither the Indian nor US feed, or none on record), say so
+    explicitly in the TLDR (signals = INSUFFICIENT_DATA) and fall back to
+    the get_forward_estimates consensus view — do NOT fabricate management
+    targets.  Keep under ~3400 chars.  Every figure carries an inline
+    ``[source: …]`` tag.
+    The VERY LAST line of the report MUST be the canonical machine tag
+    ``DESK_BIAS: BULLISH`` (or ``BEARISH`` / ``NEUTRAL``) — exactly one
+    uppercase word, alone on its line, mapping your NET_GUIDANCE_BIAS
+    (POSITIVE→BULLISH, NEGATIVE→BEARISH, else NEUTRAL) so it is read
+    deterministically downstream.  REQUIRED (use NEUTRAL if INSUFFICIENT_DATA).
 
 macro_task:
   description: >
@@ -271,24 +389,27 @@ macro_task:
     report.  Emitting more tool calls counts as task failure (this was
     the degraded-output failure mode on tool-heavy runs).
 
+    When the tools have returned, WRITE THE REPORT immediately.  Do NOT
+    narrate your tool usage ("Let me get…", "Now let me…", "I'll fetch…")
+    — the report is the ONLY output, and a narration of tool calls
+    instead of a report is a task failure.
+
     Mandatory order:
-      1. Call get_market_context({ticker}) ONCE to learn the country,
-         currency, the macro basket, and the industry themes that
-         matter for this name (e.g. shipbuilder → ship insurance war
-         risk + Strait of Hormuz + naval procurement; semis → chip
-         export controls + Taiwan strait; oil & gas → OPEC quota +
-         Red Sea shipping).
-      2. Call get_macro_data({ticker}) — the basket is country-aware:
-         US → 10y UST + DXY + VIX + WTI + gold; India → Nifty +
-         India VIX + INR/USD + Sensex + Brent; UK / HK / JP get their
-         own equivalents.
-      3. Call get_global_news({ticker}) so the macro news headlines
-         match the country (RBI repo / Union Budget for India,
-         FOMC / CPI for the US, BoE for the UK, …).
-      4. Call get_geopolitical_news({ticker}) — the query is derived
-         from the brief's country + industry seeds.
-      5. Call get_supply_chain_risk({ticker}) to map customer /
-         supplier concentration.
+      1. Call get_market_context({ticker}) ONCE. The brief is FACTS
+         (country, currency, sector, industry, macro-ticker symbols).
+         It does not hand you Hormuz / TSMC / Fed phrases — you name
+         the chokepoint that follows from THIS country + industry.
+      2. Call get_macro_data({ticker}) — levels for the brief's
+         country macro-ticker symbols.
+      3. Write a 6-12 word home-country macro query (central bank, FX,
+         inflation for that country) and call
+         get_global_news({ticker}, query="<your query>").
+      4. From the brief + your remit (tariffs, export controls,
+         sanctions, regional chokepoints) + any gap still open, write
+         a 6-12 word query and call
+         get_geopolitical_news({ticker}, query="<your query>").
+      5. Same for suppliers / OEMs / shortages:
+         get_supply_chain_risk({ticker}, query="<your query>").
 
     State whether the regime is risk-on or risk-off in the COMPANY'S
     home country, how it tilts a {ticker} position (translate FX moves
@@ -313,15 +434,35 @@ macro_task:
     with exposure estimates, and a 1-line tilt on the trade.  Keep
     under ~2800 chars.  Every claim carries an inline ``[source: …]``
     tag.
+    The VERY LAST line of the report MUST be the canonical machine tag
+    ``DESK_BIAS: BULLISH`` (or ``BEARISH`` / ``NEUTRAL``) — exactly one
+    uppercase word, alone on its line, reflecting how the macro +
+    geopolitical regime tilts the trade, so it is read deterministically
+    downstream.  This is REQUIRED, not optional.
 
 # ----- Bull / Bear debate (per-round tasks generated in code) ---------------
 
 bull_round:
   description: >
-    Debate round {round_num} of {total_rounds} (BULL turn). Read all four
-    analyst reports and prior debate turns in context. State the strongest
-    bullish argument for {ticker} in 4-6 bullets, each tied to a specific
-    analyst report or earlier debate point.
+    Debate round {round_num} of {total_rounds} (BULL turn) for {ticker}.
+    Analyst reports and prior turns are NOT dumped into this task's
+    context. Start by calling read_scratchpad ONCE — that shared pad
+    holds compact analyst TLDRs, prior debate turns, and live notes.
+
+    Tool budget (hard, at most 4 calls this turn):
+      1. read_scratchpad (required, first).
+      2. Optional NEW-evidence calls with a fresh query — research_web
+         ("<specific claim to support or rebut>"), get_news("{ticker}"),
+         and/or get_event_proximity("{ticker}"). Do not re-ask what is
+         already on the pad.
+      3. Optional request_evidence if a missing number is owned by an
+         analyst desk (cap 2 per run).
+      4. write_scratchpad with compact NEW claims or tool findings
+         (author=bull). Your finished 4-6 bullets are copied onto the
+         pad automatically — do not paste that whole turn.
+
+    Then state the strongest bullish argument in 4-6 bullets, each tied
+    to a scratch-pad TLDR, a prior debate turn, or a tool you just called.
 
     Round-{round_num} discipline (REQUIRED — the runner persists every
     round separately now, so duplicate rounds are visible to the
@@ -346,9 +487,9 @@ bull_round:
               words and add what's new since.
 
     PROVENANCE: copy each ``[source: <identifier>]`` tag verbatim from
-    the analyst report you cite. Do NOT introduce new numbers — only
-    paraphrase or aggregate analyst figures, keeping their tags
-    attached.
+    the pad or from a tool you called this turn. You MAY introduce
+    numbers that came from those tool calls, with their tags. Do NOT
+    invent numbers.
   expected_output: >
     Bull argument for round {round_num} (bulleted; for round_num > 1
     starts with one or more ``REBUTTAL:`` lines that paste the bear
@@ -358,42 +499,240 @@ bull_round:
 
 bear_round:
   description: >
-    Debate round {round_num} of {total_rounds} (BEAR turn). State the
-    strongest bearish argument in 4-6 bullets, each tied to evidence in
-    the analyst reports or prior debate. Explicitly rebut the BULL turn
-    that just ran.
+    Debate round {round_num} of {total_rounds} (BEAR turn) for {ticker}.
+    Analyst reports and prior turns are NOT dumped into this task's
+    context. Start by calling read_scratchpad ONCE — that shared pad
+    holds compact analyst TLDRs, prior debate turns, and live notes.
 
-    Round-{round_num} discipline (REQUIRED):
-      * Open with one or more ``REBUTTAL:`` lines that paste the exact
-        bull bullet (with its ``[source: …]`` tag) you are attacking,
-        followed by 1-2 lines explaining why it does not hold.
-      * If round_num > 1, additionally:
-          (a) Introduce AT LEAST ONE risk that draws on a non-yfinance
+    Tool budget (hard, at most 4 calls this turn):
+      1. read_scratchpad (required, first).
+      2. Optional NEW-evidence calls with a fresh query — research_web
+         ("<specific claim to support or rebut>"), get_news("{ticker}"),
+         and/or get_event_proximity("{ticker}"). Do not re-ask what is
+         already on the pad.
+      3. Optional request_evidence if a missing number is owned by an
+         analyst desk (cap 2 per run).
+      4. write_scratchpad with compact NEW claims or tool findings
+         (author=bear). Your finished 4-6 bullets are copied onto the
+         pad automatically — do not paste that whole turn.
+
+    Then state the strongest bearish argument in 4-6 bullets, each tied
+    to a scratch-pad TLDR, a prior debate turn, or a tool you just called.
+
+    Round-{round_num} discipline (REQUIRED — the runner persists every
+    round separately now, so duplicate rounds are visible to the
+    reviewer):
+      * If round_num == 1: this is your OPENING, run in parallel with
+        the bull. Write an independent first bearish case from the
+        analyst TLDRs and your own tools. Open with your strongest
+        4-6 downside drivers. Do NOT open with ``REBUTTAL:`` and do
+        NOT wait for or attack a bull turn — even if a bull opening
+        is already on the pad, ignore it this round.
+      * If round_num > 1: this turn MUST be materially different from
+        your round (round_num - 1).  Specifically:
+          (a) Open with one or more ``REBUTTAL:`` lines that paste the
+              exact bull bullet (with its ``[source: …]`` tag) you are
+              attacking, followed by 1-2 lines explaining why it does
+              not hold. Repeat for the next strongest bull bullet if
+              space allows.
+          (b) Introduce AT LEAST ONE risk that draws on a non-yfinance
               lens (news / social / macro / geopolitical / sector /
               quant) that you did not lead with in round
               (round_num - 1).
-          (b) Add a "Conviction vs prior round: ↑ / → / ↓ — <reason>"
+          (c) Add a "Conviction vs prior round: ↑ / → / ↓ — <reason>"
               line tracking how your downside conviction has shifted.
-          (c) Do NOT repeat any prior-round bullet verbatim.
+          (d) Do NOT repeat any prior-round bullet verbatim.
 
-    PROVENANCE: keep every ``[source: <identifier>]`` tag from the
-    analyst figures you cite. Do NOT introduce numbers without a tag.
+    PROVENANCE: copy each ``[source: <identifier>]`` tag from the pad
+    or from a tool you called this turn. You MAY introduce numbers
+    that came from those tool calls, with their tags. Do NOT invent
+    numbers.
   expected_output: >
-    Bear argument for round {round_num} (bulleted; starts with one or
-    more ``REBUTTAL:`` lines pasting the bull bullet under attack,
-    introduces at least one new analyst lens vs the previous bear
-    round, and ends with a ``Conviction vs prior round:`` line).
+    Bear argument for round {round_num} (bulleted; for round_num == 1
+    an independent opening with no ``REBUTTAL:`` line; for
+    round_num > 1 starts with one or more ``REBUTTAL:`` lines pasting
+    the bull bullet under attack, introduces at least one new analyst
+    lens vs the previous bear round, and ends with a
+    ``Conviction vs prior round:`` line).
     Every numeric claim carries an inline ``[source: …]`` tag.
+
+# ----- Bundled live debate (one crew, both sides, tools mid-exchange) --------
+
+debate_bull_open:
+  description: >
+    Bundled debate OPENING (BULL) for {ticker}. You share this crew with
+    the bear. Open your case, then they will rebut you, then you close.
+
+    Call tools during this opening when a claim needs a number, a
+    filing fact, a headline, or a web source you do not already have.
+    Useful tools: read_scratchpad (first), research_web (write a fresh
+    query), get_news, get_stock_data, get_fundamentals,
+    get_analyst_recommendations, get_event_proximity, write_scratchpad
+    (author=bull). Do not invent figures.
+
+    State the strongest bullish argument in 4-6 bullets, each tied to a
+    scratch-pad TLDR or a tool you just called. Every number carries
+    ``[source: …]``. End with DESK_BIAS: BULLISH (or BEARISH / NEUTRAL).
+  expected_output: >
+    Cited bull opening for {ticker}: drivers, what would flip you.
+    Every number carries [source: …]. Last line DESK_BIAS: BULLISH
+    (or BEARISH / NEUTRAL).
+
+debate_bear_rebut:
+  description: >
+    Bundled debate REBUTTAL (BEAR) for {ticker}. The bull opening is in
+    this crew's prior task. Attack their strongest cited bullets. Fetch
+    new evidence yourself — do not only restate analyst TLDRs.
+
+    Call tools when a rebuttal hinges on a number, a headline, or a
+    web source you do not have: read_scratchpad, research_web (fresh
+    query that names the claim you are testing), get_news,
+    get_stock_data, get_fundamentals, get_analyst_recommendations,
+    get_event_proximity, write_scratchpad (author=bear).
+
+    Open with one or more ``REBUTTAL:`` lines that paste the bull
+    bullet (with its ``[source: …]`` tag) you are attacking. Then 4-6
+    bearish bullets. End with DESK_BIAS: BEARISH (or BULLISH / NEUTRAL).
+  expected_output: >
+    Cited bear rebuttal for {ticker}: REBUTTAL lines, downside drivers,
+    what would flip you. Every number carries [source: …]. Last line
+    DESK_BIAS: BEARISH (or BULLISH / NEUTRAL).
+
+debate_bull_close:
+  description: >
+    Bundled debate CLOSE (BULL) for {ticker}. The bear rebuttal is in
+    this crew's prior tasks. Answer their strongest attack. Call tools
+    again if a new claim needs a source you do not have (research_web,
+    get_news, get_fundamentals, get_stock_data). Do not recap your
+    opening verbatim.
+
+    Open with ``REBUTTAL:`` pasting the bear bullet you are answering.
+    Then 3-5 bullets that move conviction vs your opening. End with
+    DESK_BIAS: BULLISH (or BEARISH / NEUTRAL) and
+    ``Conviction vs opening: ↑ / → / ↓ — because <one cited line>``.
+  expected_output: >
+    Cited bull close for {ticker}: REBUTTAL lines, updated drivers,
+    Conviction vs opening. Every number carries [source: …]. Last line
+    DESK_BIAS: BULLISH (or BEARISH / NEUTRAL).
+
+# ----- Bundled risk debate (one crew, three wings, two rounds) ---------------
+
+risk_aggressive_open:
+  description: >
+    Bundled risk ROUND 1 OPENING (AGGRESSIVE) for {ticker}. You share
+    this crew with Conservative and Neutral. Write your independent
+    size-up / proactive-path opinion from the thesis and plan. Do NOT
+    open with ``REBUTTAL:``. Do not wait for or attack the other wings.
+
+    Call tools when a size claim needs a number you do not have:
+    research_web, get_news, get_stock_data, get_fundamentals,
+    get_options_summary, get_event_proximity. Do not invent figures.
+    End with a recommended size (pct of book) and what would flip you.
+  expected_output: >
+    Independent aggressive opening for {ticker}: size call, named
+    risks, what would flip you. Every number carries [source: …].
+    No REBUTTAL: line.
+
+risk_conservative_open:
+  description: >
+    Bundled risk ROUND 1 OPENING (CONSERVATIVE) for {ticker}. You share
+    this crew with Aggressive and Neutral. Write your independent
+    size-down / skip / tighter-stop opinion from the thesis and plan.
+    Do NOT open with ``REBUTTAL:``. Do not wait for or attack the
+    other wings.
+
+    Call tools when a tail-risk claim needs a number you do not have:
+    research_web, get_news, get_stock_data, get_fundamentals,
+    get_options_summary, get_event_proximity. Do not invent figures.
+    End with a recommended size (pct of book) and what would flip you.
+  expected_output: >
+    Independent conservative opening for {ticker}: size call, named
+    tail risks, what would flip you. Every number carries [source: …].
+    No REBUTTAL: line.
+
+risk_neutral_open:
+  description: >
+    Bundled risk ROUND 1 OPENING (NEUTRAL) for {ticker}. You share this
+    crew with Aggressive and Conservative. Write YOUR independent
+    book-defensible size opinion first — this is not yet a synthesis
+    of the other wings. Do NOT open with ``REBUTTAL:``.
+
+    Call tools when a size claim needs a number you do not have:
+    research_web, get_news, get_stock_data, get_fundamentals,
+    get_options_summary, get_event_proximity. Do not invent figures.
+    End with a recommended size (pct of book) and what would reopen
+    the plan.
+  expected_output: >
+    Independent neutral opening for {ticker}: size call, named risks,
+    what would reopen the plan. Every number carries [source: …].
+    No REBUTTAL: line.
+
+risk_aggressive_rebut:
+  description: >
+    Bundled risk ROUND 2 DEBATE (AGGRESSIVE) for {ticker}. The three
+    openings are in this crew. Attack the strongest conservative or
+    neutral size-down bullets. Fetch new evidence — do not only restate
+    your opening.
+
+    Open with ``REBUTTAL:`` pasting the other-wing bullet (with
+    ``[source: …]``) you are countering. Call research_web / get_news /
+    get_fundamentals / get_stock_data if you need a source. End with
+    ``Conviction vs opening: ↑ / → / ↓ — <reason>`` and an updated
+    size (pct of book).
+  expected_output: >
+    Aggressive rebuttal for {ticker}: REBUTTAL lines, updated size,
+    Conviction vs opening. Every number carries [source: …].
+
+risk_conservative_rebut:
+  description: >
+    Bundled risk ROUND 2 DEBATE (CONSERVATIVE) for {ticker}. The three
+    openings are in this crew. Attack the strongest aggressive size-up
+    bullets. Fetch new evidence — do not only restate your opening.
+
+    Open with ``REBUTTAL:`` pasting the other-wing bullet (with
+    ``[source: …]``) you are countering. Call research_web / get_news /
+    get_fundamentals / get_stock_data if you need a source. End with
+    ``Conviction vs opening: ↑ / → / ↓ — <reason>`` and an updated
+    size (pct of book).
+  expected_output: >
+    Conservative rebuttal for {ticker}: REBUTTAL lines, updated size,
+    Conviction vs opening. Every number carries [source: …].
+
+risk_neutral_rebut:
+  description: >
+    Bundled risk ROUND 2 DEBATE (NEUTRAL) for {ticker}. The three
+    openings and the wing rebuttals are in this crew. Debate both
+    sides, then lock one book-defensible size. Fetch a source if a
+    claim is still uncited.
+
+    Open with ``REBUTTAL:`` pasting the wing bullet you reject or
+    accept. Call research_web / get_news / get_fundamentals /
+    get_stock_data if a claim is still uncited. End with recommended
+    size (pct of book) and
+    ``Conviction vs opening: ↑ / → / ↓ — <reason>``. Do not emit
+    graph control tokens.
+  expected_output: >
+    Neutral rebuttal for {ticker}: REBUTTAL lines, locked size,
+    Conviction vs opening. Every number carries [source: …].
 
 # ----- Research synthesis ----------------------------------------------------
 
 research_synthesis:
   description: >
-    As Research Manager, read the full bull/bear debate plus the four
-    analyst reports (market/positioning, news/sentiment,
-    fundamentals/sector, macro/geopolitical). Pick the side with stronger
-    evidence — do NOT split the difference. Note 1-2 things that would
-    change your mind.
+    As Research Manager, call read_scratchpad for compact analyst TLDRs
+    and the debate history. The last bull and last bear turns are also
+    in context — do not expect the five full analyst reports here.
+    Pick the
+    side with stronger evidence when one side is clearly stronger.
+    If the desks conflict and neither side is clearly stronger, emit
+    STANCE: MIXED with named evidence on both sides and 1-2 things
+    that would change your mind. MIXED is a locked thesis, not a
+    sit-out instruction — do not tell the PM to sit out. HOLD is
+    the PM's call only when the
+    directional desk vote is tied (bullish count == bearish count,
+    both > 0) or a majority of directional desks oppose the lean.
+    Neutrals do not create a split: 3 bullish / 2 neutral is a
+    bullish majority, not a split board.
 
     Multi-lens grounding (REQUIRED — anti yfinance-only bias).
     Reports tend to collapse onto market + fundamentals because those
@@ -403,10 +742,15 @@ research_synthesis:
       * Across the 3 KEY DRIVERS and the 3 KEY RISKS combined, at
         least **TWO** entries must source primarily from a NON-yfinance
         lens — i.e. the underlying ``[source: …]`` tag must be a news
-        URL, an article from get_corporate_actions, a macro-basket
+        URL, an article from get_corporate_actions, a
+        get_report_insights / SIGNAL line, a macro-basket
         line tied to a news headline, a geopolitical / supply-chain
         item, a sector / peer comparison, or an options/quant
         indicator that is not just a yfinance fundamentals figure.
+      * If the Reports desk emitted a NET_GUIDANCE_BIAS or a computed
+        REVENUE/EARNINGS/MARGIN_TREND, that read MUST appear in drivers,
+        risks, or falsifiers — not silently dropped because the filing
+        digest feels softer than a yfinance multiple.
       * If the News, Social, Geopolitical, or Macro reports surfaced
         a material catalyst (e.g. share buyback, special dividend,
         acquisition, leadership change, sanctions action), that
@@ -421,15 +765,17 @@ research_synthesis:
         the trader to know about.
 
     PROVENANCE: every quantitative driver / risk / falsifier MUST carry
-    the underlying ``[source: <identifier>]`` tag inherited from the
-    analyst report you took it from. The trader and the Portfolio
-    Manager rely on these tags being present — strip them and the
-    Reflective Critic will mark the decision unsupported.
+    the underlying ``[source: <identifier>]`` tag copied VERBATIM from
+    the analyst report you took the figure from (same URL / tool id,
+    not a paraphrased host). A tagged news URL is complete — do not
+    drop the fact because a later reviewer cannot re-find the article.
+    The trader and the Portfolio Manager rely on these tags — strip
+    them and the Reflective Critic will mark the decision unsupported.
   expected_output: >
-    A RESEARCH THESIS with: STANCE (BULL/BEAR), 3 key drivers, 3 key
+    A RESEARCH THESIS with: STANCE (BULL/BEAR/MIXED), 3 key drivers, 3 key
     risks (with at least TWO entries across drivers+risks sourcing
-    from a non-yfinance lens — news, corporate actions, geopolitical,
-    macro headlines, sector peers, options/quant), 1-2 falsifiers,
+    from a non-yfinance lens — news, corporate actions, reports/guidance,
+    geopolitical, macro headlines, sector peers, options/quant), 1-2 falsifiers,
     and (if any analyst was degraded) a one-line note flagging the
     missing lens.  Every line that contains a number ends with an
     inline ``[source: …]`` tag.
@@ -439,30 +785,37 @@ research_synthesis:
 quality_review:
   description: >
     Audit the Research Manager's thesis. For every claim, mark
-    (SUPPORTED) and cite the analyst report or debate turn it leans on,
-    or (UNSUPPORTED) if no reference exists. Then grade the thesis 0-10
-    on evidence-grounding, and list 1-3 gaps the trader should be aware
-    of. Recommend size reduction ONLY if the score is below 4 (genuine
-    evidence gap, not a single missing tag). A 4-6 thesis is "actionable
-    with caveats", not "size-down".
+    SUPPORTED, SUPPORTED-qualitative, or UNSUPPORTED using the rules
+    below — then grade evidence-grounding 0-10 and list 1-3 gaps.
+    Recommend size reduction ONLY if the score is below 4 (a genuine
+    thesis-wide hole: most material numbers have no tag at all). A
+    4-10 thesis is "actionable with caveats", not "size-down" and not
+    "weight the tagged levers down".
 
-    A claim counts as SUPPORTED when it carries an inline
-    ``[source: <identifier>]`` tag (added by the analyst layer and
-    preserved by the manager).  A claim explicitly labelled
-    ``[analyst judgement]`` counts as SUPPORTED-qualitative — it is an
-    honest, reasoned view without a single citable URL, NOT a fatal
-    gap; treat it as valid supporting context (right-size its weight,
-    do not delete the thesis).  Only an UNTAGGED bare number, or a
-    citation pointing at a fabricated / placeholder URL (``example.com``,
-    a made-up path), is UNSUPPORTED — flag those explicitly so the
-    trader can omit them.  A single missing tag NEVER triggers a
-    size-down on its own; reserve the size-down recommendation for a
-    genuine, thesis-wide evidence gap (score below 4).
+    SUPPORTED — the claim already carries an inline
+    ``[source: <identifier>]`` tag. The tag IS the citation. Accept
+    any of: an ``http``/``https`` URL, a tool identifier
+    (``yfinance …``, ``screener.in …``, ``get_report_insights``,
+    ``long_term_thesis``), or a desk label (``Fundamentals Analyst
+    TLDR``). Do NOT require that same URL to reappear as prose in
+    another desk report. Your context is truncated; a tagged news
+    URL that you cannot grep in the analyst pack is still SUPPORTED.
+    Do NOT tell the trader or PM to omit, drop, or down-weight a
+    tagged claim.
+
+    SUPPORTED-qualitative — the claim is labelled
+    ``[analyst judgement]``. Honest view, not a fatal gap. Keep it.
+
+    UNSUPPORTED — only an UNTAGGED bare number, or a citation that
+    points at a fabricated / placeholder URL (``example.com``, a
+    made-up path). Flag those so the PM can ignore THAT number.
+    A single missing tag NEVER triggers a size-down.
   expected_output: >
     A QUALITY REVIEW with: per-claim audit (SUPPORTED with the tag it
     cites / SUPPORTED-qualitative for ``[analyst judgement]`` labels /
-    UNSUPPORTED with the missing-tag or fabricated-URL warning),
-    overall score X/10, and 1-3 gap statements.
+    UNSUPPORTED only for a missing-tag or fabricated-URL),
+    overall score X/10, and 1-3 gap statements. Do not recommend
+    dropping tagged claims.
 
 # ----- Trader ----------------------------------------------------------------
 
@@ -495,12 +848,21 @@ trader_task:
     forward-looking view built on the analyst evidence.  Do NOT
     downgrade a genuine multi-year thesis to a shorter window on the
     basis of how the stock behaved historically: past price paths were
-    measured in a different regime and India in particular is in an
-    investment / production / earnings upcycle where the past is a poor
-    guide to the forward window.  A structural-break SELL on collapsing
-    ROCE is a LONG-tier trade; a multi-year compounder BUY is a
-    LONG-tier trade — regardless of what the last few years of prices
-    did.
+    measured in a different regime.  Take any home-country cycle call
+    from the macro desk's evidence, never from a standing prior.
+    A structural-break SELL on collapsing ROCE is a LONG-tier trade;
+    a multi-year compounder BUY is a LONG-tier trade — regardless of
+    what the last few years of prices did.
+
+    Learning clock vs thesis clock (do NOT collapse them):
+      The desk scores a 30-calendar-day LEARNING review (~21 trading
+      days) against ``trading_crew/config/desk_strategy.yaml`` success
+      and failure bars.  That clock does not replace the thesis
+      horizon.  Pick SHORT / MEDIUM / LONG from the CHARACTER of the
+      thesis.  Do NOT shrink a MEDIUM/LONG thesis to 30 days just to
+      feed the learning loop — the loop snapshots the 30-day path
+      automatically.  Edit the YAML to change the bars or the one
+      open experiment; change only one process knob at a time.
 
     Mandatory workflow:
       1. Call get_event_proximity once. If days_to_event is less than
@@ -565,45 +927,62 @@ trader_task:
 risk_aggressive_round:
   description: >
     Risk round {round_num} of {total_rounds} (AGGRESSIVE turn). Argue for
-    higher conviction sizing or a more proactive execution path. Reference
-    the trader's plan and the prior risk turns directly.
+    higher conviction sizing or a more proactive execution path from
+    the trader's plan.
 
-    Round-{round_num} discipline (REQUIRED for round_num > 1):
-      * Open with "REBUTTAL:" pasting the Conservative bullet (with
-        ``[source: …]`` tag) you are countering, then 1-2 lines why.
-      * Introduce at least one NEW size-up driver not used in your
-        earlier aggressive round.
-      * End with "Conviction vs prior round: ↑ / → / ↓ — <reason>".
-      * Do NOT repeat any prior-round bullet verbatim.
+    Round-{round_num} discipline (REQUIRED — same contract as bull/bear):
+      * If round_num == 1: this is your OPENING, run in parallel with
+        Conservative. Write an independent first size-up case from the
+        thesis and the trader's plan. Do NOT open with ``REBUTTAL:``
+        and do NOT wait for or attack a conservative turn — even if
+        one is already in context, ignore it this round.
+      * If round_num > 1: this turn MUST be materially different from
+        your round (round_num - 1). Specifically:
+          (a) Open with "REBUTTAL:" pasting the Conservative bullet
+              (with ``[source: …]`` tag) you are countering, then 1-2
+              lines why.
+          (b) Introduce at least one NEW size-up driver not used in
+              your earlier aggressive round.
+          (c) End with "Conviction vs prior round: ↑ / → / ↓ — <reason>".
+          (d) Do NOT repeat any prior-round bullet verbatim.
 
     PROVENANCE: keep every ``[source: …]`` tag from the figures you cite.
   expected_output: >
-    Aggressive risk argument round {round_num} (for round_num > 1:
-    starts with ``REBUTTAL:``, ends with ``Conviction vs prior
-    round:``).  Each numeric claim carries an inline ``[source: …]``
-    tag.
+    Aggressive risk argument round {round_num} (for round_num == 1
+    an independent opening with no ``REBUTTAL:`` line; for
+    round_num > 1 starts with ``REBUTTAL:``, ends with
+    ``Conviction vs prior round:``).  Each numeric claim carries an
+    inline ``[source: …]`` tag.
 
 risk_conservative_round:
   description: >
     Risk round {round_num} of {total_rounds} (CONSERVATIVE turn). Argue
-    for tighter stops, smaller size, or skipping the trade. Rebut the
-    AGGRESSIVE turn that just ran.
+    for tighter stops, smaller size, or skipping the trade.
 
-    Round-{round_num} discipline (REQUIRED for round_num > 1):
-      * Open with "REBUTTAL:" pasting the Aggressive bullet you are
-        countering (with its ``[source: …]`` tag) then 1-2 lines why
-        the size-up case does not hold.
-      * Introduce at least one NEW size-down driver not used in your
-        prior conservative round.
-      * End with "Conviction vs prior round: ↑ / → / ↓ — <reason>".
-      * Do NOT repeat any prior-round bullet verbatim.
+    Round-{round_num} discipline (REQUIRED — same contract as bull/bear):
+      * If round_num == 1: this is your OPENING, run in parallel with
+        Aggressive. Write an independent first size-down / skip case
+        from the thesis and the trader's plan. Do NOT open with ``REBUTTAL:``
+        and do NOT wait for or attack an aggressive
+        turn — even if one is already in context, ignore it this
+        round.
+      * If round_num > 1: this turn MUST be materially different from
+        your round (round_num - 1). Specifically:
+          (a) Open with "REBUTTAL:" pasting the Aggressive bullet you
+              are countering (with its ``[source: …]`` tag) then 1-2
+              lines why the size-up case does not hold.
+          (b) Introduce at least one NEW size-down driver not used in
+              your prior conservative round.
+          (c) End with "Conviction vs prior round: ↑ / → / ↓ — <reason>".
+          (d) Do NOT repeat any prior-round bullet verbatim.
 
     PROVENANCE: keep every ``[source: …]`` tag from the figures you cite.
   expected_output: >
-    Conservative risk argument round {round_num} (for round_num > 1:
-    starts with ``REBUTTAL:``, ends with ``Conviction vs prior
-    round:``).  Each numeric claim carries an inline ``[source: …]``
-    tag.
+    Conservative risk argument round {round_num} (for round_num == 1
+    an independent opening with no ``REBUTTAL:`` line; for
+    round_num > 1 starts with ``REBUTTAL:``, ends with
+    ``Conviction vs prior round:``).  Each numeric claim carries an
+    inline ``[source: …]`` tag.
 
 risk_neutral_round:
   description: >
@@ -660,14 +1039,48 @@ compliance_review:
 
 pm_decision:
   description: >
-    As Portfolio Manager, weigh the four analyst reports
+    As Portfolio Manager, weigh ALL FIVE analyst reports
     (market/positioning, news/sentiment, fundamentals/sector,
-    macro/geopolitical), the trader's plan, and the risk debate. If a
+    reports/guidance, macro/geopolitical), the trader's plan, and the risk debate. If a
     Quality Review audit and/or a Compliance review are present in
     context, treat them as ADVISORY inputs: a Quality Review score
     below 4 or a FLAGGED compliance status should right-size (cut) the
-    position, never by itself force a HOLD.  Issue ONE final decision
+    position, never by itself force a HOLD.  Do NOT drop, omit, or
+    down-weight a claim that already carries a real ``[source: …]``
+    tag (an ``http``/``https`` URL, ``screener.in``, ``yfinance``,
+    ``get_report_insights``, or a desk TLDR) just because Quality
+    Review marked it UNSUPPORTED — that audit cannot re-see every
+    article in its window. Only ignore an untagged bare number or an
+    ``example.com`` placeholder.  Issue ONE final decision
     on {ticker}.
+
+    Decisiveness guard — you are making a researched, decisive call on
+    {ticker}, NOT answering an ambiguous user request:
+      * The analyst reports, trader plan, and risk debate in your
+        context ARE specifically about {ticker} and contain real,
+        citable figures.  Use them.  Never write "the request is
+        ambiguous", "no specific sources", "placeholder", or a generic
+        market summary — that is a hard failure and will be rejected.
+      * key_drivers / key_risks / falsifiers MUST each name a concrete
+        piece of analyst evidence with its inline ``[source: …]`` tag
+        (e.g. "price 1253.90 below SMA20/SMA50/SMA200, RSI 37.73
+        [source: yahoo · ohlcv]", "CFO transition", "India VIX
+        collapsed to 12.1", "mean target 1584.43 vs spot").  Never
+        generic labels like "Momentum", "Volume", "Market volatility",
+        "Economic data releases", or "Geopolitical events" without a
+        tagged {ticker}-specific figure.
+      * entry_price / stop_loss / target_price: ground entry to
+        LAST_CLOSE (injected) or the last market close in the market
+        analyst report. Copy the trader's levels only when they sit
+        within a few percent of that print. Never invent a round
+        placeholder (100 / 50 / 10 / $10 / $12 / $8) and never copy a
+        trader entry that is tens of percent away from spot. Size stop
+        and target off the measured volatility cited in context.
+      * If the analyst evidence is genuinely one-sided, commit to the
+        matching directional tier and explain WHY with tagged figures —
+        do not retreat to a generic HOLD or a placeholder trade merely
+        because one analyst lens was degraded.  A degraded lens is a
+        reason to cut size, not to emit a placeholder decision.
 
     Action alphabet — 5-tier, retail-recognisable:
       Choose ``action`` from EXACTLY ONE of:
@@ -693,11 +1106,12 @@ pm_decision:
                             size_pct_of_book in (0, 2.0] and confidence
                             in [0.55, 0.75].
         * ``HOLD``        — sit out. ``size_pct_of_book`` MUST be 0.
-                            Choose only when directional evidence is
-                            genuinely contradictory, when neither the
-                            short-term nor the mid-/long-term panels
-                            have a meaningful edge, or when compliance
-                            forces a stand-down.
+                            Choose when the desk-bias board is split or
+                            majority-opposed to a directional call, when
+                            directional evidence is genuinely mixed,
+                            when neither the short-term nor the
+                            mid-/long-term panels have a meaningful
+                            edge, or when compliance forces a stand-down.
         * ``SELL``        — standard short (mirror of BUY).
         * ``STRONG_SELL`` — high-conviction short (mirror of STRONG_BUY).
 
@@ -738,12 +1152,33 @@ pm_decision:
           inclusion).  Do NOT pick SHORT for a genuine multi-year
           thesis just to shorten the review window.
 
+      Learning clock vs thesis clock:
+        A 30-calendar-day review (~21 trading days) is scored against
+        the success/failure bars in desk_strategy.yaml.  That is the
+        self-learn signal.  Your ``horizon_days`` remains the thesis
+        clock (MEDIUM/LONG stay).  Do not emit horizon_days=30 unless
+        the thesis itself is a dated catalyst.
+
       The decision is anchored on the ANALYST EVIDENCE (fundamentals,
-      macro, sector, news, geopolitical), the trader's plan, and (for
-      LONG-tier calls) the multi-year fundamentals.  India especially
-      is in an investment / production / earnings upcycle where the
-      past is a poor guide to the forward window — do not let historic
-      price behaviour dictate the direction, the tier, or the size.
+      reports/guidance, macro, sector, news, geopolitical), the trader's
+      plan, and (for LONG-tier calls) the multi-year fundamentals.  Take
+      any home-country cycle / regime call from the macro desk — do not
+      assume an upcycle for any country.  Do not let historic price
+      behaviour dictate the direction, the tier, or the size.
+
+      Desk-bias board — BINDING coverage check:
+        * A split board means bullish count == bearish count, both > 0.
+          Neutrals do not create a split (3 bullish / 2 neutral is a
+          bullish majority). A 3–1 directional majority is not a split.
+        * A true split, or a majority of directional desks against your
+          side, is HOLD — not a weak BUY/SELL. Override a dissenting
+          desk only with specific tagged evidence that desk missed;
+          otherwise sit out.
+        * STRONG_BUY / STRONG_SELL require a one-sided board (no
+          opposing desk).  Any opposing desk caps you at BUY / SELL.
+        * Weight computed REVENUE_TREND / EARNINGS_TREND / MARGIN_TREND
+          (hard quarterly numbers) at least as heavily as LLM-read
+          OUTLOOK_TONE — management filings are structurally optimistic.
 
       Populate ``long_term_view`` on EVERY decision — it is the
       permanent home of the multi-year context in the final report,
@@ -760,8 +1195,9 @@ pm_decision:
           ticker" — never leave the field empty.
 
       HOLD is reserved for cases where the analyst evidence is
-      genuinely contradictory across the mid- and long-term
-      fundamentals, OR none of them have a meaningful edge.
+      genuinely mixed (split or majority-opposed desk board, conflicting
+      mid- vs long-term fundamentals), OR none of them have a meaningful
+      edge.
 
     Decision quality — when to express conviction:
       Default to a directional tier (BUY / STRONG_BUY / SELL /
@@ -773,8 +1209,9 @@ pm_decision:
 
       Upgrade to STRONG_BUY / STRONG_SELL only when the analyst
       evidence is one-sided across the mid- AND long-term horizons
-      AND at least one independent corroboration (sector alignment OR
-      macro tailwind OR news catalyst OR ``get_long_term_thesis``)
+      AND the desk-bias board has no opposing desk AND at least one
+      independent corroboration (sector alignment OR macro tailwind
+      OR news catalyst OR reports/guidance OR ``get_long_term_thesis``)
       points the same way.
 
       Weight the MULTI-YEAR compounding picture (revenue / EPS CAGR,
@@ -782,15 +1219,15 @@ pm_decision:
       LEAST as heavily as the near-term signal.  When the long-term
       thesis is intact and the fundamentals are strong, prefer the LONG
       horizon and let the multi-year evidence, not a soft near-term
-      wobble, drive the tier — this is especially important for Indian
-      names in a multi-year investment / production upcycle.
+      wobble, drive the tier.
 
-      HOLD is reserved for genuinely contradictory evidence — do not
-      use it as a "soft veto" when one signal is mildly weak, when
-      only the short-term picture is weak, or when you are uncertain
-      about a single quantitative claim.  A HOLD with size 0 is a
-      real position decision (sit out) — only choose it when the
-      evidence genuinely cannot resolve direction.
+      HOLD is the correct call on a true split (bull == bear, both > 0)
+      or a majority-opposed desk board — do not use it as a "soft veto"
+      when the board is MIXED-with-conviction but has a directional
+      majority, when one signal is mildly weak, when only the
+      short-term picture is weak, or when you are uncertain about a
+      single quantitative claim.  A HOLD with size 0 is a real
+      position decision (sit out).
 
       A well-reasoned QUALITATIVE thesis stands on its own.  When the
       fundamentals + macro + sector lenses align on a direction, that
@@ -811,9 +1248,21 @@ pm_decision:
         any directional tier as long as the size cap is honoured.
       - HOLD ⇒ size_pct_of_book == 0.  Any directional tier ⇒
         size_pct_of_book > 0.  The guardrail rejects mismatches.
+        A HOLD may still carry watch stop/target/expected-return
+        levels filled by the risk layer after you emit — those are
+        not a live order. Do not put a recommended size into
+        size_pct_of_book on HOLD.
       - confidence is a probability in [0, 1]; calibrate it to the
         evidence (do not output a 0.50 placeholder); never claim >0.88
         on a single-name trade.
+      - expected_return_pct is a DECIMAL FRACTION over the horizon, NOT
+        percent points: +5% => 0.05, +20% => 0.20, -12% => -0.12.  Its
+        SIGN is the expected move of the underlying: POSITIVE for a
+        BUY/STRONG_BUY thesis (you expect the price to rise) and
+        NEGATIVE for a SELL/STRONG_SELL thesis (you expect it to fall).
+        It must be consistent with (target_price - entry_price)/entry_price.
+        Emitting 20 instead of 0.20, or a positive value on a short, is a
+        schema violation.
       - Confidence is set by the STRENGTH and BREADTH of the forward
         analyst evidence.  Apply the cap "do not exceed confidence
         0.6" ONLY when the qualitative analyst evidence (fundamentals,

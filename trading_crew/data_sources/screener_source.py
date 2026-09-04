@@ -30,10 +30,13 @@ round-trip.
 from __future__ import annotations
 
 import logging
+import os
+import random
 import re
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import requests
@@ -42,6 +45,39 @@ from bs4 import BeautifulSoup, Tag
 from .routing import get_config, strip_exchange_suffix
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Polite rate-limiting — space out requests to screener.in so we stay a
+# well-behaved anonymous/logged-in client instead of hammering the site
+# (and getting a 429 / IP ban).  Configurable via env; jittered so bursts
+# from parallel analyst threads don't align.
+# ---------------------------------------------------------------------------
+
+_THROTTLE_LOCK = threading.Lock()
+_LAST_REQUEST_AT: float = 0.0
+
+
+def _min_request_gap() -> float:
+    try:
+        return max(0.0, float(os.environ.get("SCREENER_MIN_REQUEST_GAP_SECONDS", "1.5")))
+    except (TypeError, ValueError):
+        return 1.5
+
+
+def _throttle() -> None:
+    """Block until at least ``SCREENER_MIN_REQUEST_GAP_SECONDS`` (plus a small
+    random jitter) has elapsed since the previous request."""
+    global _LAST_REQUEST_AT
+    gap = _min_request_gap()
+    if gap <= 0:
+        return
+    with _THROTTLE_LOCK:
+        now = time.monotonic()
+        wait = (_LAST_REQUEST_AT + gap) - now
+        if wait > 0:
+            time.sleep(wait + random.uniform(0.0, gap * 0.25))
+        _LAST_REQUEST_AT = time.monotonic()
 
 
 # ---------------------------------------------------------------------------
@@ -116,13 +152,21 @@ class ShareholdingPattern:
 
 @dataclass
 class DocumentLink:
-    """One filing / announcement / concall / rating link."""
+    """One filing / announcement / concall / rating link.
+
+    ``kind`` categorises the dated primary source so the tool layer can
+    group the feed (announcements vs annual reports vs concall
+    transcripts vs credit-rating actions).  These dated documents are the
+    point-in-time-safe part of screener.in (unlike the restated ratio
+    snapshot), which makes them the backbone of offline backfill.
+    """
 
     title: str
     url: str
     # screener.in embeds the date inside the title (``"... 15h"`` or
     # ``"... 24 Jun"``) — we surface it as ``title`` verbatim; a stricter
     # parser could split it but the LLM handles the freeform date fine.
+    kind: str = "announcement"  # announcement | annual_report | concall | credit_rating
 
 
 @dataclass
@@ -252,6 +296,11 @@ def _maybe_login(session: requests.Session) -> None:
 _CACHE_LOCK = threading.Lock()
 _CACHE: Dict[str, tuple] = {}  # symbol -> (parsed_page, fetched_at)
 _CACHE_TTL_SECONDS = 15 * 60
+# Bound the parsed-page cache.  Keyed by symbol so it's naturally capped by the
+# universe size, but a long-running process would still keep every expired
+# parsed page (financial tables + doc links) resident until the same symbol is
+# re-read.  Purge-on-write frees them and hard-caps total entries.
+_CACHE_MAX_ENTRIES = 256
 
 
 def _cache_get(key: str):
@@ -267,8 +316,15 @@ def _cache_get(key: str):
 
 
 def _cache_put(key: str, parsed) -> None:
+    now = time.time()
     with _CACHE_LOCK:
-        _CACHE[key] = (parsed, time.time())
+        _CACHE[key] = (parsed, now)
+        expired = [k for k, (_, ts) in _CACHE.items() if now - ts > _CACHE_TTL_SECONDS]
+        for k in expired:
+            _CACHE.pop(k, None)
+        if len(_CACHE) > _CACHE_MAX_ENTRIES:
+            for k in list(_CACHE.keys())[: len(_CACHE) - _CACHE_MAX_ENTRIES]:
+                _CACHE.pop(k, None)
 
 
 def clear_cache() -> None:
@@ -426,7 +482,9 @@ def parse_documents(section: Optional[Tag]) -> List[DocumentLink]:
 
     The very first anchor on the page is typically the "All"
     aggregation link back to BSE — we drop it because it isn't a
-    filing itself.
+    filing itself.  Each link is categorised (``announcement`` /
+    ``annual_report`` / ``concall`` / ``credit_rating``) so the feed can
+    be grouped downstream.
     """
     if section is None:
         return []
@@ -438,8 +496,83 @@ def parse_documents(section: Optional[Tag]) -> List[DocumentLink]:
             continue
         if title.strip().lower() == "all":
             continue
-        out.append(DocumentLink(title=title, url=url))
+        out.append(DocumentLink(title=title, url=url, kind=classify_document(title, url)))
     return out
+
+
+def classify_document(title: str, url: str) -> str:
+    """Categorise a screener.in document link by title/URL heuristics.
+
+    Returns one of ``announcement`` / ``annual_report`` / ``concall`` /
+    ``credit_rating``.  Deliberately conservative — anything unrecognised
+    stays a generic ``announcement``.
+    """
+    hay = f"{title} {url}".lower()
+    if any(k in hay for k in ("concall", "transcript", "conference call", "earnings call", "investor ppt", "investor presentation", "/concalls/")):
+        return "concall"
+    if any(k in hay for k in ("annual report", "annual-report", "/annual-reports/", "integrated report")):
+        return "annual_report"
+    if any(k in hay for k in ("credit rating", "rating", "crisil", "icra", "care ratings", "india ratings", "fitch", "brickwork")):
+        return "credit_rating"
+    return "announcement"
+
+
+_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+_REL_DATE_RE = re.compile(r"\b\d+\s*(h|hr|hrs|hour|hours|d|day|days|w|wk|week|weeks|min|mins)\b", re.IGNORECASE)
+_ABS_DATE_RE = re.compile(r"\b(\d{1,2})\s+([A-Za-z]{3})[a-z]*\s+(\d{4})\b")
+_DM_DATE_RE = re.compile(r"\b(\d{1,2})\s+([A-Za-z]{3})[a-z]*\b")
+
+
+def parse_document_date(title: str) -> Optional[datetime]:
+    """Best-effort parse of the filing date screener embeds in a doc title.
+
+    Handles ``"24 Jun 2024"`` (absolute) and treats relative markers
+    (``"15h"``, ``"3d"``) as *now*.  A bare ``"24 Jun"`` (no year) is
+    ambiguous, so we return ``None`` — the PIT filter then drops it in
+    strict backfill mode rather than guess a year and risk a leak.
+    """
+    if not title:
+        return None
+    m = _ABS_DATE_RE.search(title)
+    if m:
+        day, mon, year = int(m.group(1)), _MONTHS.get(m.group(2).lower()), int(m.group(3))
+        if mon:
+            try:
+                return datetime(year, mon, day, tzinfo=timezone.utc)
+            except ValueError:
+                return None
+    if _REL_DATE_RE.search(title):
+        # "15h" / "3d" → a very recent filing; anchor at now.
+        return datetime.now(timezone.utc)
+    return None
+
+
+def pit_filter_documents(documents: List[DocumentLink]) -> List[DocumentLink]:
+    """Drop filings published after the current PIT cutoff (backfill only).
+
+    Live mode returns the list unchanged.  In strict backfill, filings
+    whose date can't be parsed are also dropped (fail-closed).
+    """
+    try:
+        from . import pit
+    except Exception:  # noqa: BLE001
+        return documents
+    ctx = pit.get_context()
+    if not ctx.is_backfill:
+        return documents
+    kept: List[DocumentLink] = []
+    for d in documents:
+        dt = parse_document_date(d.title)
+        if dt is None:
+            if not ctx.strict:
+                kept.append(d)
+            continue
+        if dt <= ctx.as_of:
+            kept.append(d)
+    return kept
 
 
 def parse_pros_cons(section: Optional[Tag]) -> ProsCons:
@@ -474,6 +607,99 @@ def parse_pros_cons(section: Optional[Tag]) -> ProsCons:
 # ---------------------------------------------------------------------------
 
 
+def _table_has_values(t: Optional[FinancialTable]) -> bool:
+    """True when a financial table actually carries period data (not just row
+    labels).  screener serves a label-only skeleton (no period columns, blank
+    value cells) for a statement a company doesn't publish in the requested
+    mode — e.g. the ``/consolidated/`` page of a name with no subsidiaries."""
+    if t is None or not t.columns:
+        return False
+    for _metric, values in t.rows:
+        if any((v not in (None, "")) for v in values):
+            return True
+    return False
+
+
+def _page_has_financials(page: CompanyPage) -> bool:
+    """A page is "real" if either its quarterly or annual P&L table is populated."""
+    return _table_has_values(page.quarters) or _table_has_values(getattr(page, "profit_loss", None))
+
+
+_SEARCH_URL = "https://www.screener.in/api/company/search/"
+_SLUG_RE = re.compile(r"/company/([A-Za-z0-9.-]+)/")
+
+
+def search_company_slug(query: str, session: Optional[requests.Session] = None) -> Optional[str]:
+    """Resolve a ticker root to screener.in's listing slug via its search API.
+
+    Yahoo / operator input can differ from the NSE listing code
+    (``SBI.NS`` vs ``SBIN``). This is the same source, not another
+    vendor. Empty / non-200 search returns None — the caller still
+    raises ``ScreenerNotFoundError``.
+    """
+    q = (query or "").strip()
+    if not q:
+        return None
+    sess = session or _get_session()
+    _maybe_login(sess)
+    try:
+        from trading_crew.data_sources import rate_gateway
+
+        if rate_gateway.is_enabled():
+            rate_gateway.acquire("scrape")
+        else:
+            _throttle()
+    except Exception:  # noqa: BLE001
+        _throttle()
+    try:
+        r = sess.get(_SEARCH_URL, params={"q": q}, timeout=20)
+    except requests.RequestException as exc:
+        raise ScreenerError(f"screener.in search {q!r} failed: {exc}") from exc
+    if r.status_code == 429:
+        raise ScreenerRateLimitError(
+            f"screener.in rate-limited ({r.status_code}) on search {q!r}"
+        )
+    if r.status_code != 200:
+        logger.info("screener.in search %r returned HTTP %s", q, r.status_code)
+        return None
+    try:
+        rows = r.json()
+    except ValueError:
+        return None
+    if not isinstance(rows, list):
+        return None
+    q_up = q.upper()
+    exact: List[str] = []
+    prefix: List[str] = []
+    name_hit: List[str] = []
+    other: List[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        url = str(row.get("url") or "")
+        match = _SLUG_RE.search(url)
+        if not match:
+            continue
+        slug = match.group(1).upper()
+        name = str(row.get("name") or "").upper()
+        tokens = name.replace("-", " ").split()
+        if slug == q_up:
+            exact.append(slug)
+        elif slug.startswith(q_up):
+            prefix.append(slug)
+        elif q_up in tokens:
+            name_hit.append(slug)
+        else:
+            other.append(slug)
+    if exact:
+        return exact[0]
+    if prefix:
+        return sorted(prefix, key=len)[0]
+    if name_hit:
+        return name_hit[0]
+    return other[0] if other else None
+
+
 def _company_urls(symbol_root: str) -> List[tuple]:
     """Return ``(url, mode)`` candidates for a symbol root.
 
@@ -496,11 +722,39 @@ def _fetch_html(url: str, session: requests.Session) -> Optional[str]:
     us.  Any other HTTP or transport error is wrapped in a
     ``ScreenerError`` so the tool layer can log a single line and move
     on.
+
+    A 429 triggers a short bounded exponential backoff (respecting a
+    ``Retry-After`` header when present) before giving up.
     """
-    try:
-        r = session.get(url, timeout=20)
-    except requests.RequestException as exc:
-        raise ScreenerError(f"screener.in GET {url} failed: {exc}") from exc
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        # Rate limiting: prefer the Kafka ``scrape`` slot queue when the web
+        # server's gateway is up (centralised + visible); else the in-process
+        # gap.  Never let the limiter itself break a scrape.
+        try:
+            from trading_crew.data_sources import rate_gateway
+
+            if rate_gateway.is_enabled():
+                rate_gateway.acquire("scrape")
+            else:
+                _throttle()
+        except Exception:  # noqa: BLE001
+            _throttle()
+        try:
+            r = session.get(url, timeout=20)
+        except requests.RequestException as exc:
+            raise ScreenerError(f"screener.in GET {url} failed: {exc}") from exc
+        if r.status_code != 429:
+            break
+        # Rate-limited — back off and retry a couple of times before failing.
+        if attempt < max_attempts - 1:
+            retry_after = r.headers.get("Retry-After")
+            try:
+                sleep_s = float(retry_after) if retry_after else (2.0 ** attempt) * _min_request_gap()
+            except (TypeError, ValueError):
+                sleep_s = (2.0 ** attempt) * _min_request_gap()
+            logger.warning("screener.in 429 on %s; backing off %.1fs (attempt %d)", url, sleep_s, attempt + 1)
+            time.sleep(min(sleep_s, 30.0))
     if r.status_code == 404:
         return None
     if r.status_code == 429:
@@ -541,24 +795,89 @@ def fetch_company(symbol: str) -> CompanyPage:
     if cached is not None:
         return cached
 
+    # Point-in-time backfill: reuse a previously-captured on-disk snapshot
+    # of the raw HTML so we scrape each company at most once across an
+    # entire backfill run (huge request reduction + politeness).  Only
+    # reused in backfill — live runs always fetch fresh (subject to the
+    # 15-min in-process TTL cache above).
+    try:
+        from . import pit as _pit
+
+        if _pit.is_backfill():
+            snap = _pit.load_snapshot("screener_html", root)
+            if snap and snap.get("html"):
+                page = _parse_company_html(root, snap.get("url", ""), snap.get("mode", "consolidated"), snap["html"])
+                _cache_put(root, page)
+                return page
+    except Exception:  # noqa: BLE001 — snapshot reuse is best-effort
+        pass
+
     session = _get_session()
     _maybe_login(session)
 
-    last_error: Optional[ScreenerError] = None
-    for url, mode in _company_urls(root):
-        try:
-            html = _fetch_html(url, session)
-        except ScreenerError as exc:
-            last_error = exc
-            # Rate-limit / 5xx applies to the whole site — no point
-            # trying the standalone URL because it'll hit the same
-            # limit.
-            raise
-        if html is None:
-            continue
-        page = _parse_company_html(root, url, mode, html)
+    def _finalize(page: CompanyPage, html: str, url: str, mode: str) -> CompanyPage:
         _cache_put(root, page)
+        # Persist a raw-HTML snapshot for later PIT reuse (best-effort).
+        try:
+            from . import pit as _pit
+
+            _pit.save_snapshot("screener_html", root, {"html": html, "url": url, "mode": mode})
+        except Exception:  # noqa: BLE001
+            pass
         return page
+
+    last_error: Optional[ScreenerError] = None
+
+    def _collect(symbol_root: str) -> list[tuple]:
+        nonlocal last_error
+        found: list[tuple] = []
+        for url, mode in _company_urls(symbol_root):
+            try:
+                html = _fetch_html(url, session)
+            except ScreenerError as exc:
+                last_error = exc
+                raise
+            if html is None:
+                continue
+            page = _parse_company_html(symbol_root, url, mode, html)
+            found.append((page, html, url, mode))
+            if _table_has_values(page.quarters):
+                return found
+            logger.info(
+                "screener.in %s page for %s has an empty #quarters skeleton — "
+                "trying next candidate URL for populated quarterly data",
+                mode, symbol_root,
+            )
+        return found
+
+    # Rank candidates by usefulness of their QUARTERLY table: a name with no
+    # consolidated financials (the COLPAL case) serves a label-only #quarters
+    # skeleton on /consolidated/ — yet its ANNUAL P&L is populated with stale
+    # history, so a P&L-only check would wrongly keep it.  The computed trend
+    # signals need quarters, so prefer the first candidate whose quarters are
+    # populated; fetch the next URL (standalone) when they aren't.
+    candidates = _collect(root)
+    if candidates and _table_has_values(candidates[-1][0].quarters):
+        return _finalize(*candidates[-1])
+
+    if not candidates:
+        slug = search_company_slug(root, session)
+        if slug and slug != root:
+            logger.info(
+                "screener.in: %s has no /company/%s page; search resolved "
+                "listing slug %s",
+                root, root, slug,
+            )
+            candidates = _collect(slug)
+            if candidates and _table_has_values(candidates[-1][0].quarters):
+                return _finalize(*candidates[-1])
+
+    # No candidate had quarterly data — pick the best of what we fetched:
+    # prefer one whose annual P&L is populated, else the first parsed page (its
+    # documents / about / ratios are still useful) rather than raising.
+    if candidates:
+        best = next((c for c in candidates if _page_has_financials(c[0])), candidates[0])
+        return _finalize(*best)
 
     raise ScreenerNotFoundError(
         f"screener.in has no consolidated or standalone page for {root!r}."
@@ -680,8 +999,12 @@ def render_announcements_report(page: CompanyPage, limit: int = 12) -> str:
     outcome, etc. lands here days before it hits the generic news
     ranker — this is the specific fix for the BAJAJ-AUTO buyback-miss
     failure mode observed in the prior BAJAJ-AUTO.NS run.
+
+    In a backfill ``AsOfContext`` the filing list is first filtered to
+    those published on/before the cutoff (dated primary sources are the
+    PIT-safe part of screener, unlike the restated ratio snapshot).
     """
-    docs = page.documents[:limit]
+    docs = pit_filter_documents(page.documents)[:limit]
     if not docs:
         return (
             f"# {page.long_name} — Recent filings & announcements ({page.mode})\n\n"
@@ -691,6 +1014,43 @@ def render_announcements_report(page: CompanyPage, limit: int = 12) -> str:
     lines.append(f"Latest {len(docs)} filings from BSE / NSE via screener.in:\n")
     for d in docs:
         lines.append(f"- {d.title}\n  {d.url}\n  [source: {d.url}]")
+    return "\n".join(lines) + "\n"
+
+
+_DOC_KIND_LABELS = {
+    "announcement": "Announcements (SEBI / BSE / NSE)",
+    "annual_report": "Annual reports",
+    "concall": "Concall transcripts & investor presentations",
+    "credit_rating": "Credit-rating actions",
+}
+
+
+def render_documents_report(page: CompanyPage, limit_per_kind: int = 6) -> str:
+    """Grouped digest of dated primary documents (PIT-filtered).
+
+    Groups the ``#documents`` feed by category so the analyst sees
+    announcements, annual reports, concall transcripts, and credit-rating
+    actions separately.  These are the point-in-time-safe screener
+    surfaces (each carries a filing date), so in a backfill ``AsOfContext``
+    the list is first filtered to ``filing_date <= as_of``.
+    """
+    docs = pit_filter_documents(page.documents)
+    if not docs:
+        return (
+            f"# {page.long_name} — Dated documents ({page.mode})\n\n"
+            "_(no dated documents available for this point in time)_\n"
+        )
+    by_kind: Dict[str, List[DocumentLink]] = {}
+    for d in docs:
+        by_kind.setdefault(d.kind, []).append(d)
+    lines = [f"# {page.long_name} — Dated documents ({page.mode})\n"]
+    for kind in ("announcement", "annual_report", "concall", "credit_rating"):
+        group = by_kind.get(kind)
+        if not group:
+            continue
+        lines.append(f"\n## {_DOC_KIND_LABELS[kind]}")
+        for d in group[:limit_per_kind]:
+            lines.append(f"- {d.title}\n  {d.url}\n  [source: {d.url}]")
     return "\n".join(lines) + "\n"
 
 
